@@ -5,7 +5,7 @@ import os from 'node:os'
 import {join} from 'node:path'
 import {after, before, test} from 'node:test'
 
-import {compareVersions, createUpdater, releaseNotes} from '../omarchyd/updater.mjs'
+import {compareVersions, createUpdater, rawFromOrigin, releaseNotes} from '../omarchyd/updater.mjs'
 
 let dir
 before(async () => (dir = await mkdtemp(join(os.tmpdir(), 'omarchyd-u-'))))
@@ -69,7 +69,7 @@ test('update: download, build, restart from a separate unit; after the restart i
 	await u.procedures['system.update'].run()
 	await until(() => calls.some((c) => c.startsWith('systemd-run')))
 	assert.deepEqual(
-		calls.filter((c) => !c.startsWith('pacman')).map((c) => c.split(' ').slice(0, 4).join(' ')),
+		calls.filter((c) => !c.startsWith('pacman') && !c.includes('remote get-url')).map((c) => c.split(' ').slice(0, 4).join(' ')),
 		['git -C /app rev-parse', 'git -C /app rev-parse', 'git -C /app fetch', 'git -C /app reset', `${process.execPath} scripts/deps.mjs`, 'npm run build', 'systemd-run --user --collect --on-active=2s'],
 	)
 	assert.match(calls.at(-1), /systemctl --user restart omarchyd\.service omarchy-server-web\.service$/)
@@ -96,4 +96,22 @@ test('update: a failed build puts the previous version back', async () => {
 	assert.match(st.error, /failed and nothing changed: .*syntax error/)
 	assert.ok(calls.includes('git -C /app reset --hard old111'))
 	assert.ok(!calls.some((c) => c.startsWith('systemd-run')))
+})
+
+test('checks and updates from the repository it was installed from (omarchy-server-dev, or omarchy-server)', async () => {
+	assert.equal(rawFromOrigin('https://github.com/TouchWorkStation/omarchy-server-dev.git'), 'https://raw.githubusercontent.com/TouchWorkStation/omarchy-server-dev')
+	assert.equal(rawFromOrigin('https://github.com/TouchWorkStation/omarchy-server'), 'https://raw.githubusercontent.com/TouchWorkStation/omarchy-server')
+	assert.equal(rawFromOrigin('git@github.com:TouchWorkStation/omarchy-server-dev.git'), 'https://raw.githubusercontent.com/TouchWorkStation/omarchy-server-dev')
+	assert.equal(rawFromOrigin('https://evil.example/x/y.git'), null)
+	const asked = []
+	const run = async (cmd, args) => (cmd === 'git' && args.includes('get-url') ? 'https://github.com/TouchWorkStation/omarchy-server-dev.git\n' : '')
+	const fetchImpl = async (url) => (asked.push(String(url)), new Response(JSON.stringify({version: '0.6.1'})))
+	const u = createUpdater({autoCheck: false, appDir: '/app', dataDir: dir, currentVersion: '0.5.0', run, fetchImpl, helperPath: '/nonexistent'})
+	await u.procedures['system.checkUpdate'].run()
+	assert.ok(asked.length && asked.every((a) => a.startsWith('https://raw.githubusercontent.com/TouchWorkStation/omarchy-server-dev/main/')), asked.join(' '))
+	// Anything else (no origin, not GitHub): the main repository.
+	const asked2 = []
+	const u2 = createUpdater({autoCheck: false, appDir: '/app', dataDir: dir, currentVersion: '0.5.0', run: async () => { throw new Error('no git') }, fetchImpl: async (url) => (asked2.push(String(url)), new Response(JSON.stringify({version: '0.5.0'}))), helperPath: '/nonexistent'})
+	await u2.procedures['system.checkUpdate'].run()
+	assert.ok(asked2[0].startsWith('https://raw.githubusercontent.com/TouchWorkStation/omarchy-server/main/'))
 })

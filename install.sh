@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Omarchy Server installer: run as your normal user on Omarchy (or any Arch Linux).
-#   curl -fsSL https://raw.githubusercontent.com/TouchWorkStation/omarchy-server/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/TouchWorkStation/omarchy-server-dev/main/install.sh | bash
 # Installs to ~/.local/share/omarchy-server and runs as two systemd user services:
 #   omarchyd            the backend, on 127.0.0.1:2021 only
 #   omarchy-server-web  the web app, on port 7780 (OMARCHY_SERVER_PORT to change)
@@ -17,7 +17,9 @@ for arg in "$@"; do
 	esac
 done
 
-REPO="${OMARCHY_SERVER_REPO:-https://github.com/TouchWorkStation/omarchy-server.git}"
+# DEV REPO: this copy installs (and updates from) omarchy-server-dev. When moving code to
+# omarchy-server, keep omarchy-server's own line here: https://github.com/TouchWorkStation/omarchy-server.git
+REPO="${OMARCHY_SERVER_REPO:-https://github.com/TouchWorkStation/omarchy-server-dev.git}"
 BRANCH="${OMARCHY_SERVER_BRANCH:-main}"
 PORT="${OMARCHY_SERVER_PORT:-7780}"
 BASE="${XDG_DATA_HOME:-$HOME/.local/share}/omarchy-server"
@@ -69,6 +71,12 @@ node -e 'process.exit(Number(process.versions.node.split(".")[0]) >= 20 ? 0 : 1)
 mkdir -p "$BASE"
 if [ -d "$APP/.git" ]; then
 	say "Updating Omarchy Server"
+	# Installed from somewhere else before (e.g. omarchy-server, now the dev copy, or back): follow this
+	# installer's repository from now on, for this update and the in-app updates after it.
+	if [ "$(git -C "$APP" remote get-url origin 2>/dev/null)" != "$REPO" ]; then
+		say "Switching to $REPO"
+		git -C "$APP" remote set-url origin "$REPO"
+	fi
 	git -C "$APP" fetch --depth 1 origin "$BRANCH"
 	git -C "$APP" reset --hard "origin/$BRANCH"
 else
