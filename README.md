@@ -11,7 +11,7 @@ Turn an [Omarchy](https://omarchy.org) machine into a home server you run from a
 apps from a catalog of about 580, keep your files and drives in one place, run virtual machines, and
 reach your real Omarchy desktop — from a phone, a tablet or another computer.
 
-![The desktop layout in a browser, with the app launcher open](docs/screenshots/desktop-overview.png)
+![Omarchy Server's desktop in a browser, with App Store, Machines and Terminal windows open](docs/screenshots/desktop-overview.jpg)
 
 <p align="center">
   <img src="docs/screenshots/phone-home.png" width="24%" alt="Home on a phone">
@@ -59,6 +59,8 @@ where you left off; add `--purge` to delete those too.
 - **The dock your way:** left, bottom, right or top; any icon size; lift or magnify under the pointer;
   bounce when an app opens; floating or auto-hide.
 
+![Desktop & Dock settings with the desktop themes](docs/screenshots/desktop-themes.jpg)
+
 ### Apps
 
 - **App Store:** about 580 self-hosted apps (Jellyfin, Immich, Nextcloud, Home Assistant, Vaultwarden,
@@ -99,6 +101,8 @@ where you left off; add `--purge` to delete those too.
 - The screen in your browser with keyboard, mouse and touch controls, clipboard paste, and
   port forwarding to services inside a machine.
 - Machines run as you under libvirt's per-user session, not as root.
+
+![Machines in the desktop layout: the server's status, its virtual machines and backups](docs/screenshots/desktop-machines.jpg)
 
 ### Your Omarchy desktop, remotely
 
