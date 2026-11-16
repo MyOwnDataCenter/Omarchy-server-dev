@@ -178,5 +178,5 @@ export function createOmarchyPlugins({home, theme, run = execRun, fetchImpl = fe
 		return true
 	}
 
-	return {list, install, remove, refresh: () => load({refresh: true}).then((l) => l.length)}
+	return {list, install, remove, refresh: () => load({refresh: true}).then((l) => l.length), find: async (id) => (await load()).find((p) => p.id === id) ?? null}
 }

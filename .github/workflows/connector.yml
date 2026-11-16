@@ -1,0 +1,28 @@
+name: Connector on Linux distributions
+
+# The local swarm's connector (connector/agent.py) joining a real server from many distributions:
+# joins with a one-time code, reports, opens a terminal, and is removed. See scripts/swarm-distros.mjs.
+on:
+  pull_request:
+    paths: ['connector/**', 'omarchyd/connector.mjs', 'server/app.mjs', 'scripts/swarm-distros.mjs', '.github/workflows/connector.yml']
+  push:
+    branches: [main]
+    paths: ['connector/**', 'omarchyd/connector.mjs']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  distros:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: bash -n connector/install.sh
+      - run: node scripts/swarm-distros.mjs debian:12 ubuntu:20.04 ubuntu:24.04 fedora:41 archlinux:latest opensuse/tumbleweed

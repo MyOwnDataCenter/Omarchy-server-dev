@@ -20,7 +20,7 @@ import {dualProtocolServer, wantsUpgrade} from '../omarchyd/tls.mjs'
 import {createBackendClient, BackendError} from './backend.mjs'
 import {hashId, newSessionId} from './store.mjs'
 
-export const VERSION = '0.9.28'
+export const VERSION = '0.9.29'
 const COOKIE = 'omarchy_server_sid'
 const SESSION_MAX_AGE_S = 60 * 60 * 24 * 365
 const REFRESH_MARGIN_MS = 2 * 60 * 1000
@@ -71,6 +71,12 @@ export const ALLOWED = {
 	'appStore.removeRepository': 'mutation',
 	'appStore.refresh': 'mutation',
 	'omarchy.plugins': 'query',
+	'swarm.list': 'query',
+	'swarm.pair': 'mutation',
+	'swarm.remove': 'mutation',
+	'swarm.rename': 'mutation',
+	'swarm.setAbilities': 'mutation',
+	'swarm.action': 'mutation',
 	'omarchy.installPlugin': 'mutation',
 	'omarchy.removePlugin': 'mutation',
 	'apps.uninstall': 'mutation',
@@ -197,7 +203,7 @@ export const ALLOWED = {
 }
 
 // Long-running mutations: omarchyd answers when the operation finishes.
-const SLOW = new Set(['storage.growSystem', 'system.replaceCertificate', 'system.desktopSignIn', 'system.desktopShare', 'omarchy.removeTheme', 'storage.disks', 'storage.createPool', 'storage.addToPool', 'storage.importPool', 'storage.forgetPool', 'files.addShare', 'files.removeShare', 'files.copy', 'files.unarchive', 'files.getThumbnail', 'files.move', 'files.delete', 'files.emptyTrash', 'files.search', 'files.list', 'apps.install', 'apps.update', 'apps.uninstall', 'appStore.registry', 'appStore.addRepository', 'appStore.refresh', 'omarchy.plugins', 'omarchy.installPlugin', 'files.updateShare', 'files.setSharePassword', 'apps.logs', 'system.update', 'system.logs', 'machines.create', 'machines.uninstall', 'machines.snapshot', 'machines.revertSnapshot', 'machines.deleteSnapshot', 'machines.resizeDisk', 'machines.addDisk', 'machines.restart', 'machines.updateCloudInit', 'machines.details', 'machines.node', 'wifi.connect', 'wifi.networks', 'system.setHostname', 'hardware.internalStorage.getDevices', 'hardware.raid.addDevice', 'hardware.raid.addMirror', 'hardware.raid.addAccelerator', 'hardware.raid.replaceDevice', 'hardware.raid.transitionToFailsafeRaidz'])
+const SLOW = new Set(['storage.growSystem', 'system.replaceCertificate', 'system.desktopSignIn', 'system.desktopShare', 'omarchy.removeTheme', 'storage.disks', 'storage.createPool', 'storage.addToPool', 'storage.importPool', 'storage.forgetPool', 'files.addShare', 'files.removeShare', 'files.copy', 'files.unarchive', 'files.getThumbnail', 'files.move', 'files.delete', 'files.emptyTrash', 'files.search', 'files.list', 'apps.install', 'apps.update', 'apps.uninstall', 'appStore.registry', 'appStore.addRepository', 'appStore.refresh', 'omarchy.plugins', 'omarchy.installPlugin', 'files.updateShare', 'files.setSharePassword', 'apps.logs', 'swarm.action', 'system.update', 'system.logs', 'machines.create', 'machines.uninstall', 'machines.snapshot', 'machines.revertSnapshot', 'machines.deleteSnapshot', 'machines.resizeDisk', 'machines.addDisk', 'machines.restart', 'machines.updateCloudInit', 'machines.details', 'machines.node', 'wifi.connect', 'wifi.networks', 'system.setHostname', 'hardware.internalStorage.getDevices', 'hardware.raid.addDevice', 'hardware.raid.addMirror', 'hardware.raid.addAccelerator', 'hardware.raid.replaceDevice', 'hardware.raid.transitionToFailsafeRaidz'])
 
 function parseCookies(header = '') {
 	const out = {}
@@ -303,6 +309,16 @@ export function createApp({store, staticDir, fetchImpl = fetch, secureCookies = 
 		next()
 	})
 
+	// The connector on another computer trading its one-time pairing code for its own key
+	// (omarchyd checks the code; nothing else is reachable without a key).
+	app.post('/connector/enroll', express.json({limit: '64kb'}), async (req, res) => {
+		try {
+			const r = await fetchImpl(`${getClient().baseUrl}/connector/enroll`, {method: 'POST', headers: {'content-type': 'application/json'}, body: JSON.stringify(req.body ?? {}), signal: AbortSignal.timeout(15_000)})
+			res.status(r.status).json(await r.json().catch(() => ({})))
+		} catch {
+			res.status(502).json({error: 'The server isn’t answering right now'})
+		}
+	})
 	const api = express.Router()
 	api.use(express.json({limit: '64kb'}))
 	api.use((req, res, next) => {
@@ -1346,6 +1362,9 @@ export function createApp({store, staticDir, fetchImpl = fetch, secureCookies = 
 			// The server's own desktop: make sure its screen sharing is running (starts it if not),
 			// or say plainly why it can't be.
 			if (req.query.machineId === 'desktop') await authedCall(req, 'system.desktopShare', 'mutation')
+			// A computer in the local swarm: is its desktop there to show (and allowed)?
+			const agent = /^agent-([0-9a-f]{12})$/.exec(String(req.query.machineId ?? ''))
+			if (agent) await authedCall(req, 'swarm.desktopCheck', 'query', {id: agent[1]})
 			res.json({ok: true})
 		} catch (error) {
 			sendError(res, error)
@@ -1365,6 +1384,30 @@ export function createApp({store, staticDir, fetchImpl = fetch, secureCookies = 
 			}
 			try {
 				const url = new URL(req.url, 'http://x')
+				// A connector on another computer: no browser session; it signs in with its own key,
+				// which omarchyd checks. Passed straight through.
+				if (url.pathname === '/connector/ws') {
+					const target = new URL(getClient().baseUrl)
+					target.protocol = target.protocol === 'https:' ? 'wss:' : 'ws:'
+					target.pathname = '/connector/ws'
+					const upstream = new WebSocket(target, {headers: {authorization: String(req.headers.authorization ?? '')}, handshakeTimeout: 10_000, maxPayload: 16 * 1024 * 1024})
+					upstream.once('unexpected-response', (_q, r) => refuse(`${r.statusCode === 401 ? '401 Unauthorized' : '502 Bad Gateway'}`))
+					upstream.once('error', () => refuse('502 Bad Gateway'))
+					upstream.once('open', () => {
+						upstream.removeAllListeners('error')
+						wss.handleUpgrade(req, socket, head, (client) => {
+							upstream.on('message', (data, isBinary) => client.readyState === WebSocket.OPEN && client.send(data, {binary: isBinary}))
+							client.on('message', (data, isBinary) => upstream.readyState === WebSocket.OPEN && upstream.send(data, {binary: isBinary}))
+							upstream.on('close', () => client.readyState === WebSocket.OPEN && client.close(1000))
+							client.on('close', () => upstream.readyState === WebSocket.OPEN && upstream.close(1000))
+							upstream.on('error', () => client.terminate())
+							client.on('error', () => upstream.terminate())
+							// Keep it open through idle stretches (pings from omarchyd reach the connector).
+							upstream.on('ping', (d) => client.readyState === WebSocket.OPEN && client.ping(d))
+						})
+					})
+					return
+				}
 				const route = {'/api/console': 'machines', '/api/terminal': 'terminal'}[url.pathname]
 				if (!route) return refuse('404 Not Found')
 				// Browsers always send Origin on WebSocket handshakes: refuse other sites.
@@ -1382,12 +1425,14 @@ export function createApp({store, staticDir, fetchImpl = fetch, secureCookies = 
 					params = {machineId, sessionId: randomUUID()}
 				} else {
 					const appId = url.searchParams.get('appId') ?? ''
+					const agentId = url.searchParams.get('agentId') ?? ''
 					const cols = Number(url.searchParams.get('cols'))
 					const rows = Number(url.searchParams.get('rows'))
 					if (appId && !/^[a-z0-9][a-z0-9_-]{0,63}$/.test(appId)) return refuse('400 Bad Request')
+					if (agentId && !/^[0-9a-f]{12}$/.test(agentId)) return refuse('400 Bad Request')
 					if (!Number.isInteger(cols) || !Number.isInteger(rows) || cols < 10 || cols > 500 || rows < 4 || rows > 300) return refuse('400 Bad Request')
 					target.pathname = '/terminal'
-					params = {...(appId ? {appId} : {}), cols: String(cols), rows: String(rows)}
+					params = {...(appId ? {appId} : {}), ...(agentId ? {agentId} : {}), cols: String(cols), rows: String(rows)}
 				}
 				const ticket = await consoleTicket(sid, route)
 				target.search = new URLSearchParams({...params, ticket}).toString()

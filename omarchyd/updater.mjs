@@ -194,6 +194,8 @@ export function createUpdater({autoCheck = true, appDir, dataDir, currentVersion
 		ready,
 		// The version waiting to be installed, if a check found one.
 		updateWaiting: () => (cache?.value?.available ? cache.value.version : known),
+		// Where this copy came from (raw.githubusercontent.com/<owner>/<repo>), e.g. for the connector's installer.
+		source,
 		stop: () => timers.forEach((t) => (clearTimeout(t), clearInterval(t))),
 		procedures: {
 			'system.checkUpdate': {kind: 'query', run: () => check()},

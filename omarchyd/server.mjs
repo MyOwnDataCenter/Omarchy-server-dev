@@ -14,6 +14,7 @@ import {createFiles} from './files.mjs'
 import {createMachines} from './machines.mjs'
 import {createOmarchyTheme} from './omarchy-theme.mjs'
 import {createOmarchyPlugins} from './omarchy-plugins.mjs'
+import {createConnector} from './connector.mjs'
 import {createStorage} from './storage.mjs'
 import {bridge, openShell} from './terminal.mjs'
 import {createUpdater} from './updater.mjs'
@@ -23,7 +24,7 @@ import {RpcError, handleRpc, sendError, sendJson} from './rpc.mjs'
 import * as system from './system.mjs'
 import {WebSocketServer} from 'ws'
 
-export const OMARCHYD_VERSION = '0.9.28'
+export const OMARCHYD_VERSION = '0.9.29'
 
 export async function startOmarchyd({port = 2021, host = '127.0.0.1', dataDir, tlsDir: sharedTlsDir = null, home = os.homedir(), webPort = 7780, machineOptions = {}, appOptions = {}, storageOptions = {}, updaterOptions = {}, pluginOptions = {}, themeOptions = {}, desktopVncPort = 5900, desktopVncSocket = join(process.env.XDG_RUNTIME_DIR || `/run/user/${process.getuid?.() ?? ''}`, 'omarchy-server', 'desktop-vnc.sock')}) {
 	const accounts = await openAccounts(dataDir)
@@ -120,6 +121,13 @@ export async function startOmarchyd({port = 2021, host = '127.0.0.1', dataDir, t
 		'omarchy.removeTheme': {kind: 'mutation', run: (input, {auth}) => (ownerOnly(auth), themeCall(() => omarchyTheme.removeTheme(String(input?.slug ?? ''))))},
 		// Verified plugins from the Omarchy plugin registry (see omarchy-plugins.mjs).
 		'omarchy.plugins': {kind: 'query', run: (input) => themeCall(() => omarchyPlugins.list(input ?? {}))},
+		// Local swarm (connector.mjs): owner only.
+		...Object.fromEntries(
+			['swarm.list', 'swarm.pair', 'swarm.remove', 'swarm.rename', 'swarm.setAbilities', 'swarm.action', 'swarm.desktopCheck'].map((name) => [
+				name,
+				{kind: name === 'swarm.list' || name === 'swarm.desktopCheck' ? 'query' : 'mutation', run: (input, {auth}) => (ownerOnly(auth, 'manage the local swarm'), connector.procedures[name].run(input))},
+			]),
+		),
 		'omarchy.installPlugin': {kind: 'mutation', run: (input, {auth}) => (ownerOnly(auth, 'install Omarchy plugins'), themeCall(() => omarchyPlugins.install(input)))},
 		'omarchy.removePlugin': {kind: 'mutation', run: (input, {auth}) => (ownerOnly(auth, 'remove Omarchy plugins'), themeCall(() => omarchyPlugins.remove(input)))},
 		'user.get': {kind: 'query', run: (_i, {auth}) => ({...accounts.getUser(auth.userId), wallpaper: {id: '1'}, sambaUsername: os.userInfo().username})},
@@ -310,6 +318,8 @@ export async function startOmarchyd({port = 2021, host = '127.0.0.1', dataDir, t
 
 	const omarchyTheme = createOmarchyTheme({home, ...themeOptions})
 	const omarchyPlugins = createOmarchyPlugins({home, theme: omarchyTheme, ...pluginOptions})
+	// Local swarm: other Linux computers joined through the connector (see connector.mjs).
+	const connector = createConnector({dataDir, tlsDir, plugins: omarchyPlugins, source: () => updater.source(), webPort})
 	let signedInAt = 0
 	// After a sign-in from the web, lock the desktop again once nobody is viewing it (Settings →
 	// Security), so the screen isn't left signed in at the server itself. A short wait lets a page
@@ -518,6 +528,24 @@ WantedBy=graphical-session.target
 		try {
 			if (url.pathname.startsWith('/trpc/')) return await handleRpc(req, res, url, procedures, (r) => accounts.authenticate(r))
 			if (url.pathname === '/assets/wallpapers/1.jpg' && req.method === 'GET') return await wallpaper(res)
+			// A connector trading its one-time pairing code for its own id and key.
+			if (url.pathname === '/connector/enroll' && req.method === 'POST') {
+				let size = 0
+				const chunks = []
+				for await (const c of req) {
+					size += c.length
+					if (size > 64 * 1024) return sendJson(res, 413, {error: 'Too large'})
+					chunks.push(c)
+				}
+				let body = null
+				try {
+					body = JSON.parse(Buffer.concat(chunks).toString('utf8'))
+				} catch {
+					return sendJson(res, 400, {error: 'Bad request'})
+				}
+				const r = await connector.enroll(body)
+				return sendJson(res, r.status, r.body)
+			}
 			// Omarchy's themes and their backgrounds (local only; the web app proxies them).
 			if (url.pathname === '/omarchy/themes' && req.method === 'GET') return sendJson(res, 200, await omarchyTheme.list())
 			const bg = /^\/omarchy\/background\/(current|[0-9a-f]{16})$/.exec(url.pathname)
@@ -556,6 +584,8 @@ WantedBy=graphical-session.target
 		}
 		try {
 			const url = new URL(req.url ?? '/', 'http://localhost')
+			// A connector on another computer (it signs in with its own key, checked in connector.mjs).
+			if (url.pathname === '/connector/ws') return await connector.upgradeAgent(req, socket, head)
 			const route = {'/machines/console': 'machines', '/terminal': 'terminal'}[url.pathname]
 			if (!route) return refuse('404 Not Found')
 			const t = tickets.get(url.searchParams.get('ticket') ?? '')
@@ -566,6 +596,12 @@ WantedBy=graphical-session.target
 				const cols = Number(url.searchParams.get('cols'))
 				const rows = Number(url.searchParams.get('rows'))
 				if (!Number.isInteger(cols) || !Number.isInteger(rows) || cols < 10 || cols > 500 || rows < 4 || rows > 300) return refuse('400 Bad Request')
+				// A computer in the local swarm: its connector opens the shell.
+				const agentId = url.searchParams.get('agentId')
+				if (agentId) {
+					if (!/^[0-9a-f]{12}$/.test(agentId)) return refuse('400 Bad Request')
+					return wss.handleUpgrade(req, socket, head, (ws) => connector.openChannel(agentId, 'pty', ws, {cols, rows}))
+				}
 				const appId = url.searchParams.get('appId')
 				const inApp = appId ? await apps.shellFor(appId).catch(() => null) : null
 				if (appId && !inApp) return refuse('409 Conflict')
@@ -575,6 +611,8 @@ WantedBy=graphical-session.target
 			}
 			// "desktop" is this server's own Omarchy desktop, shared by wayvnc on 127.0.0.1 only.
 			const machineId = url.searchParams.get('machineId') ?? ''
+			// A computer in the local swarm: its connector shares its screen.
+			if (connector.isAgentMachine(machineId)) return wss.handleUpgrade(req, socket, head, (ws) => connector.openChannel(machineId.slice(6), 'vnc', ws))
 			const target = machineId === 'desktop' ? await desktopTarget() : await machines.vncSocket(machineId).then((path) => ({path}), () => null)
 			if (!target) return refuse('409 Conflict')
 			const vnc = net.connect(target)
@@ -623,7 +661,7 @@ WantedBy=graphical-session.target
 		}
 	}, 20_000).unref?.()
 
-	return {url: `http://${host}:${server.address().port}`, accounts, close: () => (apps.close(), updater.stop(), new Promise((r) => server.close(r)))}
+	return {url: `http://${host}:${server.address().port}`, accounts, close: () => (apps.close(), updater.stop(), connector.close(), new Promise((r) => server.close(r)))}
 }
 
 // The "always use the secure address" choice made while omarchyd kept its own certificate folder.
