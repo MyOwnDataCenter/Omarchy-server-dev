@@ -16,6 +16,12 @@ import {RpcError} from './rpc.mjs'
 
 export const REPO_RAW = 'https://raw.githubusercontent.com/TouchWorkStation/omarchy-server'
 export const INSTALL_COMMAND = 'curl -fsSL https://raw.githubusercontent.com/TouchWorkStation/omarchy-server/main/install.sh | bash'
+// Where this copy came from: the GitHub repository it was installed from (its git origin), so a copy
+// installed from omarchy-server-dev checks and updates from there, and one from omarchy-server from there.
+export function rawFromOrigin(url) {
+	const m = /^(?:https:\/\/github\.com\/|git@github\.com:)([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+?)(?:\.git)?\/?$/.exec(String(url).trim())
+	return m ? `https://raw.githubusercontent.com/${m[1]}/${m[2]}` : null
+}
 const HELPER = '/usr/local/libexec/omarchy-server/helper.mjs'
 
 function execP(cmd, args, {cwd, env, timeout = 15 * 60_000} = {}) {
@@ -54,7 +60,11 @@ export function releaseNotes(changelogSource, since) {
 	return out.join('\n\n')
 }
 
-export function createUpdater({autoCheck = true, appDir, dataDir, currentVersion, run = execP, fetchImpl = fetch, raw = REPO_RAW, branch = 'main', helperPath = HELPER, restartDelay = '2s'}) {
+export function createUpdater({autoCheck = true, appDir, dataDir, currentVersion, run = execP, fetchImpl = fetch, raw = null, branch = 'main', helperPath = HELPER, restartDelay = '2s'}) {
+	let rawBase = raw
+	const source = async () =>
+		(rawBase ??= await run('git', ['-C', appDir, 'remote', 'get-url', 'origin'], {timeout: 10_000}).then(rawFromOrigin, () => null).then((r) => r ?? REPO_RAW))
+	const installCommand = async () => `curl -fsSL ${await source()}/${branch}/install.sh | bash`
 	const statusFile = join(dataDir, 'update.json')
 	let status = {running: false, progress: 0, description: '', error: false}
 	let cache = null
@@ -71,14 +81,14 @@ export function createUpdater({autoCheck = true, appDir, dataDir, currentVersion
 				status =
 					compareVersions(currentVersion, saved.target) >= 0
 						? {running: false, progress: 100, description: `Updated to ${saved.target}`, error: false}
-						: {running: false, progress: 0, description: '', error: `The update to ${saved.target} didn’t take effect. Run the installer: ${INSTALL_COMMAND}`}
+						: {running: false, progress: 0, description: '', error: `The update to ${saved.target} didn’t take effect. Run the installer: ${await installCommand()}`}
 				await save()
 			}
 		} catch {}
 	})()
 
 	const get = async (path) => {
-		const res = await fetchImpl(`${raw}/${branch}/${path}?t=${Date.now()}`, {signal: AbortSignal.timeout(15_000), headers: {'cache-control': 'no-cache'}})
+		const res = await fetchImpl(`${await source()}/${branch}/${path}?t=${Date.now()}`, {signal: AbortSignal.timeout(15_000), headers: {'cache-control': 'no-cache'}})
 		if (!res.ok) throw new Error(`GitHub answered ${res.status}`)
 		return res.text()
 	}
@@ -117,7 +127,7 @@ export function createUpdater({autoCheck = true, appDir, dataDir, currentVersion
 		if (available) {
 			notes = await get('web/src/changelog.ts').then((t) => releaseNotes(t, currentVersion), () => '')
 			const reasons = await needsInstaller()
-			if (reasons.length) notes = `**After updating, run the installer on the server** (${reasons.join('; ')}):\n\n    ${INSTALL_COMMAND}\n\n${notes}`
+			if (reasons.length) notes = `**After updating, run the installer on the server** (${reasons.join('; ')}):\n\n    ${await installCommand()}\n\n${notes}`
 		}
 		const value = {available, version: available ? latest : currentVersion, name: `Omarchy Server ${available ? latest : currentVersion}`, ...(notes ? {releaseNotes: notes} : {})}
 		cache = {at: Date.now(), value}
@@ -134,7 +144,7 @@ export function createUpdater({autoCheck = true, appDir, dataDir, currentVersion
 		if (busy) throw new RpcError('CONFLICT', 'An update is already running')
 		const {available, version} = await check({force: true})
 		if (!available) throw new RpcError('BAD_REQUEST', 'Omarchy Server is already up to date')
-		if (!(await run('git', ['-C', appDir, 'rev-parse', 'HEAD']).then(() => true, () => false))) throw new RpcError('PRECONDITION_FAILED', `This copy can’t update itself. Run the installer: ${INSTALL_COMMAND}`)
+		if (!(await run('git', ['-C', appDir, 'rev-parse', 'HEAD']).then(() => true, () => false))) throw new RpcError('PRECONDITION_FAILED', `This copy can’t update itself. Run the installer: ${await installCommand()}`)
 		busy = true
 		status = {running: true, progress: 2, description: 'Starting', error: false, target: version}
 		await save()

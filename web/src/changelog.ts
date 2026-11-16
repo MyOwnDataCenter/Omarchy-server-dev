@@ -4,6 +4,15 @@ export type Release = {version: string; date: string; title: string; added?: str
 
 export const CHANGELOG: Release[] = [
 	{
+		version: '0.9.28',
+		date: '2026-11-16',
+		title: 'Updates come from where you installed',
+		added: [
+			'Omarchy Server now checks for and installs updates from the repository it was installed from. A server installed from the development copy (omarchy-server-dev) gets development updates; one installed from omarchy-server gets those.',
+			'Running an installer from a different copy switches the server to that copy, for that update and the ones after it.',
+		],
+	},
+	{
 		version: '0.9.27',
 		date: '2026-11-15',
 		title: 'Bell back to size; sharing on a fresh Samba',

@@ -1,4 +1,11 @@
-# Omarchy Server
+# Omarchy Server (development copy)
+
+> **This is the development copy of [Omarchy Server](https://github.com/TouchWorkStation/omarchy-server).**
+> New work is built and tested here first, then moved to omarchy-server when it's ready. A server
+> installed from here also updates from here. For the stable version, use omarchy-server.
+>
+> When moving code to omarchy-server, keep omarchy-server's own repository address in `install.sh`
+> (the line marked `DEV REPO`) and this README.
 
 Turn an [Omarchy](https://omarchy.org) machine into a home server you run from any browser. Install
 apps from a catalog of about 580, keep your files and drives in one place, run virtual machines, and
@@ -18,7 +25,7 @@ reach your real Omarchy desktop — from a phone, a tablet or another computer.
 On the Omarchy machine, as your normal user (not with sudo):
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/TouchWorkStation/omarchy-server/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/TouchWorkStation/omarchy-server-dev/main/install.sh | bash
 ```
 
 The installer:
