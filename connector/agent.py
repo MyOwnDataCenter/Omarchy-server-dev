@@ -712,7 +712,10 @@ def forget():
         os.unlink(CONFIG)
     except OSError:
         pass
-    subprocess.run(["systemctl", "--user", "disable", "omarchy-connector.service"], capture_output=True)
+    try:
+        subprocess.run(["systemctl", "--user", "disable", "omarchy-connector.service"], capture_output=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        pass  # not run by systemd (or no systemd): stopping is enough
     os._exit(0)
 
 

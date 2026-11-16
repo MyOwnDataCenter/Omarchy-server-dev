@@ -26,7 +26,8 @@ const PY = {
 	debian: 'apt-get update -qq && apt-get install -y -qq python3 >/dev/null',
 	ubuntu: 'apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3 >/dev/null',
 	fedora: 'dnf install -y -q python3 >/dev/null',
-	archlinux: 'pacman -Sy --noconfirm --needed python >/dev/null',
+	// A container image lags the repositories, so update it whole (a real Arch system is current).
+	archlinux: 'pacman -Syu --noconfirm --needed python >/dev/null',
 	opensuse: 'zypper -q --non-interactive install python3 >/dev/null',
 }
 const images = process.argv.slice(2)
