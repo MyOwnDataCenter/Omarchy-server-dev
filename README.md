@@ -136,6 +136,36 @@ pastes. On a phone there's a key row with Esc, Tab, Ctrl, Alt and arrows.
 
 ![System in the desktop layout](docs/screenshots/desktop-system.png)
 
+## Local swarm (other Linux computers)
+
+Join your other Linux computers to your server and see them in **Machines → Local swarm**:
+watch them (CPU, memory, disks, temperature, updates waiting), open a terminal, see and use their
+desktop, and manage them (verified Omarchy plugins, Omarchy theme, updates, restart). Linux only, on
+any distribution with systemd: Omarchy, Arch, Debian, Ubuntu, Fedora, openSUSE and their relatives.
+
+1. On your server: **Machines → Local swarm → Add a computer**. Choose what it may do (Terminal,
+   Desktop, Manage; watching is always on) and tap **Make the install command**.
+2. On the other computer, open a terminal as the person who uses it (not root), paste the command
+   and press Enter. It asks for your password only to install Python, git and screen sharing, and
+   to keep the connector running while you're signed out.
+3. It appears in Local swarm within a few seconds.
+
+How it stays safe: the connector ([connector/agent.py](connector/agent.py)) runs as that user (a
+systemd user service), never as root, and dials out to your server, so the computer opens no ports.
+The command carries your server's certificate fingerprint, checked before anything is sent, and a
+pairing code that works once, for 15 minutes. The computer only ever allows what you chose when it
+joined (the connector enforces it as well as the server), there is no "run any command": the
+terminal is a shell you type into, and Manage is a short fixed list. The desktop is shared only
+through a private socket in that user's runtime folder. Remove a computer and its connector forgets
+your server and stops. To take the connector off a computer:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/TouchWorkStation/omarchy-server-dev/main/connector/install.sh | bash -s -- --uninstall
+```
+
+The desktop works with Hyprland, Sway and other wlroots desktops (wayvnc) and X11 desktops
+(x11vnc). GNOME and KDE on Wayland can't be shared yet: sign in with an X11 session there.
+
 ## Security
 
 - **Your password stays on the server:** it's created in the terminal, stored as a scrypt hash.

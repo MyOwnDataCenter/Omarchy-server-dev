@@ -8,6 +8,7 @@ import {useAction, useMachines} from '../data'
 import {useMachineDetails} from '../machines/api'
 import {BackupsPanel, CloudInitPanel, HardwarePanel, HistoryPanel, MonitorPanel, OptionsPanel, PANELS, SnapshotsPanel, SummaryPanel, usePowerActions, type PanelId} from '../machines/panels'
 import {Icon, type IconName} from '../icons'
+import {LocalSwarm} from '../swarm/Swarm'
 import {Sheet, SheetHeader, StatusPill, haptic, machineStatus} from '../ui'
 
 export function osLook(osId = ''): {icon: IconName; bg: string; name: string} {
@@ -150,6 +151,7 @@ export function Machines() {
 					}}
 				/>
 			)}
+			<LocalSwarm />
 			<CreateMachine open={creating} onClose={() => setCreating(false)} />
 			{consoleMachine && <Console machine={consoleMachine} onClose={() => setConsoleId(null)} />}
 		</div>

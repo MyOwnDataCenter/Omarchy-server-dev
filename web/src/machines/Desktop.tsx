@@ -8,6 +8,7 @@ import {useMachines} from '../data'
 import {useDesktop} from '../desktop/Desktop'
 import {Icon, type IconName} from '../icons'
 import {PortForwarding, osLook} from '../screens/Machines'
+import {LocalSwarm, useSwarm} from '../swarm/Swarm'
 import {bytes, duration, haptic, useConfirm} from '../ui'
 import {mib, useAllTasks, useBackups, useMachineAction, useMachineDetails, useNode, when} from './api'
 import {
@@ -25,7 +26,7 @@ import {
 	type PanelId,
 } from './panels'
 
-type Sel = {kind: 'node'} | {kind: 'vm'; id: string}
+type Sel = {kind: 'node'} | {kind: 'vm'; id: string} | {kind: 'swarm'}
 
 export function MachinesDesktop() {
 	const machines = useMachines()
@@ -40,6 +41,8 @@ export function MachinesDesktop() {
 		if (sel.kind === 'vm' && machines.isSuccess && !selected) setSel({kind: 'node'})
 	}, [sel, selected, machines.isSuccess])
 	const host = node.data?.hostname ?? 'server'
+	const swarm = useSwarm()
+	const swarmList = swarm.data ?? []
 	return (
 		<div className="pve">
 			<header className="pve-top">
@@ -77,9 +80,23 @@ export function MachinesDesktop() {
 						</button>
 					))}
 					{machines.isLoading && <div className="pve-tree-note">Loading…</div>}
+					<button type="button" className={`pve-node${sel.kind === 'swarm' ? ' on' : ''}`} onClick={() => setSel({kind: 'swarm'})}>
+						<Icon name="devices" size={15} />
+						<span>Local swarm</span>
+						{swarmList.length > 0 && (
+							<span className="muted" style={{marginLeft: 'auto', fontSize: 12}}>
+								{swarmList.filter((a) => a.online).length}/{swarmList.length}
+							</span>
+						)}
+					</button>
 				</aside>
 				<section className="pve-content">
-					{sel.kind === 'node' || !selected ? (
+					{sel.kind === 'swarm' ? (
+						<div className="pve-swarm">
+							<h3 style={{margin: '0 0 10px'}}>Local swarm</h3>
+							<LocalSwarm heading={false} />
+						</div>
+					) : sel.kind === 'node' || !selected ? (
 						<NodeView onSelect={(id) => setSel({kind: 'vm', id})} onCreate={() => setCreating(true)} />
 					) : (
 						<VmView key={selected.id} m={selected} host={host} panel={panel} setPanel={setPanel} onGone={() => setSel({kind: 'node'})} />

@@ -77,7 +77,20 @@ function cssVar(name: string, fallback: string) {
 	return getComputedStyle(document.documentElement).getPropertyValue(name).trim() || fallback
 }
 
-export function TerminalScreen({app, onClose, embedded, input}: {app?: {id: string; name?: string; icon?: string}; onClose: () => void; embedded?: boolean; input?: string}) {
+export function TerminalScreen({
+	app,
+	agent,
+	onClose,
+	embedded,
+	input,
+}: {
+	app?: {id: string; name?: string; icon?: string}
+	// A computer in the local swarm (through its connector), instead of this server.
+	agent?: {id: string; name: string}
+	onClose: () => void
+	embedded?: boolean
+	input?: string
+}) {
 	const portalRoot = usePortalRoot()
 	const root = useRef<HTMLDivElement>(null)
 	const host = useRef<HTMLDivElement>(null)
@@ -220,7 +233,7 @@ export function TerminalScreen({app, onClose, embedded, input}: {app?: {id: stri
 			term.resize(s.cols, s.rows)
 			term.reset()
 			const scheme = location.protocol === 'https:' ? 'wss:' : 'ws:'
-			const qs = new URLSearchParams({...(app ? {appId: app.id} : {}), cols: String(s.cols), rows: String(s.rows)})
+			const qs = new URLSearchParams({...(app ? {appId: app.id} : {}), ...(agent ? {agentId: agent.id} : {}), cols: String(s.cols), rows: String(s.rows)})
 			const ws = new WebSocket(`${scheme}//${location.host}/api/terminal?${qs}`)
 			ws.binaryType = 'arraybuffer'
 			wsRef.current = ws
@@ -294,7 +307,7 @@ export function TerminalScreen({app, onClose, embedded, input}: {app?: {id: stri
 			el.removeEventListener('contextmenu', onContextMenu)
 			term.dispose()
 		}
-	}, [app, attempt])
+	}, [app, agent?.id, attempt])
 
 	const sendSeq = (s: string) => {
 		haptic(5)
@@ -338,7 +351,7 @@ export function TerminalScreen({app, onClose, embedded, input}: {app?: {id: stri
 		window.setTimeout(() => termRef.current?.focus(), 50)
 	}
 	const live = state === 'connected'
-	const title = app ? (app.name ?? app.id) : 'Terminal'
+	const title = app ? (app.name ?? app.id) : agent ? agent.name : 'Terminal'
 
 	const keys: {label: string; onClick: () => void; on?: boolean}[] = [
 		{label: 'esc', onClick: () => sendSeq(SEQ.esc)},
@@ -375,7 +388,7 @@ export function TerminalScreen({app, onClose, embedded, input}: {app?: {id: stri
 					<b>{title}</b>
 					<span>
 						<i className={`dot ${live ? 'live' : state === 'connecting' ? '' : 'down'}`} />
-						{live ? (app ? 'App shell' : 'Omarchy Server shell') : state === 'connecting' ? 'Connecting…' : 'Disconnected'}
+						{live ? (app ? 'App shell' : agent ? 'Shell through its connector' : 'Omarchy Server shell') : state === 'connecting' ? 'Connecting…' : 'Disconnected'}
 					</span>
 				</div>
 				<button className="round-btn" aria-label="Paste" onClick={paste} disabled={!live}>

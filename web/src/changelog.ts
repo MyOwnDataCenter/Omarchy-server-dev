@@ -4,6 +4,18 @@ export type Release = {version: string; date: string; title: string; added?: str
 
 export const CHANGELOG: Release[] = [
 	{
+		version: '0.9.29',
+		date: '2026-11-16',
+		title: 'Local swarm: your other Linux computers',
+		added: [
+			'Machines → Local swarm: join your other Linux computers (Omarchy, Ubuntu, Debian, Fedora, Arch, openSUSE and their relatives) with one command, and see them here with their CPU, memory, disks, temperature and updates waiting.',
+			'Open a terminal on any of them, or see and use its desktop (Hyprland, Sway and other X11 or wlroots desktops), right from Omarchy Server.',
+			'Manage them: install verified Omarchy plugins at the exact version the registry checked, change the Omarchy theme, run updates in a terminal you can watch, or restart.',
+			'Add a computer walks you through it: choose what it may do, copy the command, paste it on that computer. It checks it’s talking to your server before it sends anything, the code works once, and the computer opens no ports.',
+			'Each computer only allows what you chose when it joined. You can switch things off later, rename it, or remove it, and a removed computer’s connector forgets your server and stops.',
+		],
+	},
+	{
 		version: '0.9.28',
 		date: '2026-11-16',
 		title: 'Updates come from where you installed',

@@ -7507,3 +7507,63 @@ html.page-locked body {
 	width: 100%;
 	height: 100%;
 }
+
+/* ---- Local swarm ------------------------------------------------------------------------------ */
+.swarm-steps {
+	margin: 0 4px;
+	padding: 0;
+	list-style: none;
+	counter-reset: step;
+	display: flex;
+	flex-direction: column;
+	gap: 16px;
+}
+.swarm-steps li {
+	counter-increment: step;
+	position: relative;
+	padding-left: 40px;
+	display: flex;
+	flex-direction: column;
+	gap: 4px;
+	font-size: 14px;
+}
+.swarm-steps li::before {
+	content: counter(step);
+	position: absolute;
+	left: 0;
+	top: -2px;
+	width: 28px;
+	height: 28px;
+	border-radius: 50%;
+	display: grid;
+	place-items: center;
+	font-weight: 700;
+	font-size: 13.5px;
+	background: color-mix(in srgb, var(--accent) 22%, transparent);
+	color: var(--accent);
+}
+.swarm-steps li > span {
+	color: var(--muted);
+}
+.swarm-cmd {
+	display: block;
+	margin-top: 8px;
+	padding: 10px 12px;
+	border-radius: 12px;
+	background: rgba(0, 0, 0, 0.35);
+	color: var(--text, #fff);
+	font-size: 12px;
+	line-height: 1.45;
+	word-break: break-all;
+	user-select: all;
+	-webkit-user-select: all;
+}
+.swarm-steps .chip.on {
+	background: var(--accent);
+	color: #fff;
+}
+.pve-swarm {
+	padding: 16px 18px;
+	overflow: auto;
+	height: 100%;
+}
