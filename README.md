@@ -11,13 +11,13 @@ Turn an [Omarchy](https://omarchy.org) machine into a home server you run from a
 apps from a catalog of about 580, keep your files and drives in one place, run virtual machines, and
 reach your real Omarchy desktop — from a phone, a tablet or another computer.
 
-![The desktop layout in a browser, with the app launcher open](docs/screenshots/desktop-overview.png)
+![Omarchy Server's desktop in a browser, with App Store, Machines and Terminal windows open](docs/screenshots/desktop-overview.jpg)
 
 <p align="center">
   <img src="docs/screenshots/phone-home.png" width="24%" alt="Home on a phone">
   <img src="docs/screenshots/phone-store.png" width="24%" alt="App Store on a phone">
-  <img src="docs/screenshots/phone-system.png" width="24%" alt="System on a phone">
-  <img src="docs/screenshots/phone-machines.png" width="24%" alt="Machines on a phone">
+  <img src="docs/screenshots/phone-site-home.png" width="24%" alt="touchworkstation.com on a phone: the dashboard and the current release">
+  <img src="docs/screenshots/phone-site-machines.png" width="24%" alt="touchworkstation.com on a phone: virtual machines">
 </p>
 
 ## Install
@@ -59,6 +59,8 @@ where you left off; add `--purge` to delete those too.
 - **The dock your way:** left, bottom, right or top; any icon size; lift or magnify under the pointer;
   bounce when an app opens; floating or auto-hide.
 
+![Desktop & Dock settings with the desktop themes](docs/screenshots/desktop-themes.jpg)
+
 ### Apps
 
 - **App Store:** about 580 self-hosted apps (Jellyfin, Immich, Nextcloud, Home Assistant, Vaultwarden,
@@ -76,8 +78,6 @@ where you left off; add `--purge` to delete those too.
 - **Behind your sign-in:** every app's port admits only browsers signed in to Omarchy Server.
 - Start, stop, restart, update, logs, and a shell inside any app.
 
-![App Store in the desktop layout](docs/screenshots/desktop-app-store.png)
-
 ### Files
 
 - Your real home folder, so the browser and the Omarchy desktop see the same files.
@@ -85,8 +85,6 @@ where you left off; add `--purge` to delete those too.
   recents, and the same Trash as Omarchy's file manager.
 - View photos, videos, music, PDFs, documents, spreadsheets and code in the browser.
 - Photo sync from your phone, and SMB network shares for any folder.
-
-![Files in the desktop layout](docs/screenshots/desktop-files.png)
 
 ### Machines (virtual machines)
 
@@ -99,6 +97,8 @@ where you left off; add `--purge` to delete those too.
 - The screen in your browser with keyboard, mouse and touch controls, clipboard paste, and
   port forwarding to services inside a machine.
 - Machines run as you under libvirt's per-user session, not as root.
+
+![Machines in the desktop layout: the server's status, its virtual machines and backups](docs/screenshots/desktop-machines.jpg)
 
 ### Your Omarchy desktop, remotely
 
@@ -114,8 +114,6 @@ where you left off; add `--purge` to delete those too.
 
 A real login shell in the browser, or a shell inside any app. Right-click copies a selection or
 pastes. On a phone there's a key row with Esc, Tab, Ctrl, Alt and arrows.
-
-![Terminal in the desktop layout](docs/screenshots/desktop-terminal.png)
 
 ### Storage and NAS
 
@@ -133,8 +131,6 @@ pastes. On a phone there's a key row with Esc, Tab, Ctrl, Alt and arrows.
 - If a drive got bigger (a resized virtual disk, say), it shows the space that isn't in use yet and
   the exact commands to grow into it.
 - Device name, Wi-Fi, logs, restart, shut down, factory reset, and a What's New after every update.
-
-![System in the desktop layout](docs/screenshots/desktop-system.png)
 
 ## Local swarm (other Linux computers)
 
