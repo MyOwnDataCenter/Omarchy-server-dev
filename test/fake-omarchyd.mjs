@@ -712,7 +712,7 @@ export async function startFakeserverd({
 		const ticket = url.searchParams.get('ticket')
 		if (url.pathname === '/terminal') {
 			if (!ticket?.startsWith('terminal:') || !tickets.delete(ticket)) return socket.destroy()
-			terminals.push({appId: url.searchParams.get('appId'), cols: Number(url.searchParams.get('cols')), rows: Number(url.searchParams.get('rows'))})
+			terminals.push({appId: url.searchParams.get('appId'), cols: Number(url.searchParams.get('cols')), rows: Number(url.searchParams.get('rows')), ...(url.searchParams.get('fresh') ? {fresh: url.searchParams.get('fresh')} : {})})
 			return wss.handleUpgrade(req, socket, head, (ws) => shellServer(ws, url.searchParams.get('appId'), keys))
 		}
 		if (url.pathname !== '/machines/console' || !ticket?.startsWith('machines:') || !tickets.delete(ticket) || !url.searchParams.get('machineId') || !url.searchParams.get('sessionId')) {
