@@ -16,7 +16,7 @@ import {createOmarchyTheme} from './omarchy-theme.mjs'
 import {createOmarchyPlugins} from './omarchy-plugins.mjs'
 import {createConnector} from './connector.mjs'
 import {createStorage} from './storage.mjs'
-import {bridge, openShell} from './terminal.mjs'
+import {createTerminalSessions} from './terminal.mjs'
 import {createUpdater} from './updater.mjs'
 import {createSystemApps} from './system-apps.mjs'
 import {authorityInfo, readPolicy, rotateAuthority, tlsContext, writePolicy} from './tls.mjs'
@@ -24,7 +24,7 @@ import {RpcError, handleRpc, sendError, sendJson} from './rpc.mjs'
 import * as system from './system.mjs'
 import {WebSocketServer} from 'ws'
 
-export const OMARCHYD_VERSION = '0.9.29'
+export const OMARCHYD_VERSION = '0.9.30'
 
 export async function startOmarchyd({port = 2021, host = '127.0.0.1', dataDir, tlsDir: sharedTlsDir = null, home = os.homedir(), webPort = 7780, machineOptions = {}, appOptions = {}, storageOptions = {}, updaterOptions = {}, pluginOptions = {}, themeOptions = {}, desktopVncPort = 5900, desktopVncSocket = join(process.env.XDG_RUNTIME_DIR || `/run/user/${process.getuid?.() ?? ''}`, 'omarchy-server', 'desktop-vnc.sock')}) {
 	const accounts = await openAccounts(dataDir)
@@ -576,6 +576,7 @@ WantedBy=graphical-session.target
 	})
 	// VM screens: /machines/console?machineId=…&ticket=… (subprotocol "binary") <-> the machine's
 	// VNC unix socket. Only reachable on localhost, and only with a fresh ticket.
+	const terminals = createTerminalSessions()
 	const wss = new WebSocketServer({noServer: true, maxPayload: 16 * 1024 * 1024})
 	server.on('upgrade', async (req, socket, head) => {
 		const refuse = (status) => {
@@ -605,8 +606,11 @@ WantedBy=graphical-session.target
 				const appId = url.searchParams.get('appId')
 				const inApp = appId ? await apps.shellFor(appId).catch(() => null) : null
 				if (appId && !inApp) return refuse('409 Conflict')
-				const child = openShell({cols, rows, home, ...(inApp ?? {}), cwd: inApp?.cwd ?? home})
-				wss.handleUpgrade(req, socket, head, (ws) => bridge(ws, child))
+				// Your shell keeps running when you close it; opening it again picks up where you left off.
+				const fresh = url.searchParams.get('fresh') === '1'
+				wss.handleUpgrade(req, socket, head, (ws) =>
+					terminals.attach(ws, {userId: t.userId, appId: appId ?? '', cols, rows, fresh, shell: {home, ...(inApp ?? {}), cwd: inApp?.cwd ?? home}}).catch(() => ws.close(1011, 'Couldn’t start a shell')),
+				)
 				return
 			}
 			// "desktop" is this server's own Omarchy desktop, shared by wayvnc on 127.0.0.1 only.
@@ -661,7 +665,7 @@ WantedBy=graphical-session.target
 		}
 	}, 20_000).unref?.()
 
-	return {url: `http://${host}:${server.address().port}`, accounts, close: () => (apps.close(), updater.stop(), connector.close(), new Promise((r) => server.close(r)))}
+	return {url: `http://${host}:${server.address().port}`, accounts, terminals, close: () => (apps.close(), updater.stop(), connector.close(), terminals.close(), new Promise((r) => server.close(r)))}
 }
 
 // The "always use the secure address" choice made while omarchyd kept its own certificate folder.

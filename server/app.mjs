@@ -20,7 +20,7 @@ import {dualProtocolServer, wantsUpgrade} from '../omarchyd/tls.mjs'
 import {createBackendClient, BackendError} from './backend.mjs'
 import {hashId, newSessionId} from './store.mjs'
 
-export const VERSION = '0.9.29'
+export const VERSION = '0.9.30'
 const COOKIE = 'omarchy_server_sid'
 const SESSION_MAX_AGE_S = 60 * 60 * 24 * 365
 const REFRESH_MARGIN_MS = 2 * 60 * 1000
@@ -1373,7 +1373,8 @@ export function createApp({store, staticDir, fetchImpl = fetch, secureCookies = 
 
 	// WebSocket bridges: phone <-> this server <-> omarchyd.
 	//   /api/console?machineId=…            -> /machines/console (raw VNC, binary)
-	//   /api/terminal?appId=…&cols=…&rows=… -> /terminal (shell text; appId = a shell inside that app)
+	//   /api/terminal?appId=…&cols=…&rows=…[&fresh=1] -> /terminal (your shell, which keeps running when
+	//   closed; appId = a shell inside that app; fresh = end it and start a new one)
 	app.attachConsole = (server) => {
 		const wss = new WebSocketServer({noServer: true, maxPayload: 16 * 1024 * 1024})
 		server.on('upgrade', async (req, socket, head) => {
@@ -1432,7 +1433,7 @@ export function createApp({store, staticDir, fetchImpl = fetch, secureCookies = 
 					if (agentId && !/^[0-9a-f]{12}$/.test(agentId)) return refuse('400 Bad Request')
 					if (!Number.isInteger(cols) || !Number.isInteger(rows) || cols < 10 || cols > 500 || rows < 4 || rows > 300) return refuse('400 Bad Request')
 					target.pathname = '/terminal'
-					params = {...(appId ? {appId} : {}), ...(agentId ? {agentId} : {}), cols: String(cols), rows: String(rows)}
+					params = {...(appId ? {appId} : {}), ...(agentId ? {agentId} : {}), cols: String(cols), rows: String(rows), ...(url.searchParams.get('fresh') === '1' ? {fresh: '1'} : {})}
 				}
 				const ticket = await consoleTicket(sid, route)
 				target.search = new URLSearchParams({...params, ticket}).toString()

@@ -7,9 +7,10 @@ import {Terminal as XTerm} from '@xterm/xterm'
 import '@xterm/xterm/css/xterm.css'
 
 import {Icon} from './icons'
-import {AppIcon, haptic, lockPageScroll, usePortalRoot, useToast} from './ui'
+import {AppIcon, haptic, lockPageScroll, useConfirm, usePortalRoot, useToast} from './ui'
 
-type State = 'connecting' | 'connected' | 'closed' | 'error'
+// closed: the shell ended. lost: the connection dropped (the shell is still running on the server).
+type State = 'connecting' | 'connected' | 'closed' | 'lost' | 'error'
 const BASE_FONT = 13
 const SEQ = {esc: '\x1b', tab: '\t', up: '\x1b[A', down: '\x1b[B', right: '\x1b[C', left: '\x1b[D', home: '\x1b[H', end: '\x1b[F', ctrlC: '\x03'}
 
@@ -106,6 +107,10 @@ export function TerminalScreen({
 	const [pasteBox, setPasteBox] = useState(false)
 	const [pasteText, setPasteText] = useState('')
 	const mods = useRef({ctrl: false, alt: false})
+	// Your shell keeps running when you close this; reopening resumes it. `fresh` asks for a new one.
+	const [resumed, setResumed] = useState(false)
+	const fresh = useRef(false)
+	const confirm = useConfirm()
 	// A command to have ready at the prompt (typed, never run: you press Enter). Only once.
 	const pending = useRef(input)
 	mods.current = {ctrl, alt}
@@ -233,7 +238,8 @@ export function TerminalScreen({
 			term.resize(s.cols, s.rows)
 			term.reset()
 			const scheme = location.protocol === 'https:' ? 'wss:' : 'ws:'
-			const qs = new URLSearchParams({...(app ? {appId: app.id} : {}), ...(agent ? {agentId: agent.id} : {}), cols: String(s.cols), rows: String(s.rows)})
+			const qs = new URLSearchParams({...(app ? {appId: app.id} : {}), ...(agent ? {agentId: agent.id} : {}), cols: String(s.cols), rows: String(s.rows), ...(fresh.current ? {fresh: '1'} : {})})
+			fresh.current = false
 			const ws = new WebSocket(`${scheme}//${location.host}/api/terminal?${qs}`)
 			ws.binaryType = 'arraybuffer'
 			wsRef.current = ws
@@ -247,11 +253,37 @@ export function TerminalScreen({
 				}
 				term.focus() // types straight away with a hardware keyboard; phones may still need the keyboard button
 			}
-			ws.onmessage = (e) => term.write(typeof e.data === 'string' ? e.data : new Uint8Array(e.data))
-			ws.onclose = () => {
-				if (disposed) return
-				setState((st) => (st === 'connecting' ? 'error' : 'closed'))
-				setMessage('The shell has ended.')
+			ws.onmessage = (e) => {
+				if (typeof e.data !== 'string') return term.write(new Uint8Array(e.data))
+				// Text frames are about the session: resumed (what was on screen follows, drawn at the
+				// size it was), and the size it's now at. Resize in order with the output around it.
+				let m: {type?: string; resumed?: boolean; cols?: number; rows?: number}
+				try {
+					m = JSON.parse(e.data)
+				} catch {
+					return
+				}
+				if (m.type === 'session') setResumed(!!m.resumed)
+				if ((m.type === 'session' || m.type === 'size') && m.cols && m.rows) {
+					const {cols, rows} = m
+					term.write('', () => {
+						if (cols === term.cols && rows === term.rows) return
+						size.current = {...size.current, cols, rows}
+						term.resize(cols, rows)
+						fit()
+					})
+				}
+			}
+			ws.onclose = (e) => {
+				if (disposed || wsRef.current !== ws) return
+				if (e.code === 1000 && e.reason === 'Shell ended') {
+					setState('closed')
+					setMessage('The shell has ended.')
+				} else {
+					setState((st) => (st === 'connecting' ? 'error' : 'lost'))
+					// A swarm computer's shell goes through its connector and isn't kept (yet): it ended.
+					setMessage(agent ? 'The connection to it dropped. Reconnect for a new shell.' : 'Your shell is still running on the server. Reconnect to pick up where you left off.')
+				}
 			}
 		}
 		connect()
@@ -283,14 +315,15 @@ export function TerminalScreen({
 		term.onRender(follow)
 
 		// On rotate / keyboard, keep the shell's columns and scale the font to fit the width.
-		const ro = new ResizeObserver(() => {
+		const fit = () => {
 			const {cols, cellW, font, ready} = size.current
 			if (!ready) return
 			const fitted = Math.max(8, Math.min(20, (font * (el.clientWidth - 12)) / (cols * cellW)))
 			if (Math.abs(fitted - (term.options.fontSize ?? BASE_FONT)) > 0.3) term.options.fontSize = Math.round(fitted * 2) / 2
 			term.scrollToBottom()
 			follow()
-		})
+		}
+		const ro = new ResizeObserver(fit)
 		ro.observe(el)
 		ro.observe(frame)
 		const rootEl = root.current
@@ -351,6 +384,20 @@ export function TerminalScreen({
 		window.setTimeout(() => termRef.current?.focus(), 50)
 	}
 	const live = state === 'connected'
+	// End the shell that's running (and whatever is running in it) and start a new one.
+	const newSession = async () => {
+		haptic(6)
+		const ok = await confirm({
+			title: 'Start a new session?',
+			body: 'The shell that’s running now ends, along with anything still running in it. (Closing the terminal doesn’t do this: your shell keeps running until you exit it.)',
+			confirm: 'New session',
+			icon: 'reset',
+		})
+		if (!ok) return
+		fresh.current = true
+		setResumed(false)
+		setAttempt((a) => a + 1)
+	}
 	const title = app ? (app.name ?? app.id) : agent ? agent.name : 'Terminal'
 
 	const keys: {label: string; onClick: () => void; on?: boolean}[] = [
@@ -388,9 +435,14 @@ export function TerminalScreen({
 					<b>{title}</b>
 					<span>
 						<i className={`dot ${live ? 'live' : state === 'connecting' ? '' : 'down'}`} />
-						{live ? (app ? 'App shell' : agent ? 'Shell through its connector' : 'Omarchy Server shell') : state === 'connecting' ? 'Connecting…' : 'Disconnected'}
+						{live ? `${app ? 'App shell' : agent ? 'Shell through its connector' : 'Omarchy Server shell'}${resumed ? ' · resumed' : ''}` : state === 'connecting' ? 'Connecting…' : 'Disconnected'}
 					</span>
 				</div>
+				{!agent && (
+					<button className="round-btn" aria-label="New session" title="New session" onClick={newSession} disabled={!live}>
+						<Icon name="reset" size={19} />
+					</button>
+				)}
 				<button className="round-btn" aria-label="Paste" onClick={paste} disabled={!live}>
 					<Icon name="clipboard" size={19} />
 				</button>
@@ -399,11 +451,11 @@ export function TerminalScreen({
 				<div ref={host} className="term-host" />
 				{state !== 'connected' && state !== 'connecting' && (
 					<div className="console-overlay">
-						<Icon name={state === 'closed' ? 'logs' : 'alert'} size={34} />
-						<b>{state === 'closed' ? 'Session ended' : 'Terminal unavailable'}</b>
+						<Icon name={state === 'closed' ? 'logs' : state === 'lost' ? 'wifi' : 'alert'} size={34} />
+						<b>{state === 'closed' ? 'Session ended' : state === 'lost' ? 'Disconnected' : 'Terminal unavailable'}</b>
 						<span>{message}</span>
 						<button className="btn primary small" onClick={() => setAttempt((a) => a + 1)}>
-							{state === 'closed' ? 'New session' : 'Try again'}
+							{state === 'closed' ? 'New session' : state === 'lost' ? 'Reconnect' : 'Try again'}
 						</button>
 					</div>
 				)}

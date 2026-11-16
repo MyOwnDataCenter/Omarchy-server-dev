@@ -5,10 +5,12 @@ import net from 'node:net'
 import os from 'node:os'
 import {join} from 'node:path'
 import {after, before, test} from 'node:test'
+import {EventEmitter} from 'node:events'
 import WebSocket from 'ws'
 
 import {openAccounts} from '../omarchyd/accounts.mjs'
 import {startOmarchyd} from '../omarchyd/server.mjs'
+import {createTerminalSessions} from '../omarchyd/terminal.mjs'
 
 let root, d, auth, vnc
 before(async () => {
@@ -44,6 +46,78 @@ test('a terminal ticket opens a sized shell in a pty; it works once', async () =
 	ws.send('exit\n')
 	await new Promise((r) => ws.once('close', r))
 	assert.equal(await refused(url), true, 'tickets are single-use')
+})
+
+// Open the terminal and collect what it shows; control messages (text frames) separately.
+async function open(params) {
+	const ws = new WebSocket(`${d.url.replace('http', 'ws')}/terminal?${new URLSearchParams({...params, ticket: await ticket('terminal')})}`)
+	const term = {ws, out: '', control: []}
+	ws.on('message', (m, binary) => (binary ? (term.out += m.toString()) : term.control.push(JSON.parse(m.toString()))))
+	await new Promise((r, j) => (ws.once('open', r), ws.once('error', j)))
+	term.until = async (re, ms = 5000) => {
+		const end = Date.now() + ms
+		while (!re.test(term.out) && Date.now() < end) await new Promise((r) => setTimeout(r, 30))
+		assert.match(term.out, re)
+	}
+	term.close = () => new Promise((r) => (ws.once('close', r), ws.close()))
+	return term
+}
+
+test('closing the terminal leaves the shell running; opening it again resumes it, at this device’s size', async () => {
+	const a = await open({cols: '91', rows: '27'})
+	assert.deepEqual(a.control[0], {type: 'session', resumed: false, cols: 91, rows: 27})
+	a.ws.send('export MARK=kept-7; echo ready-$MARK\n')
+	await a.until(/ready-kept-7/)
+	// Something still running when you close it keeps going.
+	a.ws.send('for i in 1 2 3; do sleep 0.3; echo tick-$i; done\n')
+	await a.close()
+	await new Promise((r) => setTimeout(r, 1500))
+	// Another device, another size: the same shell, with what was on screen.
+	const b = await open({cols: '100', rows: '30'})
+	assert.deepEqual(b.control[0], {type: 'session', resumed: true, cols: 91, rows: 27})
+	await b.until(/ready-kept-7[\s\S]*tick-3/)
+	await new Promise((r) => setTimeout(r, 300))
+	assert.deepEqual(b.control[1], {type: 'size', cols: 100, rows: 30})
+	b.ws.send('echo still-$MARK $(tput cols)x$(tput lines)\n')
+	await b.until(/still-kept-7 100x30/)
+	assert.equal(d.terminals.list().length, 1)
+	await b.close()
+})
+
+test('two open at once both see it; “new session” ends the old shell; exit ends it', async () => {
+	const a = await open({cols: '80', rows: '24'})
+	const b = await open({cols: '80', rows: '24'})
+	assert.equal(b.control[0].resumed, true)
+	a.ws.send('echo both-$((6*7))\n')
+	await a.until(/both-42/)
+	await b.until(/both-42/)
+	const c = await open({cols: '80', rows: '24', fresh: '1'})
+	assert.equal(c.control[0].resumed, false)
+	await new Promise((r) => (a.ws.readyState === a.ws.CLOSED ? r() : a.ws.once('close', r)))
+	c.ws.send('echo mark-[$MARK]\n')
+	await c.until(/mark-\[\]/)
+	c.ws.send('exit\n')
+	await new Promise((r) => c.ws.once('close', r))
+	assert.equal(d.terminals.list().length, 0)
+	const e = await open({cols: '80', rows: '24'})
+	assert.equal(e.control[0].resumed, false, 'after exit, the next one starts fresh')
+	e.ws.send('exit\n')
+	await new Promise((r) => e.ws.once('close', r))
+})
+
+test('each person, and each app, has their own shell', async () => {
+	const sessions = createTerminalSessions()
+	const fake = () => Object.assign(new EventEmitter(), {OPEN: 1, readyState: 1, sent: [], send(m) {this.sent.push(m)}, close() {this.readyState = 3}})
+	try {
+		const shell = {home: root, cwd: root}
+		assert.equal((await sessions.attach(fake(), {userId: 'owner', cols: 80, rows: 24, shell})).resumed, false)
+		assert.equal((await sessions.attach(fake(), {userId: 'sam', cols: 80, rows: 24, shell})).resumed, false)
+		assert.equal((await sessions.attach(fake(), {userId: 'owner', appId: 'immich', cols: 80, rows: 24, shell})).resumed, false)
+		assert.equal((await sessions.attach(fake(), {userId: 'owner', cols: 80, rows: 24, shell})).resumed, true)
+		assert.equal(sessions.list().length, 3)
+	} finally {
+		sessions.close()
+	}
 })
 
 test('a machines ticket can’t open a shell; bad sizes are refused', async () => {

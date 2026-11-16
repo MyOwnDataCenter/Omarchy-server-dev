@@ -4,6 +4,18 @@ export type Release = {version: string; date: string; title: string; added?: str
 
 export const CHANGELOG: Release[] = [
 	{
+		version: '0.9.30',
+		date: '2026-11-16',
+		title: 'Your terminal keeps running',
+		added: [
+			'Closing the terminal no longer ends your shell. Open it again, on this device or another, and you’re right where you left off, with what was on screen and anything you left running still going. App shells work the same way, one per app. (A Local swarm computer’s terminal still ends when you close it.)',
+			'If the connection drops, Reconnect picks up the same shell. Open it on two devices at once and both show the same session.',
+			'New session (the circular arrow at the top) ends the running shell and starts a fresh one. Typing exit ends it too.',
+			'Restarting the server, or installing an Omarchy Server update, still ends running shells.',
+		],
+		fixed: ['Closing the terminal used to leave its shell running out of sight on the server, with no way back to it. Shells now stop when you exit them or start a new session.'],
+	},
+	{
 		version: '0.9.29',
 		date: '2026-11-16',
 		title: 'Local swarm: your other Linux computers',
