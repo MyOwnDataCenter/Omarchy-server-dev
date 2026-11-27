@@ -110,7 +110,7 @@ export function Settings({prefs, setPrefs, onBack, onSignedOut}: {prefs: Prefs; 
 	const twoFactor = useQ<boolean>('user.is2faEnabled')
 	const oidc = useQ<{clientCount: number}>('oidc.status', undefined, {enabled: owner})
 	// Starts after a restart or power cut with nobody signed in (headless servers).
-	const bootStart = useQ<{startsAtBoot: boolean | null; diskLock?: {encrypted: boolean; unlocksItself: boolean} | null}>('system.bootStart', undefined, {enabled: owner})
+	const bootStart = useQ<{startsAtBoot: boolean | null; diskLock?: {encrypted: boolean; unlocksItself: boolean; tpm?: boolean} | null; headlessCommand?: string | null}>('system.bootStart', undefined, {enabled: owner})
 	const diskWaits = !!bootStart.data?.diskLock?.encrypted && !bootStart.data.diskLock.unlocksItself
 	const sessions = useQ<ActiveSession[]>('user.listSessions')
 	const check = useQ<{available: boolean; version: string; name: string; releaseNotes?: string}>('system.checkUpdate', undefined, {enabled: owner})
@@ -289,8 +289,16 @@ export function Settings({prefs, setPrefs, onBack, onSignedOut}: {prefs: Prefs; 
 							<span className="main">
 								<b style={{fontWeight: 600}}>Waits for the disk password after a restart</b>
 								<span>
-									This computer’s disk is encrypted. After a restart or power cut it stops at the disk password screen, before this server or remote access can start, so someone has to type it at the computer. To have it start by itself, set the disk to unlock with the computer’s TPM chip (it then unlocks only on this computer, as long as its startup isn’t changed).
+									This computer’s disk is encrypted. After a restart or power cut it stops at the disk password screen, before this server or remote access can start, so someone has to type it at the computer.{' '}
+									{bootStart.data?.diskLock?.tpm === false
+										? 'This computer has no TPM 2.0 chip turned on, so the disk can’t unlock itself. Turn the TPM on in the BIOS/UEFI settings, or reinstall Omarchy without disk encryption for a server with no screen.'
+										: 'To have it start by itself, set the disk to unlock with this computer’s TPM chip: run this in a terminal on the server (it explains what changes and asks first; your disk password keeps working).'}
 								</span>
+								{bootStart.data?.diskLock?.tpm !== false && bootStart.data?.headlessCommand && (
+									<code className="mono" style={{display: 'block', fontSize: 12, userSelect: 'all', marginTop: 6, wordBreak: 'break-all'}}>
+										{bootStart.data.headlessCommand}
+									</code>
+								)}
 							</span>
 						</div>
 					)}

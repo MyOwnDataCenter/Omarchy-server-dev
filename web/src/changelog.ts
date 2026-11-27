@@ -4,6 +4,16 @@ export type Release = {version: string; date: string; title: string; added?: str
 
 export const CHANGELOG: Release[] = [
 	{
+		version: '0.9.104',
+		date: '2026-11-27',
+		title: 'Servers with no screen come back by themselves',
+		added: [
+			'The installer has a --headless option for a server with no screen or keyboard. On an encrypted disk with a TPM 2.0 chip, it offers to let the disk unlock itself at startup, so the server comes back after a restart or power cut without someone typing the disk password. It explains what changes and asks first, and your disk password keeps working. It also reminds you to turn on the BIOS setting that powers the computer back on after a power cut. Why: a headless server has to start on its own.',
+			'Settings → Software update shows the --headless command when the disk still waits for its password, and says so when this computer has no TPM.',
+			'With no monitor attached, the desktop view adds a virtual screen, so there is something to show. It goes away when a monitor is connected.',
+		],
+	},
+	{
 		version: '0.9.103',
 		date: '2026-11-27',
 		title: 'Terminals, a clip book, and a way back in',

@@ -30,6 +30,8 @@ const MAX_SSE_SUBSCRIBERS = 32
 const MAX_PENDING_LAUNCHES = 8
 const MAX_CLIPBOARD_BYTES = 128 * 1024
 const RAIL_OUTPUT = 'RAIL-1'
+// A screen for a server with no monitor attached, so the web app's desktop view has something to show.
+export const HEADLESS_SCREEN = 'MODC-1'
 
 // Deterministic selector algorithm for ranking measured GPU encode presets against client RTT & target frame rate.
 export function scoreProfileCandidate(cand, {rttMs = 15} = {}) {
@@ -556,6 +558,33 @@ export function createHyprland({
 			return null
 		}
 		return rail
+	}
+
+	// A server with no monitor: Hyprland runs (Omarchy signs in by itself after startup) but has no real
+	// screen, so screen sharing (wayvnc) has nothing to show. Add a 1920x1080 virtual screen then, and
+	// take it away again once a real monitor is connected, so the mouse can't wander onto a screen
+	// nobody can see. RAIL-1 (desktop-mode app windows) doesn't count as a screen here.
+	// Returns the virtual screen's name while it's the one to share, otherwise null.
+	async function ensureHeadlessScreen() {
+		const env = await discoverEnv()
+		if (!env?.HYPRLAND_INSTANCE_SIGNATURE) return null
+		const mons = await monitorsInfo()
+		const real = mons.filter((m) => m.name !== RAIL_OUTPUT && m.name !== HEADLESS_SCREEN)
+		const virtual = mons.some((m) => m.name === HEADLESS_SCREEN)
+		if (real.length) {
+			if (virtual) await exec('hyprctl', ['output', 'remove', HEADLESS_SCREEN], {env, timeout: 4000})
+			return null
+		}
+		if (!virtual) {
+			const r = await exec('hyprctl', ['output', 'create', 'headless', HEADLESS_SCREEN], {env, timeout: 4000})
+			if (!r.ok) return null
+			await new Promise((res) => setTimeout(res, 250))
+			await hyprDispatch(
+				`hl.monitor({output = "${HEADLESS_SCREEN}", mode = "1920x1080@60", position = "auto", scale = 1})`,
+				['keyword', 'monitor', `${HEADLESS_SCREEN},1920x1080@60,auto,1`],
+			).catch(() => {})
+		}
+		return HEADLESS_SCREEN
 	}
 
 	// The screen-share view (wayvnc) shows the real display, not the headless RAIL-1 that desktop-mode
@@ -2993,6 +3022,7 @@ export function createHyprland({
 
 	return {
 		attachStream,
+		ensureHeadlessScreen,
 		focusSharedScreen,
 		readAppIcon,
 		subscribeEvents,
