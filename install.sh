@@ -21,10 +21,12 @@ usage() {
 	cat <<'EOF'
 My Own Data Center installer
 
-  install.sh [--zfs] [-h|--help]
+  install.sh [--zfs] [--headless] [-h|--help]
 
 Options:
   --zfs       Build and install OpenZFS from the AUR (zfs-utils, zfs-dkms)
+  --headless  Set this server up to start by itself after a restart or power cut, with no
+              screen or keyboard: offers to unlock an encrypted disk with this computer's TPM
   -h, --help  Show this help
 
 Environment:
@@ -38,9 +40,11 @@ EOF
 }
 
 ZFS=0
+HEADLESS=0
 for arg in "$@"; do
 	case "$arg" in
 		--zfs) ZFS=1 ;;
+		--headless) HEADLESS=1 ;;
 		-h | --help) usage; exit 0 ;;
 		*) printf 'Unknown option: %s\n\n' "$arg" >&2; usage >&2; exit 2 ;;
 	esac
@@ -64,6 +68,9 @@ UNITS="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 
 say() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 die() { printf '\033[1;31mError:\033[0m %s\n' "$*" >&2; exit 1; }
+
+# --headless asks questions (and the disk password): never from the app's unattended update.
+[ "$HEADLESS" = 0 ] || [ "$FROM_APP" = 0 ] || die "--headless asks questions, so run it yourself in a terminal on the server (ssh -t works)."
 
 # Isolation: OMARCHY_SERVER_SOURCE / OMARCHY_SERVER_APP_STORE, if set, must be absolute git
 # directories. A bad path is an error (the installer does not fall back to GitHub).
@@ -138,7 +145,10 @@ esac
 #    drive health (smartmontools), drive sleep (hdparm), network shares (samba), and tmux so the
 #    terminal outlives restarts and updates.
 need=()
-for pkg in nodejs npm git openssl wayvnc bubblewrap $vm_pkgs libvirt passt libisoburn podman docker-compose btrfs-progs smartmontools hdparm samba rsync openssh tmux; do pacman -Qi "$pkg" >/dev/null 2>&1 || need+=("$pkg"); done
+# --headless: Clevis and the TPM tools, to unlock an encrypted disk with the TPM (only if there's one).
+headless_pkgs=""
+if [ "$HEADLESS" = 1 ] && [ "$(cat /sys/class/tpm/tpm0/tpm_version_major 2>/dev/null)" = 2 ]; then headless_pkgs="clevis tpm2-tools"; fi
+for pkg in nodejs npm git openssl wayvnc bubblewrap $vm_pkgs libvirt passt libisoburn podman docker-compose btrfs-progs smartmontools hdparm samba rsync openssh tmux $headless_pkgs; do pacman -Qi "$pkg" >/dev/null 2>&1 || need+=("$pkg"); done
 # Arch doesn't support installing packages from a newer package list without updating the rest
 # ("partial upgrade"): a new package can need newer libraries than the ones installed. That's how
 # Samba ended up half-updated (samba 4.25 with its libraries, smbclient and libwbclient, at 4.24).
@@ -499,6 +509,95 @@ if [ "$(loginctl show-user "$USER" -p Linger --value 2>/dev/null)" != "yes" ]; t
 	if [ "$(loginctl show-user "$USER" -p Linger --value 2>/dev/null)" != "yes" ]; then
 		say "Couldn't turn that on: after a restart this server stays off until you sign in. To fix it, run: sudo loginctl enable-linger $USER"
 	fi
+fi
+
+# --headless: everything above already makes the services start at boot with nobody signed in. What's
+# left is the disk. Omarchy encrypts it, and an encrypted disk stops at its password screen before
+# anything on it runs, this server included. With a TPM 2.0 chip the disk can unlock itself: the key
+# is sealed to this computer's TPM and its Secure Boot state (PCR 7). The disk password keeps working
+# (a TPM key is added, nothing is removed), and if the TPM won't unseal, it simply asks for the password.
+# Trade-off, said plainly before anything changes: a drive pulled out and put in another computer stays
+# locked, but someone who takes the whole computer can boot it (they still meet your MODC sign-in).
+rebuild_initramfs() { if command -v limine-mkinitcpio >/dev/null 2>&1; then sudo limine-mkinitcpio; else sudo mkinitcpio -P; fi; }
+headless_disk() {
+	local src dev luks hooks_file="" f hooks yn
+	src=$(findmnt -no SOURCE / 2>/dev/null || true)
+	dev=${src%%\[*}
+	if [ -z "$dev" ] || ! lsblk -s -no TYPE "$dev" 2>/dev/null | grep -qx crypt; then
+		say "Disk: not encrypted, so nothing waits for a password at startup"
+		return 0
+	fi
+	luks=$(lsblk -s -no PATH,FSTYPE "$dev" 2>/dev/null | awk '$2 == "crypto_LUKS" { print $1; exit }')
+	[ -n "$luks" ] || { say "Disk: encrypted, but its encrypted partition couldn't be found. Skipping the TPM step."; return 0; }
+	if [ -f "$BASE/omarchyd/disk-unlock" ]; then
+		say "Disk: already unlocks itself with the TPM ($(cat "$BASE/omarchyd/disk-unlock"))"
+		return 0
+	fi
+	if [ "$(cat /sys/class/tpm/tpm0/tpm_version_major 2>/dev/null)" != 2 ]; then
+		say "Disk: encrypted, and this computer has no TPM 2.0 chip (or it's off in the BIOS/UEFI settings)."
+		printf '    After a restart it waits at the disk password screen. Turn the TPM on in the BIOS and run this\n    again with --headless, or reinstall Omarchy without disk encryption for a server with no screen.\n'
+		return 0
+	fi
+	# mkinitcpio reads /etc/mkinitcpio.conf, then /etc/mkinitcpio.conf.d/*.conf in order: the last HOOKS wins.
+	for f in /etc/mkinitcpio.conf /etc/mkinitcpio.conf.d/*.conf; do
+		[ -f "$f" ] && grep -q '^HOOKS=' "$f" && hooks_file="$f"
+	done
+	hooks=$(grep '^HOOKS=' "$hooks_file" 2>/dev/null | tail -1 || true)
+	echo
+	say "Disk: encrypted. It can unlock itself at startup with this computer's TPM chip."
+	printf '    - Your disk password keeps working; a TPM key is added next to it.\n'
+	printf '    - A drive taken out and put in another computer stays locked.\n'
+	printf '    - Someone who takes the whole computer can start it (they still meet your MODC sign-in).\n'
+	printf '    - A BIOS/UEFI or Secure Boot change makes it ask for the password again; run this again then.\n'
+	printf '    You will be asked for the disk password once, to add the TPM key.\n'
+	read -r -p "    Unlock the disk with the TPM at startup? [y/N] " yn || yn=""
+	case "$yn" in y | Y | yes | YES) ;; *) say "Disk: left as it is (it waits for the password after a restart)"; return 0 ;; esac
+	if printf '%s\n' "$hooks" | grep -qw 'sd-encrypt'; then
+		# systemd's initramfs (sd-encrypt) tries a TPM key in the disk's header by itself.
+		sudo cryptsetup luksDump "$luks" | grep -q '^Version:[[:space:]]*2' || { say "Disk: the TPM key needs LUKS2, and this disk is LUKS1. Skipping."; return 0; }
+		say "Adding a TPM key to $luks (enter the disk password)"
+		sudo systemd-cryptenroll --tpm2-device=auto --tpm2-pcrs=7 "$luks" || { say "Disk: adding the TPM key didn't finish; nothing else was changed."; return 0; }
+		# So the startup image carries the TPM libraries (sd-encrypt adds them when they're installed).
+		say "Rebuilding the startup image (initramfs)"
+		rebuild_initramfs || say "Rebuilding the startup image failed; the disk still opens with its password."
+		echo "systemd-tpm2" >"$BASE/omarchyd/disk-unlock"
+	elif printf '%s\n' "$hooks" | grep -qw 'encrypt'; then
+		# The classic initramfs (encrypt, Omarchy's default): Clevis unlocks it just before encrypt runs.
+		command -v clevis >/dev/null 2>&1 || { say "Disk: Clevis isn't installed, so the TPM step was skipped."; return 0; }
+		if [ ! -f /usr/lib/initcpio/install/clevis ]; then
+			command -v yay >/dev/null 2>&1 || { say "Disk: the Clevis startup hook comes from the AUR and needs yay (Omarchy includes it). Skipping."; return 0; }
+			say "Installing the Clevis startup hook from the AUR (mkinitcpio-clevis-hook)"
+			yay -S --needed --noconfirm --answerclean None --answerdiff None mkinitcpio-clevis-hook || { say "Disk: installing the hook failed; nothing was changed."; return 0; }
+		fi
+		if ! sudo clevis luks list -d "$luks" 2>/dev/null | grep -q tpm2; then
+			say "Adding a TPM key to $luks (enter the disk password)"
+			sudo clevis luks bind -d "$luks" tpm2 '{"pcr_ids":"7"}' || { say "Disk: adding the TPM key didn't finish; nothing else was changed."; return 0; }
+		fi
+		if ! printf '%s\n' "$hooks" | grep -qw 'clevis'; then
+			sudo cp -a -- "$hooks_file" "$hooks_file.modc-bak"
+			sudo sed -i -E '/^HOOKS=/ s/([( ])encrypt([ )])/\1clevis encrypt\2/' "$hooks_file"
+			grep '^HOOKS=' "$hooks_file" | grep -qw clevis || { sudo cp -a -- "$hooks_file.modc-bak" "$hooks_file"; say "Disk: couldn't add clevis to HOOKS in $hooks_file; put back as it was."; return 0; }
+		fi
+		say "Rebuilding the startup image (initramfs)"
+		rebuild_initramfs || {
+			say "Rebuilding failed, so the earlier HOOKS were put back. The disk still opens with its password."
+			[ ! -f "$hooks_file.modc-bak" ] || sudo cp -a -- "$hooks_file.modc-bak" "$hooks_file"
+			rebuild_initramfs || true
+			return 0
+		}
+		echo "clevis-tpm2" >"$BASE/omarchyd/disk-unlock"
+	else
+		say "Disk: this startup image has no encrypt or sd-encrypt hook in $hooks_file, so the TPM step was skipped."
+		return 0
+	fi
+	say "Disk: unlocks itself with the TPM from the next restart (the password still works)."
+	printf '    To undo: sudo clevis luks unbind -d %s (Clevis) or sudo systemd-cryptenroll --wipe-slot=tpm2 %s\n' "$luks" "$luks"
+}
+if [ "$HEADLESS" = 1 ]; then
+	mkdir -p "$BASE/omarchyd"
+	headless_disk
+	say "One setting only you can change: in this computer's BIOS/UEFI, set power after a power cut"
+	printf '    (often "Restore on AC power loss" or "After power failure") to On / Power On, so it\n    starts again when the power comes back.\n'
 fi
 
 # Everything above succeeded (the script stops at the first error): note which installer ran, so the

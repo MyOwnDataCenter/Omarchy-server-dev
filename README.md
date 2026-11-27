@@ -46,6 +46,28 @@ Want ZFS pools too? A piped install only receives `--zfs` after `--` (see [Stora
 curl -fsSL https://raw.githubusercontent.com/MyOwnDataCenter/omarchy-server-dev/main/install.sh | bash -s -- --zfs
 ```
 
+### A server with no screen (headless)
+
+My Own Data Center starts at boot without anyone signing in. Two things can still stop a box with no
+monitor or keyboard from coming back by itself after a power cut. The `--headless` option covers both:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/MyOwnDataCenter/omarchy-server-dev/main/install.sh | bash -s -- --headless
+```
+
+- **The disk password.** Omarchy encrypts the disk, so after a restart the computer waits at the disk
+  password screen before anything starts. With a TPM 2.0 chip, `--headless` offers to let the disk
+  unlock itself (Clevis with Omarchy's `encrypt` hook, `systemd-cryptenroll` with `sd-encrypt`),
+  sealed to the TPM's Secure Boot state (PCR 7). It explains the trade-off and asks first. Your
+  disk password keeps working: a drive moved to another computer stays locked, but someone who takes the
+  whole computer can start it and reach your MODC sign-in. Settings → Software update shows whether
+  the disk still waits.
+- **Power after a power cut.** Set "Restore on AC power loss" (or "After power failure") to On in the
+  BIOS/UEFI. Software can't change this, so the installer reminds you.
+
+With no monitor attached, opening the desktop view adds a 1920x1080 virtual screen so there's something
+to show. It goes away when a real monitor is connected.
+
 To keep Software update and the App Store on local clones you sync yourself (no automatic GitHub
 fetches), set these on the installer and they are written onto `omarchyd.service`:
 

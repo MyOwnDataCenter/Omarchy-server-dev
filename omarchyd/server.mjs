@@ -44,7 +44,7 @@ import {createOsInfo} from './os-info.mjs'
 import {WebSocketServer} from 'ws'
 import {viewerBackpressure} from './backpressure.mjs'
 
-export const OMARCHYD_VERSION = '0.9.103'
+export const OMARCHYD_VERSION = '0.9.104'
 
 export async function startOmarchyd({port = 2021, host = '127.0.0.1', dataDir, tlsDir: sharedTlsDir = null, home = os.homedir(), webPort = 7780, machineOptions = {}, containerOptions = {}, appOptions = {}, storageOptions = {}, updaterOptions = {}, pluginOptions = {}, themeOptions = {}, assistantOptions = {}, usbOptions = {}, backupOptions = {}, unraidOptions = {}, tailscaleOptions = {}, oidcOptions = {}, hyprlandOptions = {}, terminalTmux = process.env.NODE_TEST_CONTEXT ? null : undefined, desktopVncPort = 5900, viewerStallMs = undefined, desktopVncSocket = join(process.env.XDG_RUNTIME_DIR || `/run/user/${process.getuid?.() ?? ''}`, 'omarchy-server', 'desktop-vnc.sock')}) {
 	const sourceDir = localGitDir('OMARCHY_SERVER_SOURCE', process.env.OMARCHY_SERVER_SOURCE)
@@ -322,8 +322,10 @@ export async function startOmarchyd({port = 2021, host = '127.0.0.1', dataDir, t
 			kind: 'query',
 			run: async (_i, {auth}) => {
 				ownerOnly(auth)
-				const [startsAtBoot, diskLock] = await Promise.all([bootStart.state(), bootStart.diskLock().catch(() => null)])
-				return {startsAtBoot, diskLock}
+				const [startsAtBoot, diskLock, source] = await Promise.all([bootStart.state(), bootStart.diskLock().catch(() => null), updater.source().catch(() => null)])
+				// The installer's --headless step (TPM unlock), from the repository this copy updates from.
+				const headlessCommand = source ? `curl -fsSL ${source}/main/install.sh | bash -s -- --headless` : null
+				return {startsAtBoot, diskLock, headlessCommand}
 			},
 		},
 		'system.enableBootStart': {
@@ -859,7 +861,11 @@ export async function startOmarchyd({port = 2021, host = '127.0.0.1', dataDir, t
 			if (!stack.out.split(/\s+/).includes('crypt')) return {encrypted: false, unlocksItself: false}
 			const text = (await Promise.all(['/proc/cmdline', '/etc/crypttab.initramfs', '/etc/crypttab'].map((f) => readFile(f, 'utf8').catch(() => '')))).join('\n')
 			const clevis = await stat('/usr/lib/initcpio/install/clevis').then(() => true, () => false)
-			return {encrypted: true, unlocksItself: clevis || /tpm2-device|fido2-device/.test(text)}
+			// The installer's --headless step writes how it set the disk to unlock (clevis-tpm2, systemd-tpm2).
+			const marker = (await readFile(join(dataDir, 'disk-unlock'), 'utf8').catch(() => '')).trim()
+			// A TPM 2.0 chip, so --headless can set the disk to unlock itself.
+			const tpm = (await readFile('/sys/class/tpm/tpm0/tpm_version_major', 'utf8').catch(() => '')).trim() === '2'
+			return {encrypted: true, unlocksItself: !!marker || clevis || /tpm2-device|fido2-device/.test(text), tpm}
 		},
 	}
 	// Before a restart or shutdown: if this server wouldn't come back by itself (no linger), turn that
@@ -1012,14 +1018,24 @@ WantedBy=graphical-session.target
 		},
 	}
 
+	// No monitor attached (a headless server): give Hyprland a virtual screen and point wayvnc at it.
+	async function headlessScreen() {
+		const name = await hyprland.ensureHeadlessScreen().catch(() => null)
+		if (name) await sh('wayvncctl', ['-S', join(dirname(desktopVncSocket), 'wayvncctl'), 'output-set', name], 5_000)
+		return name
+	}
 	async function desktopShare() {
 		if (machineOptions.run) return true // the dev/test stand-in has no desktop
+		const headless = await headlessScreen()
 		if (await desktopUp()) return true
 		if (!(await readFile('/usr/bin/wayvnc').then(() => true, () => false)))
 			throw new RpcError('PRECONDITION_FAILED', 'Screen sharing (wayvnc) isn’t installed. Run the installer again to add it.')
 		await sh('systemctl', ['--user', 'reset-failed', 'omarchy-server-desktop.service'])
 		await sh('systemctl', ['--user', 'start', 'omarchy-server-desktop.service'])
-		if (await waitFor(desktopVncPort, 5)) return true
+		if (await waitFor(desktopVncPort, 5)) {
+			if (headless) await headlessScreen()
+			return true
+		}
 		// The service may lack the desktop's Wayland details (a session started without passing
 		// them to systemd): run wayvnc once with them, found from the running Hyprland.
 		const runtime = process.env.XDG_RUNTIME_DIR || `/run/user/${process.getuid?.() ?? ''}`
@@ -1029,7 +1045,10 @@ WantedBy=graphical-session.target
 		await mkdir(dirname(desktopVncSocket), {recursive: true, mode: 0o700})
 		await rm(desktopVncSocket, {force: true})
 		await sh('systemd-run', ['--user', '--collect', '--unit=omarchy-server-desktop-now', `--setenv=WAYLAND_DISPLAY=${socket}`, `--setenv=XDG_RUNTIME_DIR=${runtime}`, ...(hypr ? [`--setenv=HYPRLAND_INSTANCE_SIGNATURE=${hypr}`] : []), '/usr/bin/wayvnc', '--max-fps=30', '-S', join(dirname(desktopVncSocket), 'wayvncctl'), '--unix-socket', desktopVncSocket])
-		if (await waitFor(desktopVncPort, 5)) return true
+		if (await waitFor(desktopVncPort, 5)) {
+			if (headless) await headlessScreen()
+			return true
+		}
 		const log = await sh('journalctl', ['--user', '-u', 'omarchy-server-desktop.service', '-u', 'omarchy-server-desktop-now.service', '-n', '3', '--no-pager', '-o', 'cat'])
 		const last = log.out.trim().split('\n').filter(Boolean).pop()
 		throw new RpcError('BAD_GATEWAY', `The desktop’s screen sharing (wayvnc) didn’t start${last ? `: ${last}` : ''}. Check it with: omarchy-server logs`)
