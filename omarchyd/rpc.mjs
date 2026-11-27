@@ -8,7 +8,7 @@ export class RpcError extends Error {
 		this.code = code
 	}
 }
-const HTTP = {BAD_REQUEST: 400, UNAUTHORIZED: 401, FORBIDDEN: 403, NOT_FOUND: 404, CONFLICT: 409, PRECONDITION_FAILED: 412, BAD_GATEWAY: 502, TOO_MANY_REQUESTS: 429, METHOD_NOT_SUPPORTED: 405}
+const HTTP = {BAD_REQUEST: 400, UNAUTHORIZED: 401, FORBIDDEN: 403, NOT_FOUND: 404, METHOD_NOT_SUPPORTED: 405, CONFLICT: 409, PRECONDITION_FAILED: 412, PAYLOAD_TOO_LARGE: 413, TOO_MANY_REQUESTS: 429, BAD_GATEWAY: 502}
 
 export function sendJson(res, status, body, headers = {}) {
 	const text = JSON.stringify(body)
@@ -42,22 +42,23 @@ export async function handleRpc(req, res, url, procedures, authenticate) {
 		if (!proc) throw new RpcError('NOT_FOUND', `No procedure found on path "${name}"`)
 		if ((proc.kind === 'query') !== (req.method === 'GET')) throw new RpcError('METHOD_NOT_SUPPORTED', 'Wrong method')
 		let input
-		if (req.method === 'GET') {
-			const raw = url.searchParams.get('input')
-			input = raw === null ? undefined : JSON.parse(raw)
-		} else {
-			const body = await readBody(req)
-			input = body ? JSON.parse(body) : undefined
+		const raw = req.method === 'GET' ? url.searchParams.get('input') : await readBody(req)
+		// Only the request's own JSON is "Invalid JSON". A parse error inside a procedure is a server error.
+		try {
+			input = raw === null || raw === '' ? undefined : JSON.parse(raw)
+		} catch {
+			throw new RpcError('BAD_REQUEST', 'Invalid JSON')
 		}
 		const ctx = {req, res, auth: null}
 		if (!proc.public) {
 			ctx.auth = authenticate(req)
 			if (!ctx.auth) throw new RpcError('UNAUTHORIZED', 'Invalid token')
 		}
-		const data = await proc.run(input, ctx)
+		// An empty body and JSON null are "no fields", not a crash when a handler reads input.name.
+		// Arrays, strings, and numbers stay as sent; a TypeError from those is still a server error.
+		const data = await proc.run(input === undefined || input === null ? {} : input, ctx)
 		sendJson(res, 200, {result: {data: data ?? null}})
 	} catch (error) {
-		if (error instanceof SyntaxError) return sendError(res, new RpcError('BAD_REQUEST', 'Invalid JSON'))
 		sendError(res, error)
 	}
 }

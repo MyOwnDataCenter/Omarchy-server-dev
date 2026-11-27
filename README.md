@@ -1,17 +1,17 @@
-# Omarchy Server (development copy)
+# My Own Data Center (development copy)
 
-> **This is the development copy of [Omarchy Server](https://github.com/TouchWorkStation/omarchy-server).**
-> New work is built and tested here first, then moved to omarchy-server when it's ready. A server
-> installed from here also updates from here. For the stable version, use omarchy-server.
+> **This is the development copy of [My Own Data Center](https://github.com/MyOwnDataCenter/server).**
+> New work is built and tested here first, then moved to MyOwnDataCenter/server when it's ready. A
+> server installed from here also updates from here. For the stable version, use MyOwnDataCenter/server.
 >
-> When moving code to omarchy-server, keep omarchy-server's own repository address in `install.sh`
-> (the line marked `DEV REPO`) and this README.
+> When moving code to MyOwnDataCenter/server, keep that repo's own address in `install.sh` (the line
+> marked `DEV REPO`) and this README.
 
 Turn an [Omarchy](https://omarchy.org) machine into a home server you run from any browser. Install
 apps from a catalog of about 580, keep your files and drives in one place, run virtual machines, and
 reach your real Omarchy desktop — from a phone, a tablet or another computer.
 
-![Omarchy Server's desktop in a browser, with App Store, Machines and Terminal windows open](docs/screenshots/desktop-overview.jpg)
+![My Own Data Center's desktop in a browser, with Machines, Terminal and Files windows open](docs/screenshots/desktop-overview.jpg)
 
 <p align="center">
   <img src="docs/screenshots/phone-home.png" width="24%" alt="Home on a phone">
@@ -25,13 +25,13 @@ reach your real Omarchy desktop — from a phone, a tablet or another computer.
 On the Omarchy machine, as your normal user (not with sudo):
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/TouchWorkStation/omarchy-server-dev/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/MyOwnDataCenter/omarchy-server-dev/main/install.sh | bash
 ```
 
 The installer:
 
 - installs what's missing (Node.js, Podman, libvirt, wayvnc and friends);
-- builds Omarchy Server in `~/.local/share/omarchy-server`;
+- builds My Own Data Center in `~/.local/share/omarchy-server`;
 - asks you to create your account **in the terminal**, so your password never crosses the network;
 - starts two systemd user services that keep running while you're logged out.
 
@@ -40,7 +40,26 @@ Then open `http://<server-ip>:7780` (or `https://`, see [Security](#security)) a
 Run the same command again to update, or use Settings → Software update. Your account, apps, machines
 and files are kept. Logs: `journalctl --user -u omarchyd -u omarchy-server-web -f`
 
-Want ZFS pools too? Add `--zfs` (see [Storage](#storage-and-nas)).
+Want ZFS pools too? A piped install only receives `--zfs` after `--` (see [Storage](#storage-and-nas)):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/MyOwnDataCenter/omarchy-server-dev/main/install.sh | bash -s -- --zfs
+```
+
+To keep Software update and the App Store on local clones you sync yourself (no automatic GitHub
+fetches), set these on the installer and they are written onto `omarchyd.service`:
+
+```sh
+OMARCHY_SERVER_SOURCE=/path/to/omarchy-server \
+OMARCHY_SERVER_APP_STORE=/path/to/app-store \
+bash install.sh
+```
+
+Each value must be an absolute path to a git repository. If either is set but invalid, omarchyd
+refuses to start instead of falling back to GitHub. Unset them to use GitHub as usual. You can also
+put them in a systemd drop-in (`~/.config/systemd/user/omarchyd.service.d/local.conf`). Optional:
+`OMARCHY_SERVER_REPO` is the URL or local path the installer clones from (defaults to SOURCE when
+SOURCE is set, otherwise GitHub).
 
 To remove it, run `omarchy-server uninstall`. Your account, apps and machines stay, so installing again picks up
 where you left off; add `--purge` to delete those too.
@@ -75,8 +94,17 @@ where you left off; add `--purge` to delete those too.
   network. Before installing, you see exactly what an app asks for (system ports, devices, host
   network, folders outside its own), and it gets only what you allow. Apps never receive your Omarchy
   Server sign-in.
-- **Behind your sign-in:** every app's port admits only browsers signed in to Omarchy Server.
+- **Behind your sign-in:** every app's port admits only browsers signed in to My Own Data Center.
 - Start, stop, restart, update, logs, and a shell inside any app.
+- **Opening apps from outside your network** (through a tunnel or a reverse proxy on https://) needs
+  each app to have its own address, which you choose with an *app addresses* pattern such as
+  `{app}-touch.example.com` (`{app}` becomes the app's name). Point those names at your server, then
+  tell the web app the pattern: run `systemctl --user edit omarchy-server-web.service`, add
+  `[Service]` and `Environment=TOUCH_APP_HOSTS={app}-touch.example.com`, save, and run
+  `omarchy-server restart`. Set it to `off` to clear it. Until it is set, opening an app that way says
+  "Opening apps remotely needs app addresses". On your own network it isn't needed.
+
+![The App Store in the desktop layout: apps by category from every store you've added](docs/screenshots/desktop-store.jpg)
 
 ### Files
 
@@ -84,21 +112,31 @@ where you left off; add `--purge` to delete those too.
 - Browse, upload (files and folders, drag and drop), download, rename, copy, move, search, favorites,
   recents, and the same Trash as Omarchy's file manager.
 - View photos, videos, music, PDFs, documents, spreadsheets and code in the browser.
-- Photo sync from your phone, and SMB network shares for any folder.
+- Photo sync from your phone, and SMB network shares for any folder. Shares are opened on your home
+  LAN only (the usual 10., 172.16. and 192.168. addresses); Tailscale is a second network and does
+  not get port 445.
+- **Quick transfers with a QR code** (desktop layout): right-click a file to share it, or a folder to
+  upload into it from a phone. The phone opens a small page without signing in; the code lasts 10
+  minutes and covers only that file or folder.
+
+![Files in the desktop layout: places, your storage, and folders shared on your network](docs/screenshots/desktop-files.jpg)
+
+<p align="center"><img src="docs/screenshots/qr-upload.png" width="45%" alt="Upload to a folder from a phone: a QR code that lasts 10 minutes"></p>
 
 ### Machines (virtual machines)
 
-- **One tap:** Ubuntu, Debian, Fedora, Arch and Alpine (server or desktop), Omarchy, Windows 10/11 from
-  your own ISO, or any ISO in Files. Images are checked against their publisher's checksums, and
-  cloud-init sets up your account.
-- **Proxmox-style controls** on the desktop, and every setting on a phone: CPU (sockets, cores, type),
+- **One tap:** Ubuntu, Debian, and Fedora, as server or desktop, plus Rocky, openSUSE Leap, Arch, Alpine, and Omarchy.
+  CachyOS and Linux Mint boot their own installers. Windows 10/11 comes from your own ISO, or any ISO
+  in Files. Images are checked against their publisher's checksums, and cloud-init sets up your account
+  on the cloud images.
+- **The same controls on the phone and the desktop:** CPU (sockets, cores, type),
   memory, disks, network, boot order, firmware, snapshots, backups (live), clone, restore, pause,
   hibernate, start with the server, task history, live usage graphs and a monitor.
 - The screen in your browser with keyboard, mouse and touch controls, clipboard paste, and
   port forwarding to services inside a machine.
 - Machines run as you under libvirt's per-user session, not as root.
 
-![Machines in the desktop layout: the server's status, its virtual machines and backups](docs/screenshots/desktop-machines.jpg)
+![Machines in the desktop layout: the server's summary, status and its virtual machines](docs/screenshots/desktop-machines.jpg)
 
 ### Your Omarchy desktop, remotely
 
@@ -110,6 +148,18 @@ where you left off; add `--purge` to delete those too.
 - Paste from your computer into the desktop's apps (Ctrl+V, or right-click → Paste on https://).
 - Full screen with system keys passed through (Chrome, Edge and Brave over https://).
 
+### Hyprland layout (the web desktop)
+
+- Desktop & Dock → Layout → Hyprland tiles the same windows (Files, Apps, Machines, Terminal) with
+  workspaces 1–9 and Omarchy Super shortcuts.
+- On an Omarchy computer, Super is taken by Hyprland. Paste the snippet from Desktop & Dock → Layout
+  into `~/.config/hypr/bindings.lua` (or `bindings.conf` on Omarchy from before its config moved to
+  Lua; both are offered), run `hyprctl reload`, then press Scroll Lock (or Super+F12) so Super stays in
+  the browser. Press it again to give Super back. The lock chip on the bar shows when keys stay here.
+  The server never changes your Hyprland config.
+- On https:// in Chrome, Edge or Brave, the lock chip can take Super without that snippet (full screen).
+  On http://, use the snippet.
+
 ### Terminal
 
 A real login shell in the browser, or a shell inside any app. Right-click copies a selection or
@@ -120,7 +170,7 @@ pastes. On a phone there's a key row with Esc, Tab, Ctrl, Alt and arrows.
 - Every drive with its health (SMART), and sleep timers for hard drives.
 - **Btrfs pools** (combined, mirrored or RAID 10) on blank drives, import existing Btrfs drives, add
   drives, error checks.
-- **ZFS pools** (combined, mirrored, RAID-Z1, RAID-Z2) and imports, after installing with `--zfs`.
+- **ZFS pools** (combined, mirrored, RAID-Z1, RAID-Z2) and imports, after `curl -fsSL https://raw.githubusercontent.com/MyOwnDataCenter/omarchy-server-dev/main/install.sh | bash -s -- --zfs`.
 - Pools appear in Files at `~/Pools/<name>`, and can be shared over SMB.
 - Drives that hold anything are never erased: pools are only made on blank drives.
 
@@ -139,8 +189,12 @@ watch them (CPU, memory, disks, temperature, updates waiting), open a terminal, 
 desktop, and manage them (verified Omarchy plugins, Omarchy theme, updates, restart). Linux only, on
 any distribution with systemd: Omarchy, Arch, Debian, Ubuntu, Fedora, openSUSE and their relatives.
 
-1. On your server: **Machines → Local swarm → Add a computer**. Choose what it may do (Terminal,
-   Desktop, Manage; watching is always on) and tap **Make the install command**.
+1. On your server: **Machines → Local swarm → Add a computer**. Choose what it may do and tap **Make the install command**. Watching is always on. Five abilities, with these defaults:
+   - **Terminal** — on. A shell on that computer.
+   - **Desktop** — on. See and use its screen.
+   - **Manage** — on. Verified Omarchy plugins and themes, updates, and restart.
+   - **Storage** — off, because it can format disks.
+   - **Backups** — on. It can add backups, never delete them.
 2. On the other computer, open a terminal as the person who uses it (not root), paste the command
    and press Enter. It asks for your password only to install Python, git and screen sharing, and
    to keep the connector running while you're signed out.
@@ -156,7 +210,7 @@ through a private socket in that user's runtime folder. Remove a computer and it
 your server and stops. To take the connector off a computer:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/TouchWorkStation/omarchy-server-dev/main/connector/install.sh | bash -s -- --uninstall
+curl -fsSL https://raw.githubusercontent.com/MyOwnDataCenter/omarchy-server-dev/main/connector/install.sh | bash -s -- --uninstall
 ```
 
 The desktop works with Hyprland, Sway and other wlroots desktops (wayvnc) and X11 desktops
@@ -187,7 +241,7 @@ The desktop works with Hyprland, Sway and other wlroots desktops (wayvnc) and X1
 | `omarchy-server-web` (`server/`, `web/`) | you | `7780` (http and https) | The web app you open in a browser |
 | `helper/helper.mjs` | root, via one sudoers rule | — | Storage pools, shares, firewall ports, power |
 
-On the server itself: `omarchy-server` (status, open, restart, logs, uninstall), "Omarchy Server" in the
+On the server itself: `omarchy-server` (status, open, restart, logs, uninstall), "My Own Data Center" in the
 launcher, and a top-bar icon (`omarchy-server widget off` removes it).
 
 ## Requirements

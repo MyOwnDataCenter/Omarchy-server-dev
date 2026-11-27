@@ -1,64 +1,101 @@
-// "Desktop & Dock": desktop themes, wallpapers, dock layout and desktop icons. Desktop only,
-// saved per device; your phone's appearance (Settings → Appearance) isn't changed.
+// Appearance for the app and for this device's desktop. Theme is colour. Layout is phone or
+// desktop. Shape is round or square corners, and on the desktop how the windows are arranged.
 import {useEffect, useRef, useState, type CSSProperties, type ReactNode} from 'react'
 
 import {useUser} from '../data'
 import {Icon} from '../icons'
-import {Switch} from '../screens/Settings'
 import {OmarchyBackgrounds} from '../OmarchyBackgrounds'
-import {Segmented, customBackgroundUrl, haptic, preparePhoto, useToast, wallpaperUrl, type Prefs} from '../ui'
-import {PRESETS, STYLES, solidOf, SYSTEM_DOCK, WALLPAPERS, useDeskConfig, wallpaperSrc, type DeskAccent, type DeskConfig, type DockHover, type DockPos, DOCK_ICON_MAX, DOCK_ICON_MIN} from './config'
-import {SolidColors} from '../screens/More'
+import {applyPrefsUpdate, prefsAfterPhotoUpload} from '../photoPrefs'
+import {Appearance} from '../screens/More'
+import {Row, Segmented, Sheet, SheetHeader, SolidColors, Switch, customBackgroundUrl, haptic, preparePhoto, setLayoutPref, useLayout, useOmarchyThemes, useToast, wallpaperUrl, type Prefs} from '../ui'
+import {takeAppearanceFocus} from './settingsPage'
+import {solidOf, SYSTEM_DOCK, useDeskConfig, withTerminals, type DeskConfig, type DeskShell, type DockHover, type DockPos, DOCK_ICON_MAX, DOCK_ICON_MIN} from './config'
+import {DesktopStyleCards, ScreenLayoutCards} from '../LayoutPicker'
+import {CAPTURE_KEY, canUseKeyboardLock, coerceMode, keyboardLockApi, type CaptureMode} from './hyprland/grab'
+import {SnippetBlock} from './hyprland/Snippet'
 import {DESKTOP_KEY, useDesktop, useItems, type ItemInfo} from './Desktop'
+import {placeableKeys} from './places'
 
-type Tab = 'themes' | 'background' | 'dock' | 'desktop'
-const ACCENT_CHOICES: {id: DeskAccent; label: string; swatch: string}[] = [
-	{id: 'wallpaper', label: 'From wallpaper', swatch: 'conic-gradient(#f97316,#eab308,#22c55e,#06b6d4,#8b5cf6,#ec4899,#f97316)'},
-	{id: 'app', label: 'App theme', swatch: 'var(--accent)'},
-	{id: 'blue', label: 'Blue', swatch: 'var(--blue)'},
-	{id: 'mauve', label: 'Mauve', swatch: 'var(--mauve)'},
-	{id: 'teal', label: 'Teal', swatch: 'var(--teal)'},
-	{id: 'green', label: 'Green', swatch: 'var(--green)'},
-	{id: 'peach', label: 'Peach', swatch: 'var(--peach)'},
-	{id: 'pink', label: 'Pink', swatch: 'var(--pink)'},
-]
+const FOCUS: Record<string, string> = {layout: 'appearance-layout', dock: 'appearance-dock', desktop: 'appearance-desktop', themes: 'appearance-themes', background: 'appearance-background'}
 
-export function Personalize({tab: initial, prefs, setPrefs}: {tab?: string; prefs: Prefs; setPrefs: (p: Prefs) => void}) {
-	const [tab, setTab] = useState<Tab>(((['themes', 'background', 'dock', 'desktop'] as string[]).includes(initial ?? '') ? initial : 'themes') as Tab)
-	useEffect(() => {
-		if (initial && (['themes', 'background', 'dock', 'desktop'] as string[]).includes(initial)) setTab(initial as Tab)
-	}, [initial])
+export function Personalize({tab: initial, prefs, setPrefs, embedded, onOpenThemes}: {tab?: string; prefs: Prefs; setPrefs: (p: Prefs) => void; embedded?: boolean; onOpenThemes?: () => void}) {
+	const user = useUser()
+	const root = useRef<HTMLDivElement>(null)
+	const omarchyTheme = useOmarchyThemes(!!onOpenThemes)
 	const [cfg, setCfg] = useDeskConfig()
+	// The dock and desktop icons only exist in the desktop layout; on a phone they were confusing.
+	const desktop = useLayout().desktop
+	useEffect(() => {
+		let focus = initial ?? ''
+		try {
+			const saved = takeAppearanceFocus(sessionStorage)
+			if (saved) focus = saved
+		} catch {
+			/* private */
+		}
+		const id = FOCUS[focus]
+		if (!id) return
+		root.current?.querySelector(`#${id}`)?.scrollIntoView({block: 'start'})
+	}, [initial])
 	return (
-		<div className="personalize">
-			<h1 className="title" style={{margin: '4px 0 14px'}}>
-				Desktop &amp; Dock
-			</h1>
-			<Segmented<Tab>
-				label="Section"
-				value={tab}
-				options={[
-					{id: 'themes', label: 'Themes'},
-					{id: 'background', label: 'Background'},
-					{id: 'dock', label: 'Dock'},
-					{id: 'desktop', label: 'Desktop icons'},
-				]}
-				onChange={setTab}
-			/>
-			<div style={{height: 6}} />
-			{tab === 'themes' && <Themes cfg={cfg} setCfg={setCfg} />}
-			{tab === 'background' && <Background cfg={cfg} setCfg={setCfg} prefs={prefs} setPrefs={setPrefs} />}
-			{tab === 'dock' && <DockSettings cfg={cfg} setCfg={setCfg} />}
-			{tab === 'desktop' && <DesktopSettings cfg={cfg} setCfg={setCfg} />}
+		<div className="personalize" ref={root}>
+			{!embedded && (
+				<h1 className="title" style={{margin: '4px 0 14px'}}>
+					Appearance
+				</h1>
+			)}
+			<div id="appearance-layout">
+				<LayoutSettings cfg={cfg} setCfg={setCfg} />
+			</div>
+			<div id="appearance-themes">
+				<Section title="Theme" note="Colours only. Saved to your account, so it follows you to every phone you sign in on.">
+					<Appearance
+						prefs={prefs}
+						setPrefs={setPrefs}
+						wallpaper={user.data?.wallpaper}
+						onTheme={(id) => {
+							if (id === 'custom') setCfg((c) => ({...c, preset: null, wallpaper: 'photo'}))
+							if (id === 'omarchy') setCfg((c) => ({...c, preset: null, wallpaper: 'omarchy'}))
+						}}
+					/>
+					{onOpenThemes && (
+						<>
+							<div className="glass group pz-omarchy" style={{'--inset': '62px'} as CSSProperties}>
+								<Row icon="palette" color="var(--blue)" label="Omarchy theme" value={omarchyTheme.data?.label ?? undefined} onClick={onOpenThemes} />
+							</div>
+							<p className="footer-note pz-note">
+								{prefs.theme === 'omarchy'
+									? 'The app is using this Omarchy theme.'
+									: 'The one place to choose this server’s Omarchy theme. Choosing one makes the app use it.'}
+							</p>
+						</>
+					)}
+				</Section>
+			</div>
+			<div id="appearance-background">
+				<Background cfg={cfg} setCfg={setCfg} prefs={prefs} setPrefs={setPrefs} />
+			</div>
+			{desktop ? (
+				<>
+					<div id="appearance-dock">
+						<DockSettings cfg={cfg} setCfg={setCfg} />
+					</div>
+					<div id="appearance-desktop">
+						<DesktopSettings cfg={cfg} setCfg={setCfg} />
+					</div>
+				</>
+			) : (
+				<p className="footer-note pz-note">Dock and desktop icon settings are in the desktop layout. Choose Desktop under Layout above, or open My Own Data Center on a computer.</p>
+			)}
 		</div>
 	)
 }
 
 type P = {cfg: DeskConfig; setCfg: (fn: (c: DeskConfig) => DeskConfig) => void}
 
-function Section({title, note, children}: {title: string; note?: ReactNode; children: ReactNode}) {
+function Section({title, note, children, tight}: {title: string; note?: ReactNode; children: ReactNode; tight?: boolean}) {
 	return (
-		<section className="pz-section">
+		<section className={`pz-section${tight ? ' pz-tight' : ''}`}>
 			<div className="section-head">
 				<h2>{title}</h2>
 			</div>
@@ -68,60 +105,94 @@ function Section({title, note, children}: {title: string; note?: ReactNode; chil
 	)
 }
 
-function Themes({cfg, setCfg}: P) {
+function LayoutSettings({cfg, setCfg}: P) {
+	const toast = useToast()
+	const layout = useLayout()
+	const secure = typeof window !== 'undefined' && window.isSecureContext
+	const hasLock = typeof navigator !== 'undefined' && !!keyboardLockApi()
+	const [readme, setReadme] = useState(false)
+	const [mode, setMode] = useState<CaptureMode>(() => {
+		try {
+			const v = localStorage.getItem(CAPTURE_KEY)
+			if (v === 'host' || v === 'keyboard-lock') return coerceMode(v, secure)
+		} catch {
+			/* private */
+		}
+		return secure && hasLock ? 'keyboard-lock' : 'host'
+	})
+	const setCapture = (next: CaptureMode) => {
+		const v = coerceMode(next, secure)
+		setMode(v)
+		try {
+			localStorage.setItem(CAPTURE_KEY, v)
+		} catch {
+			/* private */
+		}
+		window.dispatchEvent(new CustomEvent('omarchy:key-capture', {detail: v}))
+	}
 	return (
 		<>
-			<Section title="Desktop themes" note="A theme sets the wallpaper, the look of the top bar, dock and menus, and the accent colour. Fine-tune any of them below or in Background.">
-				<div className="pz-grid themes">
-					{PRESETS.map((t) => {
-						const on = cfg.preset === t.id && cfg.wallpaper === t.wallpaper && cfg.style === t.style && cfg.accent === t.accent
-						return (
-							<button
-								key={t.id}
-								className={`pz-card${on ? ' on' : ''}`}
-								onClick={() => {
-									haptic(6)
-									setCfg((c) => ({...c, preset: t.id, wallpaper: t.wallpaper, style: t.style, accent: t.accent}))
-								}}
-							>
-								<span className={`pz-thumb theme-thumb style-${t.style}`} style={{backgroundImage: `url(${wallpaperSrc(t.wallpaper, true)})`}}>
-									<i className="tt-bar" />
-									<i className="tt-dock" />
-									<i className="tt-win" />
-									{on && <Icon name="check" size={16} stroke={3} className="pz-check" />}
+			<Section title="Layout" note="How this device shows the app." tight>
+				<ScreenLayoutCards value={layout.pref} detected={layout.detected} onPick={setLayoutPref} compact />
+			</Section>
+			<Section title="Shape" note="Corners on every screen. On the desktop, windows float or tile." tight>
+				<DesktopStyleCards<DeskShell>
+					value={cfg.shell ?? 'gnome'}
+					floating="gnome"
+					tiling="hyprland"
+					onPick={(v) => setCfg((c) => ({...c, shell: v}))}
+					onSquareReadme={() => setReadme(true)}
+					compact
+				/>
+			</Section>
+			<Sheet open={readme} onClose={() => setReadme(false)} label="Square">
+				<SheetHeader title="Square" onClose={() => setReadme(false)} />
+				<div className="square-readme">
+					<label className="square-super">
+						<input type="checkbox" checked={cfg.omarchySuperKeys === true} onChange={(e) => setCfg((c) => ({...c, omarchySuperKeys: e.target.checked}))} />
+						<span>Enable Omarchy Super Keybindings</span>
+					</label>
+					{cfg.omarchySuperKeys && (
+						<>
+							<p className="footer-note pz-note square-super-note">These shortcuts use Super on this desktop. Super+Return opens a terminal, Super+1–9 switches workspaces, Super+arrows move focus, and Super+K lists the rest.</p>
+							<Section title="Key capture" note="On an Omarchy computer, Super is taken by the desktop until you pass it through. HTTP can use host passthrough. Fullscreen system keys need https:// in Chrome, Edge or Brave.">
+						<div className="glass group pz-rows">
+							<div className="row static">
+								<span className="main">
+									<b>Capture Super</b>
 								</span>
-								<b>{t.name}</b>
-								<small>{STYLES.find((s) => s.id === t.style)?.name}</small>
-							</button>
-						)
-					})}
+								<Segmented<CaptureMode>
+									label="Capture Super"
+									value={mode}
+									options={[
+										{id: 'host', label: 'Host passthrough'},
+										{id: 'keyboard-lock', label: 'Fullscreen'},
+									]}
+									onChange={(v) => {
+										if (v === 'keyboard-lock' && !canUseKeyboardLock(secure, hasLock)) {
+											toast('Open https:// in Chrome, Edge or Brave for fullscreen Super, or stay on host passthrough.')
+											return
+										}
+										setCapture(v)
+									}}
+								/>
+							</div>
+						</div>
+						{!secure && (
+							<p className="footer-note pz-note">
+								<button className="btn" onClick={() => (location.href = `https://${location.host}${location.pathname}${location.search}`)}>
+									Open HTTPS
+								</button>
+							</p>
+						)}
+					</Section>
+							<Section title="Omarchy snippet" note="Paste it at the end of your Hyprland key config on the Omarchy computer you browse from, run hyprctl reload, then press Scroll Lock (or Super+F12) to keep Super in this browser. Press it again to give Super back.">
+								<SnippetBlock />
+							</Section>
+						</>
+					)}
 				</div>
-			</Section>
-			<Section title="Panel style">
-				<div className="pz-grid styles">
-					{STYLES.map((s) => (
-						<button key={s.id} className={`pz-card style-card${cfg.style === s.id ? ' on' : ''}`} onClick={() => setCfg((c) => ({...c, preset: null, style: s.id}))}>
-							<span className={`pz-thumb style-swatch style-${s.id}`} style={{backgroundImage: `url(${wallpaperSrc(WALLPAPERS.find((w) => w.id === cfg.wallpaper)?.id ?? 'valley', true)})`}}>
-								<i className="tt-bar" />
-								<i className="tt-dock" />
-								{cfg.style === s.id && <Icon name="check" size={16} stroke={3} className="pz-check" />}
-							</span>
-							<b>{s.name}</b>
-							<small>{s.note}</small>
-						</button>
-					))}
-				</div>
-			</Section>
-			<Section title="Accent colour" note="“App theme” uses the accent from Settings → Appearance, the same as your phone.">
-				<div className="pz-accents">
-					{ACCENT_CHOICES.map((a) => (
-						<button key={a.id} className={`pz-accent${cfg.accent === a.id ? ' on' : ''}`} onClick={() => setCfg((c) => ({...c, preset: null, accent: a.id}))} aria-pressed={cfg.accent === a.id}>
-							<i style={{background: a.swatch}} />
-							{a.label}
-						</button>
-					))}
-				</div>
-			</Section>
+			</Sheet>
 		</>
 	)
 }
@@ -133,8 +204,10 @@ function Background({cfg, setCfg, prefs, setPrefs}: P & {prefs: Prefs; setPrefs:
 	const [uploading, setUploading] = useState(false)
 	const photo = customBackgroundUrl(prefs.backgroundVersion)
 	const serverWall = wallpaperUrl(user.data?.wallpaper)
+	const solid = prefs.solidColor ?? solidOf(cfg.wallpaper)
 	const pick = (id: DeskConfig['wallpaper']) => {
 		haptic(6)
+		if (prefs.solidColor) setPrefs({...prefs, solidColor: null})
 		setCfg((c) => ({...c, preset: null, wallpaper: id}))
 	}
 	const upload = async (file?: File | null) => {
@@ -146,7 +219,7 @@ function Background({cfg, setCfg, prefs, setPrefs}: P & {prefs: Prefs; setPrefs:
 			const body = await res.json().catch(() => null)
 			if (!res.ok) throw new Error(body?.error?.message ?? 'Upload failed')
 			// Only the photo is stored; the phone keeps its own theme unless you choose "Your photo" there.
-			setPrefs({...prefs, customBrandHsl: hsl, backgroundVersion: body.prefs.backgroundVersion})
+			applyPrefsUpdate(setPrefs, (latest) => prefsAfterPhotoUpload(latest, {hsl, backgroundVersion: body.prefs.backgroundVersion ?? null}, {setThemeCustom: false}))
 			setCfg((c) => ({...c, preset: null, wallpaper: 'photo'}))
 			toast('Background set')
 		} catch (e) {
@@ -156,61 +229,57 @@ function Background({cfg, setCfg, prefs, setPrefs}: P & {prefs: Prefs; setPrefs:
 			if (fileRef.current) fileRef.current.value = ''
 		}
 	}
+	const on = (id: string) => !solid && cfg.wallpaper === id
 	return (
-		<>
-			<Section title="Omarchy" note="Backgrounds from your Omarchy desktop’s themes. “Same as desktop” follows whatever the desktop shows.">
-				<OmarchyBackgrounds
-					selected={cfg.wallpaper === 'omarchy' ? (prefs.omarchyBackground ?? null) : undefined}
-					onChoose={(id) => {
-						setPrefs({...prefs, omarchyBackground: id})
-						setCfg((c) => ({...c, preset: null, wallpaper: 'omarchy'}))
-					}}
-				/>
-			</Section>
-						<Section title="Wallpapers" note="High-resolution photos from the elementary OS collection (CC0, Unsplash and Pexels licences; credits in wallpapers/CREDITS.md).">
-				<div className="pz-grid walls">
-					{WALLPAPERS.map((w) => (
-						<button key={w.id} className={`pz-card wall-card${cfg.wallpaper === w.id ? ' on' : ''}`} onClick={() => pick(w.id)} title={`${w.name} · ${w.by}`}>
-							<span className="pz-thumb" style={{backgroundImage: `url(${wallpaperSrc(w.id, true)})`}}>
-								{cfg.wallpaper === w.id && <Icon name="check" size={16} stroke={3} className="pz-check" />}
-							</span>
-							<b>{w.name}</b>
-						</button>
-					))}
-				</div>
-			</Section>
-			<Section title="Solid colour" note="A plain colour instead of a picture.">
-				<SolidColors value={solidOf(cfg.wallpaper)} onChange={(c) => (haptic(6), setCfg((x) => ({...x, preset: null, wallpaper: (c ? `color:${c}` : 'omarchy') as DeskConfig['wallpaper']})))} />
-			</Section>
-			<Section title="Your own">
-				<div className="pz-grid walls">
-					<button className={`pz-card wall-card${cfg.wallpaper === 'server' ? ' on' : ''}`} onClick={() => pick('server')}>
-						<span className="pz-thumb" style={{backgroundImage: serverWall ? `url(${serverWall})` : undefined}}>
-							{cfg.wallpaper === 'server' && <Icon name="check" size={16} stroke={3} className="pz-check" />}
+		<Section title="Background" note="Pictures and solid colours behind the app and the desktop. Omarchy pictures are the ones from the Omarchy theme; you can also use the server wallpaper or upload your own photo.">
+			<OmarchyBackgrounds
+				bare
+				selected={on('omarchy') ? (prefs.omarchyBackground ?? null) : undefined}
+				onChoose={(id) => {
+					setPrefs({...prefs, omarchyBackground: id, solidColor: null})
+					setCfg((c) => ({...c, preset: null, wallpaper: 'omarchy'}))
+				}}
+			/>
+			<div className="pz-grid walls">
+				<button className={`pz-card wall-card${on('server') ? ' on' : ''}`} onClick={() => pick('server')}>
+					<span className="pz-thumb" style={{backgroundImage: serverWall ? `url(${serverWall})` : undefined}}>
+						{on('server') && <Icon name="check" size={16} stroke={3} className="pz-check" />}
+					</span>
+					<b>Server wallpaper</b>
+				</button>
+				{photo && (
+					<button className={`pz-card wall-card${on('photo') ? ' on' : ''}`} onClick={() => pick('photo')}>
+						<span className="pz-thumb" style={{backgroundImage: `url(${photo})`}}>
+							{on('photo') && <Icon name="check" size={16} stroke={3} className="pz-check" />}
 						</span>
-						<b>Omarchy Server wallpaper</b>
+						<b>Your photo</b>
 					</button>
-					{photo && (
-						<button className={`pz-card wall-card${cfg.wallpaper === 'photo' ? ' on' : ''}`} onClick={() => pick('photo')}>
-							<span className="pz-thumb" style={{backgroundImage: `url(${photo})`}}>
-								{cfg.wallpaper === 'photo' && <Icon name="check" size={16} stroke={3} className="pz-check" />}
-							</span>
-							<b>Your photo</b>
-						</button>
-					)}
-					<button className="pz-card wall-card add" onClick={() => fileRef.current?.click()} disabled={uploading}>
-						<span className="pz-thumb add-thumb">{uploading ? <span className="spinner" /> : <Icon name="upload" size={26} />}</span>
-						<b>{photo ? 'Replace photo…' : 'Upload a photo…'}</b>
-					</button>
-					<input ref={fileRef} type="file" accept="image/*" hidden onChange={(e) => upload(e.target.files?.[0])} />
-				</div>
-			</Section>
-		</>
+				)}
+				<button className="pz-card wall-card add" onClick={() => fileRef.current?.click()} disabled={uploading}>
+					<span className="pz-thumb add-thumb">{uploading ? <span className="spinner" /> : <Icon name="upload" size={26} />}</span>
+					<b>{photo ? 'Replace photo…' : 'Upload a photo…'}</b>
+				</button>
+				<input ref={fileRef} type="file" accept="image/*" hidden onChange={(e) => upload(e.target.files?.[0])} />
+			</div>
+			<SolidColors
+				value={solid}
+				onChange={(c) => {
+					haptic(6)
+					if (!c) {
+						setPrefs({...prefs, solidColor: null})
+						setCfg((x) => ({...x, preset: null, wallpaper: solidOf(x.wallpaper) ? 'omarchy' : x.wallpaper}))
+						return
+					}
+					setPrefs({...prefs, solidColor: c})
+					setCfg((x) => ({...x, preset: null, wallpaper: `color:${c}` as DeskConfig['wallpaper']}))
+				}}
+			/>
+		</Section>
 	)
 }
 
 function DockSettings({cfg, setCfg}: P) {
-	const {info, appList, machineList, owner} = useItems()
+	const {info, appList, machineList, owner, strictOwner} = useItems()
 	const d = cfg.dock
 	const set = (patch: Partial<DeskConfig['dock']>) => setCfg((c) => ({...c, dock: {...c.dock, ...patch}}))
 	const move = (k: string, dir: -1 | 1) => {
@@ -221,10 +290,10 @@ function DockSettings({cfg, setCfg}: P) {
 		;[items[i], items[j]] = [items[j], items[i]]
 		set({items})
 	}
-	const candidates = allKeys(appList, machineList, owner).filter((k) => !d.items.includes(k))
+	const candidates = withTerminals(placeableKeys(appList, machineList, owner), strictOwner).filter((k) => !withTerminals(d.items, strictOwner).includes(k))
 	return (
 		<>
-			<Section title="Layout">
+			<Section title="Position">
 				<div className="glass group pz-rows">
 					<div className="row static">
 						<span className="main">
@@ -312,9 +381,11 @@ function DockSettings({cfg, setCfg}: P) {
 								<button className="icon-btn" aria-label={`Move ${it.label} down`} disabled={i === d.items.length - 1} onClick={() => move(k, 1)}>
 									<Icon name="chevron-down" size={16} />
 								</button>
-								<button className="icon-btn danger-x" aria-label={`Remove ${it.label} from the dock`} onClick={() => set({items: d.items.filter((x) => x !== k)})}>
-									<Icon name="close" size={15} stroke={2.4} />
-								</button>
+								{k !== 'terminals' && (
+									<button className="icon-btn danger-x" aria-label={`Remove ${it.label} from the dock`} onClick={() => set({items: d.items.filter((x) => x !== k)})}>
+										<Icon name="close" size={15} stroke={2.4} />
+									</button>
+								)}
 							</div>
 						)
 					})}
@@ -336,7 +407,7 @@ function DockSettings({cfg, setCfg}: P) {
 
 function DesktopSettings({cfg, setCfg}: P) {
 	const desk = useDesktop()
-	const {info, appList, machineList, owner} = useItems()
+	const {info, appList, machineList, owner, strictOwner} = useItems()
 	const onDesk = new Set(cfg.icons.map((i) => i.key))
 	const running = [
 		...appList.filter((a) => a.state === 'ready' || a.state === 'running').map((a) => `app:${a.id}`),
@@ -347,7 +418,7 @@ function DesktopSettings({cfg, setCfg}: P) {
 		<>
 			<Section
 				title="Opening apps"
-				note="Some apps (Forgejo, Nextcloud, Home Assistant and others) don’t allow being shown inside another page. Those always open in their own browser tab, like in Omarchy Server."
+				note="Some apps (Forgejo, Nextcloud, Home Assistant and others) don’t allow being shown inside another page. Those always open in their own browser tab."
 			>
 				<div className="glass group pz-rows">
 					<div className="row static">
@@ -379,7 +450,7 @@ function DesktopSettings({cfg, setCfg}: P) {
 			</Section>
 			<Section title="Choose icons" note="Double-click an icon to open it. Drag icons to arrange them, drag across the desktop to select several, and press Delete to remove the selected icons (only the shortcut is removed). A stopped machine starts when you open it.">
 				<ItemPicker
-					keys={allKeys(appList, machineList, owner, true)}
+					keys={withTerminals(placeableKeys(appList, machineList, owner, true), strictOwner)}
 					info={info}
 					selected={onDesk}
 					onPick={(k) => (onDesk.has(k) ? desk?.removeIcon(k) : desk?.addIcon(k))}
@@ -387,17 +458,6 @@ function DesktopSettings({cfg, setCfg}: P) {
 			</Section>
 		</>
 	)
-}
-
-function allKeys(appList: {id: string; name?: string}[], machineList: {id: string}[], owner: boolean, folders = false) {
-	return [
-		...(folders ? ['folder:/Home', 'folder:/Trash'] : []),
-		...SYSTEM_DOCK.filter((k) => k !== 'terminal' || owner),
-		'personalize',
-		...[...appList].sort((a, b) => (a.name ?? a.id).localeCompare(b.name ?? b.id)).map((a) => `app:${a.id}`),
-		...(owner ? [DESKTOP_KEY] : []),
-		...machineList.map((m) => `machine:${m.id}`),
-	]
 }
 
 function ItemPicker({keys, info, selected, onPick, actionLabel}: {keys: string[]; info: (k: string) => ItemInfo; selected?: Set<string>; onPick: (k: string) => void; actionLabel?: string}) {

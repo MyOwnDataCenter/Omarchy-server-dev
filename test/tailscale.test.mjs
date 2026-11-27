@@ -2,6 +2,7 @@
 // Real omarchyd; stand-ins for the root helper, Tailscale's local API (a unix socket) and the
 // `tailscale` program (its `web` page and `version`).
 import assert from 'node:assert/strict'
+import {gitArgv} from './git-nosign.mjs'
 import {execFileSync} from 'node:child_process'
 import {chmod, mkdir, mkdtemp, readFile, rm, writeFile} from 'node:fs/promises'
 import http from 'node:http'
@@ -27,7 +28,7 @@ if (cmd === 'web') {
 `
 
 describe('Tailscale on the system', () => {
-	let root, data, d, auth, port, helperCalls, helperAnswer, operator, helperFile, prefs, apiRequests, socketPath, api, composeCalls, bin
+	let root, sockDir, data, d, auth, port, helperCalls, helperAnswer, operator, helperFile, prefs, apiRequests, socketPath, api, composeCalls, bin
 	const call = async (path, input, kind = 'mutation') => {
 		const url = new URL(`${d.url}/trpc/${path}`)
 		const init = {method: kind === 'mutation' ? 'POST' : 'GET', headers: {...auth}}
@@ -110,7 +111,8 @@ describe('Tailscale on the system', () => {
 		// Tailscale's local API: only accepts what the real one does (its Host, no Origin or Referer).
 		prefs = {WantRunning: true}
 		apiRequests = []
-		socketPath = join(root, 'tailscaled.sock')
+		sockDir = await mkdtemp('/tmp/om-ts-')
+		socketPath = join(sockDir, 'tailscaled.sock')
 		api = http.createServer((req, res) => {
 			let body = ''
 			req.on('data', (c) => (body += c))
@@ -128,7 +130,13 @@ describe('Tailscale on the system', () => {
 				res.writeHead(404).end()
 			})
 		})
-		await new Promise((r) => api.listen(socketPath, r))
+		await new Promise((resolve, reject) => {
+			api.once('error', reject)
+			api.listen(socketPath, () => {
+				api.off('error', reject)
+				resolve()
+			})
+		})
 		const accounts = await openAccounts(data)
 		await accounts.createOwner({name: 'Chris', password: 'correct horse'})
 		// A store that also lists an app called "tailscale" (as a container).
@@ -136,22 +144,22 @@ describe('Tailscale on the system', () => {
 		await mkdir(join(store, 'tailscale'), {recursive: true})
 		await writeFile(join(store, 'tailscale', 'omarchy-app.yml'), 'manifestVersion: 1\nid: tailscale\nname: Container Tailscale\nport: 8241\nweb:\n  service: web\n  port: 8240\n')
 		await writeFile(join(store, 'tailscale', 'docker-compose.yml'), 'services:\n  web:\n    image: x\n    network_mode: host\n')
-		for (const args of [['init', '-q', '-b', 'main'], ['add', '.'], ['-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 's']]) execFileSync('git', args, {cwd: store, stdio: 'pipe'})
+		for (const args of [['init', '-q', '-b', 'main'], ['add', '.'], ['-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 's']]) execFileSync('git', gitArgv(args), {cwd: store, stdio: 'pipe'})
 		await boot()
 		await call('appStore.addRepository', {url: `file://${store}`})
 	})
 	after(async () => {
 		await d?.close()
 		api?.close()
-		await rm(root, {recursive: true, force: true})
+		if (sockDir) await rm(sockDir, {recursive: true, force: true})
+		if (root) await rm(root, {recursive: true, force: true})
 	})
 
 	test('listed first, as part of Omarchy Server; a store’s own “tailscale” can’t stand in for it', async () => {
 		const reg = await q('appStore.registry')
-		assert.equal(reg[0].meta.name, 'Omarchy Server')
+		assert.equal(reg[0].meta.name, 'MODC')
 		const listing = reg[0].apps.find((a) => a.id === 'tailscale')
 		assert.equal(listing.system, true)
-		assert.deepEqual(listing.permissions, ['system-software'])
 		assert.equal(listing.port, port)
 		const review = await q('apps.installReview', {appId: 'tailscale'})
 		assert.deepEqual(review.permissions.map((p) => p.id), ['system-software'], 'the built-in one, not the store’s container (which would ask for the host network)')

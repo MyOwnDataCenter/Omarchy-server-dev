@@ -14,10 +14,11 @@
 // authority your devices already trust until the owner chooses to replace it (rotateAuthority).
 import {writeAtomic} from './atomic.mjs'
 import {execFile} from 'node:child_process'
-import {mkdir, readFile, rename, rm, stat, writeFile} from 'node:fs/promises'
+import {constants} from 'node:fs'
+import {access, mkdir, readFile, rename, rm, stat, writeFile} from 'node:fs/promises'
 import net from 'node:net'
 import os from 'node:os'
-import {join} from 'node:path'
+import {basename, join} from 'node:path'
 import {Duplex} from 'node:stream'
 import tls from 'node:tls'
 
@@ -85,50 +86,131 @@ async function withLock(dir, fn) {
 	}
 }
 
+// ENOENT is "not written". A syntax error, or JSON that is not an object, is damaged.
+// Permission errors are neither: they have to surface, or a new authority could be
+// written over a key this process is not allowed to read.
+const damaged = Symbol('damaged')
+const reportedDamage = new Set()
+
+function reportDamaged(file) {
+	if (reportedDamage.has(file)) return
+	reportedDamage.add(file)
+	console.error(`[omarchy-server] TLS metadata damaged: ${basename(file)}`)
+}
+
+async function readOptional(file) {
+	try {
+		return await readFile(file, 'utf8')
+	} catch (error) {
+		if (error.code === 'ENOENT') return null
+		throw error
+	}
+}
+
+async function exists(file) {
+	try {
+		await stat(file)
+		return true
+	} catch (error) {
+		if (error.code === 'ENOENT') return false
+		throw error
+	}
+}
+
+async function readJson(file) {
+	const text = await readOptional(file)
+	if (text === null) return null
+	try {
+		const value = JSON.parse(text)
+		if (!value || typeof value !== 'object' || Array.isArray(value)) return damaged
+		return value
+	} catch (error) {
+		if (error instanceof SyntaxError) return damaged
+		throw error
+	}
+}
+
 // Make (or renew) the authority and this server's certificate. Returns PEM strings.
 export async function ensureTls({dir = defaultTlsDir(), names = serverNames()} = {}) {
 	await mkdir(dir, {recursive: true, mode: 0o700})
 	const read = async () => {
-		const [key, cert, ca, info] = await Promise.all(['server.key', 'server.crt', 'ca.crt', 'server.json'].map((f) => readFile(join(dir, f), 'utf8').catch(() => null)))
-		return {key, cert, ca, info: info ? JSON.parse(info) : null}
+		const [key, cert, ca, info, authority] = await Promise.all([
+			readOptional(join(dir, 'server.key')),
+			readOptional(join(dir, 'server.crt')),
+			readOptional(join(dir, 'ca.crt')),
+			readJson(join(dir, 'server.json')),
+			readJson(join(dir, 'ca.json')),
+		])
+		return {key, cert, ca, info, authority}
 	}
-	const fresh = (c) => c.key && c.cert && c.ca && c.info?.names === want && c.info.expires - Date.now() > 30 * DAY
-	// A restricted authority only signs names and addresses inside what it's allowed.
-	const authority = JSON.parse((await readFile(join(dir, 'ca.json'), 'utf8').catch(() => null)) ?? 'null')
-	if (authority?.restricted) names = {dns: names.dns.filter((d) => dnsAllowed(d, authority.dns)), ips: names.ips.filter(privateAddress)}
-	const want = JSON.stringify(names)
-	let current = await read()
-	if (fresh(current)) return current
+	const certificate = (state) => ({key: state.key, cert: state.cert, ca: state.ca, info: state.info && state.info !== damaged ? state.info : null})
+	// Damaged metadata must not drop https, and must not replace the authority devices
+	// already trust. The damaged file is left as it is. A missing ca.json is different:
+	// no restriction was recorded (an authority from before 0.9.4).
+	const assess = (state) => {
+		const badServer = state.info === damaged
+		const badCa = state.authority === damaged || (state.authority?.restricted && !Array.isArray(state.authority.dns))
+		if ((badServer || badCa) && state.key && state.cert && state.ca) {
+			if (badServer) reportDamaged(join(dir, 'server.json'))
+			if (badCa) reportDamaged(join(dir, 'ca.json'))
+			return {serve: certificate(state)}
+		}
+		if (badCa) return {blocked: true}
+		let chosen = names
+		// A restricted authority only signs names and addresses inside what it's allowed.
+		if (state.authority?.restricted) chosen = {dns: names.dns.filter((d) => dnsAllowed(d, state.authority.dns)), ips: names.ips.filter(privateAddress)}
+		const want = JSON.stringify(chosen)
+		const fresh = state.key && state.cert && state.ca && state.info && state.info !== damaged && state.info.names === want && state.info.expires - Date.now() > 30 * DAY
+		if (fresh) return {serve: certificate(state)}
+		return {chosen, state}
+	}
+	const first = assess(await read())
+	if (first.serve) return first.serve
 	return withLock(dir, async () => {
-		current = await read()
-		if (fresh(current)) return current
+		const decision = assess(await read())
+		if (decision.serve) return decision.serve
+		if (decision.blocked) throw new Error('TLS metadata damaged: ca.json')
+		let chosen = decision.chosen
+		const current = decision.state
 		const host = os.hostname().replace(/[^A-Za-z0-9.-]/g, '') || 'omarchy'
-		if (!(await stat(join(dir, 'ca.key')).catch(() => null)) || !current.ca) {
+		const caKey = join(dir, 'ca.key')
+		if (!(await exists(caKey)) || !current.ca) {
+			// -keyout truncates first. stat still sees a write-only key (mode 0200); do not destroy it.
+			try {
+				await access(caKey, constants.R_OK)
+			} catch (error) {
+				if (error.code !== 'ENOENT') throw error
+			}
 			const short = host.toLowerCase()
-			await openssl(['req', '-x509', '-new', '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:prime256v1', '-nodes', '-keyout', 'ca.key', '-out', 'ca.crt', '-days', '3650', '-subj', `/O=Omarchy Server/CN=Omarchy Server ${host}`, '-addext', 'basicConstraints=critical,CA:TRUE,pathlen:0', '-addext', 'keyUsage=critical,keyCertSign,cRLSign', '-addext', nameConstraints(short)], {cwd: dir})
-			await writeFile(join(dir, 'ca.json'), JSON.stringify({restricted: true, dns: permittedDns(short), created: Date.now()}), {mode: 0o600})
+			// OpenSSL rejects a common name over 64 bytes. "Omarchy Server " is 15, so a
+			// device name of 50 or more (Settings allows 63) cannot use the host in full.
+			const prefix = 'Omarchy Server '
+			const cn = Buffer.byteLength(prefix + host) <= 64 ? prefix + host : prefix + host.slice(0, 64 - Buffer.byteLength(prefix))
+			await openssl(['req', '-x509', '-new', '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:prime256v1', '-nodes', '-keyout', 'ca.key', '-out', 'ca.crt', '-days', '3650', '-subj', `/O=Omarchy Server/CN=${cn}`, '-addext', 'basicConstraints=critical,CA:TRUE,pathlen:0', '-addext', 'keyUsage=critical,keyCertSign,cRLSign', '-addext', nameConstraints(short)], {cwd: dir})
+			await writeAtomic(join(dir, 'ca.json'), JSON.stringify({restricted: true, dns: permittedDns(short), created: Date.now()}), {mode: 0o600})
 			// The new authority can only sign what it's allowed: start over with those names.
 			await rm(join(dir, 'server.json'), {force: true})
-			names = {dns: names.dns.filter((d) => dnsAllowed(d, permittedDns(short))), ips: names.ips.filter(privateAddress)}
+			chosen = {dns: chosen.dns.filter((d) => dnsAllowed(d, permittedDns(short))), ips: chosen.ips.filter(privateAddress)}
 		}
-		const san = [...names.dns.map((d) => `DNS:${d}`), ...names.ips.map((i) => `IP:${i}`)].join(',')
+		const san = [...chosen.dns.map((d) => `DNS:${d}`), ...chosen.ips.map((i) => `IP:${i}`)].join(',')
 		await writeFile(join(dir, 'ext.cnf'), `basicConstraints=CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\nsubjectAltName=${san}\n`)
 		await openssl(['req', '-new', '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:prime256v1', '-nodes', '-keyout', 'server.key.new', '-out', 'server.csr', '-subj', `/CN=${host}`], {cwd: dir})
 		// 397 days: the longest browsers accept for a server certificate.
 		await openssl(['x509', '-req', '-in', 'server.csr', '-CA', 'ca.crt', '-CAkey', 'ca.key', '-CAcreateserial', '-out', 'server.crt.new', '-days', '397', '-extfile', 'ext.cnf'], {cwd: dir})
 		await rename(join(dir, 'server.key.new'), join(dir, 'server.key'))
 		await rename(join(dir, 'server.crt.new'), join(dir, 'server.crt'))
-		await writeFile(join(dir, 'server.json'), JSON.stringify({names: JSON.stringify(names), expires: Date.now() + 397 * DAY}), {mode: 0o600})
+		await writeAtomic(join(dir, 'server.json'), JSON.stringify({names: JSON.stringify(chosen), expires: Date.now() + 397 * DAY}), {mode: 0o600})
 		await rm(join(dir, 'server.csr'), {force: true})
 		await rm(join(dir, 'ext.cnf'), {force: true})
-		return read()
+		return certificate(await read())
 	})
 }
 
 export async function authorityInfo(dir = defaultTlsDir()) {
-	const meta = JSON.parse((await readFile(join(dir, 'ca.json'), 'utf8').catch(() => null)) ?? 'null')
-	const exists = !!(await stat(join(dir, 'ca.crt')).catch(() => null))
-	return {exists, restricted: !!meta?.restricted}
+	const meta = await readJson(join(dir, 'ca.json'))
+	if (meta === damaged) reportDamaged(join(dir, 'ca.json'))
+	// Damaged metadata is still the authority devices trust. Only a missing file is unrestricted.
+	return {exists: await exists(join(dir, 'ca.crt')), restricted: meta === damaged || !!meta?.restricted}
 }
 
 // Replace the authority with a new, restricted one. The old files are kept in retired-<time>/
@@ -145,8 +227,9 @@ export async function rotateAuthority({dir = defaultTlsDir(), names = serverName
 
 // Settings both the web server and the app gateways follow, kept beside the certificates.
 export async function readPolicy(dir = defaultTlsDir()) {
-	const p = JSON.parse((await readFile(join(dir, 'policy.json'), 'utf8').catch(() => null)) ?? '{}')
-	return {alwaysHttps: p?.alwaysHttps === true}
+	const p = await readJson(join(dir, 'policy.json'))
+	if (p === damaged) reportDamaged(join(dir, 'policy.json'))
+	return {alwaysHttps: p !== damaged && p?.alwaysHttps === true}
 }
 export async function writePolicy(dir = defaultTlsDir(), patch = {}) {
 	await mkdir(dir, {recursive: true, mode: 0o700})
@@ -177,6 +260,7 @@ export function tlsContext({dir = defaultTlsDir(), refreshMs = 10 * 60_000, lazy
 	let policy = {alwaysHttps: false}
 	let seen = ''
 	let poll = null
+	let policyUnreadable = false
 	const load = async () => {
 		if (closed) return
 		try {
@@ -194,8 +278,22 @@ export function tlsContext({dir = defaultTlsDir(), refreshMs = 10 * 60_000, lazy
 		const key = marks.join(':')
 		if (key === seen) return
 		const certChanged = seen && seen.split(':')[0] !== String(marks[0])
+		// chmod does not change mtime. Remembering this stamp before a failed read means
+		// the poll never tries again, and load().then(check) would reject on startup.
+		let next
+		try {
+			next = await readPolicy(dir)
+		} catch (error) {
+			if (!policyUnreadable) {
+				policyUnreadable = true
+				const message = String(error.message ?? error).replace(/, open .*$/, '')
+				console.error('[omarchy-server] policy.json:', message)
+			}
+			return
+		}
+		policyUnreadable = false
 		seen = key
-		policy = await readPolicy(dir)
+		policy = next
 		if (certChanged) await load()
 	}
 	// Made on first use when lazy (nothing to do on a server with no apps yet).
@@ -236,10 +334,21 @@ export function tlsContext({dir = defaultTlsDir(), refreshMs = 10 * 60_000, lazy
 // Listen for both http:// and https:// on one port and hand every connection to `server` (an
 // http.Server, with its own request and upgrade handlers). Requests over TLS have
 // req.socket.encrypted set. Returns the listening net.Server.
-export function dualProtocolServer(server, getContext) {
-	const front = net.createServer((socket) => {
+// A connection that sends nothing for `firstByteMs` is closed: until its first bytes arrive it
+// belongs to no http server, so no http timeout ever ends it, and idle connections would pile up.
+export function dualProtocolServer(server, getContext, {firstByteMs = 30_000} = {}) {
+	// Every connection, so a restart can end them (net.Server.close() waits for all of them to close,
+	// and an open WebSocket never does).
+	const sockets = new Set()
+	const front = net.createServer({noDelay: true}, (socket) => {
+		socket.setNoDelay(true)
+		sockets.add(socket)
+		socket.once('close', () => sockets.delete(socket))
 		socket.once('error', () => socket.destroy())
+		const silent = setTimeout(() => socket.destroy(), firstByteMs)
+		socket.once('close', () => clearTimeout(silent))
 		socket.once('data', (first) => {
+			clearTimeout(silent)
 			socket.pause()
 			const ctx = getContext?.()
 			if (first[0] === 0x16 && ctx) {
@@ -251,6 +360,16 @@ export function dualProtocolServer(server, getContext) {
 					},
 					write(chunk, enc, cb) {
 						socket.write(chunk, enc, cb)
+					},
+					writev(chunks, cb) {
+						socket.cork()
+						for (let i = 0; i < chunks.length - 1; i++) {
+							socket.write(chunks[i].chunk, chunks[i].encoding)
+						}
+						const last = chunks[chunks.length - 1]
+						if (last) socket.write(last.chunk, last.encoding, cb)
+						else cb()
+						process.nextTick(() => socket.uncork())
 					},
 					final(cb) {
 						socket.end(cb)
@@ -267,6 +386,7 @@ export function dualProtocolServer(server, getContext) {
 				socket.on('close', () => stream.destroy())
 				const secure = new tls.TLSSocket(stream, {isServer: true, secureContext: ctx, ALPNProtocols: ['http/1.1']})
 				for (const k of ['remoteAddress', 'remotePort', 'remoteFamily', 'localAddress', 'localPort']) Object.defineProperty(secure, k, {get: () => socket[k]})
+				secure.setNoDelay = (noDelay = true) => (socket.setNoDelay(noDelay), secure)
 				secure.on('error', () => secure.destroy())
 				stream.push(first)
 				socket.resume()
@@ -279,5 +399,8 @@ export function dualProtocolServer(server, getContext) {
 		})
 	})
 	front.on('close', () => server.close())
+	front.destroyConnections = () => {
+		for (const s of sockets) s.destroy()
+	}
 	return front
 }

@@ -107,3 +107,116 @@ test('themes: current Omarchy layout (~/.local/state), switching, getting and re
 	await new Promise((r) => setTimeout(r, 10))
 	assert.deepEqual(ran, [['omarchy-theme-set', 'tokyo-night'], ['omarchy-theme-install', 'https://github.com/bjarneo/omarchy-monokai-theme'], ['omarchy-theme-remove', 'dracula']])
 })
+
+test('setBackground runs omarchy-theme-bg-set with that image, and refuses unknown or path-like ids', async () => {
+	const home = join(root, 'home-bg')
+	const omarchy = join(root, 'omarchy-bg')
+	const file = join(omarchy, 'themes/nord/backgrounds/fjord.webp')
+	await mkdir(join(omarchy, 'themes/nord/backgrounds'), {recursive: true})
+	await mkdir(join(omarchy, 'themes/tokyo-night/backgrounds'), {recursive: true})
+	await writeFile(file, 'img-nord')
+	await writeFile(join(omarchy, 'themes/tokyo-night/backgrounds/city.jpg'), 'img-tokyo')
+	await mkdir(join(omarchy, 'bin'), {recursive: true})
+	await writeFile(join(omarchy, 'bin', 'omarchy-theme-bg-set'), '#!/bin/sh\n', {mode: 0o755})
+	await writeFile(join(omarchy, 'bin', 'omarchy-theme-set'), '#!/bin/sh\n', {mode: 0o755})
+	const state = join(home, '.local/state/omarchy/current')
+	await mkdir(state, {recursive: true})
+	await symlink(join(omarchy, 'themes/nord'), join(state, 'theme'))
+	await writeFile(join(state, 'theme.name'), 'nord\n')
+	await symlink(file, join(state, 'background'))
+	const ran = []
+	const t = createOmarchyTheme({home, env: {OMARCHY_PATH: omarchy, PATH: '/usr/bin'}, run: async (cmd, args) => ran.push([cmd.split('/').pop(), ...args])})
+
+	const listed = await t.list()
+	const nord = listed.groups.find((g) => g.theme === 'nord')
+	const tokyo = listed.groups.find((g) => g.theme === 'tokyo-night')
+	assert.ok(nord?.items[0]?.id)
+	assert.ok(tokyo?.items[0]?.id)
+	const onlyNord = await t.backgrounds({theme: 'nord'})
+	assert.deepEqual(onlyNord.groups.map((g) => g.theme), ['nord'])
+	assert.equal(onlyNord.groups[0].items[0].id, nord.items[0].id)
+
+	await t.setBackground(nord.items[0].id)
+	await new Promise((r) => setTimeout(r, 10))
+	assert.deepEqual(ran, [['omarchy-theme-bg-set', file]])
+	ran.length = 0
+	await t.setBackground(tokyo.items[0].id, 'tokyo-night')
+	await new Promise((r) => setTimeout(r, 10))
+	assert.deepEqual(ran, [
+		['omarchy-theme-set', 'tokyo-night'],
+		['omarchy-theme-bg-set', join(omarchy, 'themes/tokyo-night/backgrounds/city.jpg')],
+	])
+	await assert.rejects(t.setBackground('0123456789abcdef'), /isn.t/)
+	await assert.rejects(t.setBackground('../../etc/passwd'), /isn.t/)
+	await assert.rejects(t.setBackground(file), /isn.t/)
+})
+
+test('a copied current/theme does not list the same wallpaper twice', async () => {
+	const home = join(root, 'home-dup')
+	const share = join(home, '.local/share/omarchy/themes/nord/backgrounds')
+	const live = join(home, '.local/state/omarchy/current/theme/backgrounds')
+	await mkdir(share, {recursive: true})
+	await mkdir(live, {recursive: true})
+	await writeFile(join(share, '1-city.webp'), 'share-city')
+	await writeFile(join(share, 'omarchy.webp'), 'share-oma')
+	await writeFile(join(live, '1-city.webp'), 'copy-city')
+	await writeFile(join(live, 'omarchy.webp'), 'copy-oma')
+	await writeFile(join(home, '.local/state/omarchy/current/theme.name'), 'nord\n')
+	const t = createOmarchyTheme({home})
+	const nord = (await t.list()).groups.find((g) => g.theme === 'nord')
+	assert.deepEqual(nord.items.map((i) => i.name), ['1-city', 'omarchy'])
+})
+
+test('removing a theme clears any prior failed job for that slug', async () => {
+	const home = join(root, 'home-remove-job')
+	const omarchy = join(root, 'omarchy-remove-job')
+	const userTheme = join(home, '.config/omarchy/themes/monokai')
+	await mkdir(join(omarchy, 'themes/nord/backgrounds'), {recursive: true})
+	await writeFile(join(omarchy, 'themes/nord/backgrounds/1.webp'), 'img')
+	await mkdir(userTheme, {recursive: true})
+	await writeFile(join(userTheme, 'colors.toml'), 'background = "#272822"\n')
+	await mkdir(join(omarchy, 'bin'), {recursive: true})
+	for (const b of ['omarchy-theme-set', 'omarchy-theme-install', 'omarchy-theme-remove']) await writeFile(join(omarchy, 'bin', b), '#!/bin/sh\n', {mode: 0o755})
+	const state = join(home, '.local/state/omarchy/current')
+	await mkdir(state, {recursive: true})
+	await symlink(join(omarchy, 'themes/nord'), join(state, 'theme'))
+	await writeFile(join(state, 'theme.name'), 'nord\n')
+
+	const t = createOmarchyTheme({
+		home,
+		env: {OMARCHY_PATH: omarchy, PATH: '/usr/bin'},
+		run: async (cmd) => {
+			if (cmd.endsWith('omarchy-theme-set')) throw new Error('switch failed')
+			if (cmd.endsWith('omarchy-theme-remove')) await rm(userTheme, {recursive: true, force: true})
+		},
+	})
+
+	await t.setTheme('monokai')
+	await new Promise((r) => setTimeout(r, 15))
+	assert.equal((await t.themes()).installed.find((x) => x.slug === 'monokai')?.job?.state, 'error')
+
+	await t.removeTheme('monokai')
+	const after = await t.themes()
+	assert.equal(after.installed.some((x) => x.slug === 'monokai'), false)
+	assert.equal(after.more.find((x) => x.slug === 'monokai')?.job, undefined)
+})
+
+test('installed community themes keep the list name, and 0x alacritty colours parse', async () => {
+	const home = join(root, 'home-names')
+	const themes = join(home, '.config/omarchy/themes')
+	await mkdir(join(themes, 'omarchy'), {recursive: true})
+	await writeFile(join(themes, 'omarchy', 'alacritty.toml'), "[colors.primary]\nbackground = '0x1d1f21'\nforeground = '0xc5c8c6'\n\n[colors.normal]\nblue = '0x81a2be'\n")
+	await mkdir(join(themes, 'my_custom_theme'), {recursive: true})
+	await writeFile(join(themes, 'my_custom_theme', 'colors.toml'), 'background = "#112233"\n')
+	const t = createOmarchyTheme({home})
+	const list = await t.themes()
+	assert.equal(list.installed.find((x) => x.slug === 'omarchy')?.name, 'Eldritch')
+	assert.equal(list.installed.find((x) => x.slug === 'my_custom_theme')?.name, 'My Custom Theme')
+	const colors = list.installed.find((x) => x.slug === 'omarchy')?.colors
+	assert.equal(colors.background, '#1d1f21')
+	assert.equal(colors.foreground, '#c5c8c6')
+	assert.equal(colors.accent, '#81a2be')
+	assert.deepEqual(colors.dots, ['#81a2be'])
+	assert.equal(parseThemeColors("background = '#aabbcc'\n").background, '#aabbcc')
+	assert.equal(parseThemeColors('background = 112233\n').background, '#112233')
+})

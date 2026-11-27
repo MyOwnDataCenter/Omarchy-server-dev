@@ -4,9 +4,12 @@ import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode }
 import { createPortal } from "react-dom";
 
 import { mutate, type FileEntry } from "../../api";
+import { useDialogFocus } from "../../focus";
 import { Icon, type IconName } from "../../icons";
 import { bytes, haptic, usePortalRoot, useToast } from "../../ui";
+import { ZIP_ENTRY_LIMIT, decodeTextFile, encodeTextFile, handleDocumentLinkClick, nextGridCell, renderMarkdownHtml, shouldIgnoreViewerKey, zipTruncatedNote } from "./helpers";
 import type { Sheet, Shape, ZipEntry } from "./office";
+import { panDeltaForKey } from "./panKeys";
 
 const enc = encodeURIComponent;
 const viewUrl = (path: string) => `/api/files/view?path=${enc(path)}`;
@@ -21,7 +24,7 @@ const TEXT_EXT = new Set(
     "py rb go rs java kt c h cpp hpp cc cs php pl lua swift sql html htm css scss less xml svg vtt srt nfo " +
     "gitignore dockerfile makefile properties service gradle r dart vue svelte tf hcl nix lock").split(" "),
 );
-// Formats Omarchy Server turns into a viewable picture for us (browsers can't decode these from the file).
+// Formats My Own Data Center turns into a viewable picture for us (browsers can't decode these from the file).
 const RENDERED_EXT = new Set("heic heif tif tiff psd dng cr2 cr3 nef arw raf orf rw2 raw".split(" "));
 export function viewKind(f: FileEntry): ViewKind {
   const t = f.type;
@@ -109,7 +112,7 @@ function useParsed<T>(f: FileEntry, parse: (buf: ArrayBuffer) => Promise<T>, cle
   return { value: state.value, error: error ?? state.error, loading: !error && !state.error && state.value === undefined };
 }
 
-// Overwrite the file in place with new contents (the same upload Omarchy Server's own editor uses).
+// Overwrite the file in place with new contents (the same upload My Own Data Center's own editor uses).
 async function saveFile(f: FileEntry, body: Blob) {
   const r = await fetch(`/api/files/upload?path=${enc(f.path)}&collision=replace`, {
     method: "POST",
@@ -135,6 +138,8 @@ export type ViewerProps = {
   onInfo: (f: FileEntry) => void;
   onDownload: (f: FileEntry) => void;
   onChanged: () => void;
+  onFavorite?: (f: FileEntry) => void;
+  isFavorite?: (f: FileEntry) => boolean;
 };
 type Tools = { node: ReactNode; ownsArrows?: boolean; dirty?: boolean };
 
@@ -155,15 +160,17 @@ export function FileViewer(p: ViewerProps) {
     setI(n);
   };
   const close = () => guard() && p.onClose();
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const isTop = useDialogFocus(!!f, dialogRef, close, {
+    canEscape: (e) => !(e.target as HTMLElement | null)?.closest("input, textarea, [contenteditable=true]"),
+  });
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const el = e.target as HTMLElement;
-      if (el.closest("input, textarea, [contenteditable=true]") || document.querySelector(".sheet")) return;
-      if (e.key === "Escape") close();
-      else if (!tools.ownsArrows && e.key === "ArrowLeft") step(-1);
+      if (!isTop() || el.closest("input, textarea, [contenteditable=true]")) return;
+      if (!tools.ownsArrows && e.key === "ArrowLeft") step(-1);
       else if (!tools.ownsArrows && e.key === "ArrowRight") step(1);
     };
-    // Capture phase: runs before a details sheet on top closes itself, so Esc closes one layer.
     document.addEventListener("keydown", onKey, true);
     return () => document.removeEventListener("keydown", onKey, true);
   });
@@ -175,10 +182,12 @@ export function FileViewer(p: ViewerProps) {
   const look = KIND_INFO[kind];
   return createPortal(
     <div
+      ref={dialogRef}
       className="fv"
       role="dialog"
       aria-modal="true"
       aria-label={f.name}
+      tabIndex={-1}
       onTouchStart={(e) => {
         if (!swipeable || e.touches.length !== 1) return (swipe.current = null);
         swipe.current = { x: e.touches[0].clientX, y: e.touches[0].clientY, t: Date.now() };
@@ -206,6 +215,17 @@ export function FileViewer(p: ViewerProps) {
           </span>
         </span>
         <span className="fv-tools">{tools.node}</span>
+        {p.onFavorite && (p.isFavorite?.(f) || f.operations.includes("favorite")) && (
+          <button
+            className="icon-btn"
+            aria-pressed={!!p.isFavorite?.(f)}
+            aria-label={p.isFavorite?.(f) ? `Unfavorite ${f.name}` : `Favorite ${f.name}`}
+            title={p.isFavorite?.(f) ? "Unfavorite" : "Favorite"}
+            onClick={() => p.onFavorite?.(f)}
+          >
+            <Icon name={p.isFavorite?.(f) ? "star-filled" : "star"} size={20} />
+          </button>
+        )}
         <button className="icon-btn" onClick={() => p.onDownload(f)} aria-label="Download" title="Download">
           <Icon name="download" size={20} />
         </button>
@@ -333,7 +353,7 @@ function ImageView(b: BodyProps) {
   const pointers = useRef(new Map<number, { x: number; y: number }>());
   const gesture = useRef<{ d: number; s: number; x: number; y: number; cx: number; cy: number } | null>(null);
   const lastTap = useRef(0);
-  // Ask Omarchy Server for a large rendition when the browser can't draw the original.
+  // Ask My Own Data Center for a large rendition when the browser can't draw the original.
   const rendition = async () => {
     for (const input of [{ path: f.path, variant: "preview-1280-webp-v2" }, { path: f.path }]) {
       try {
@@ -364,6 +384,12 @@ function ImageView(b: BodyProps) {
     const k = ns / z.s;
     set(ns, px - (px - z.x) * k, py - (py - z.y) * k);
   };
+  const zRef = useRef(z);
+  zRef.current = z;
+  const setRef = useRef(set);
+  setRef.current = set;
+  const zoomAtRef = useRef(zoomAt);
+  zoomAtRef.current = zoomAt;
   useEffect(() => {
     setTools({
       node: (
@@ -376,8 +402,37 @@ function ImageView(b: BodyProps) {
           </button>
         </>
       ),
+      // A zoomed photo owns the arrow keys (they pan it); at 100% they still switch files.
+      ownsArrows: z.s > 1,
     });
-  }, [z.s]);
+  }, [z.s, z.x, z.y]);
+  const panning = z.s > 1;
+  useEffect(() => {
+    if (!panning) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.defaultPrevented || e.ctrlKey || e.altKey || e.metaKey || (e.target as HTMLElement | null)?.closest?.("input, textarea, [contenteditable=true]")) return;
+      const d = panDeltaForKey(e.key);
+      if (!d) return;
+      e.preventDefault();
+      const cur = zRef.current;
+      setRef.current(cur.s, cur.x + d.x, cur.y + d.y);
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [panning]);
+  useEffect(() => {
+    const el = box.current;
+    if (!el) return;
+    const onWheel = (e: WheelEvent) => {
+      const cur = zRef.current;
+      if (!e.ctrlKey && !e.metaKey && cur.s === 1) return;
+      e.preventDefault();
+      if (e.ctrlKey || e.metaKey) zoomAtRef.current(Math.exp(-e.deltaY / 200), e.clientX, e.clientY);
+      else setRef.current(cur.s, cur.x - e.deltaX, cur.y - e.deltaY);
+    };
+    el.addEventListener("wheel", onWheel, { passive: false });
+    return () => el.removeEventListener("wheel", onWheel);
+  }, [src, failed]);
   if (failed) return <Failed {...b} error="This picture can’t be shown in the browser. Download it to open it on your device." />;
   if (!src) return <Loading />;
   return (
@@ -385,12 +440,6 @@ function ImageView(b: BodyProps) {
       ref={box}
       className="fv-stage"
       style={{ touchAction: z.s > 1 ? "none" : "pan-y" }}
-      onWheel={(e) => {
-        if (!e.ctrlKey && !e.metaKey && z.s === 1) return;
-        e.preventDefault();
-        if (e.ctrlKey || e.metaKey) zoomAt(Math.exp(-e.deltaY / 200), e.clientX, e.clientY);
-        else set(z.s, z.x - e.deltaX, z.y - e.deltaY);
-      }}
       onDoubleClick={(e) => (z.s > 1 ? set(1, 0, 0) : zoomAt(2.5, e.clientX, e.clientY))}
       onPointerDown={(e) => {
         pointers.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
@@ -525,7 +574,7 @@ function PdfView(b: BodyProps) {
   }, [doc, page]);
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (!doc) return;
+      if (!doc || shouldIgnoreViewerKey(e.target)) return;
       if (e.key === "ArrowRight" || e.key === "PageDown") goPage(Math.min(doc.numPages, page + 1));
       if (e.key === "ArrowLeft" || e.key === "PageUp") goPage(Math.max(1, page - 1));
     };
@@ -594,7 +643,7 @@ function PdfPage({ doc, n, width, root }: { doc: PdfDoc; n: number; width: numbe
 const MAX_TEXT_VIEW = 8e6;
 const MAX_TEXT_EDIT = 3e6;
 function useText(f: FileEntry, reload: number) {
-  const [state, set] = useState<{ text?: string; error?: string }>({});
+  const [state, set] = useState<{ text?: string; error?: string; editable?: boolean; bom?: boolean; eol?: "\n" | "\r\n" }>({});
   useEffect(() => {
     if ((f.size ?? 0) > MAX_TEXT_VIEW) return set({ error: `Too large to show here (${bytes(f.size)}). Download it instead.` });
     const ac = new AbortController();
@@ -602,9 +651,11 @@ function useText(f: FileEntry, reload: number) {
     fetch(viewUrl(f.path), { credentials: "same-origin", signal: ac.signal })
       .then((r) => (r.ok ? r.arrayBuffer() : Promise.reject(new Error(`Couldn’t open the file (${r.status})`))))
       .then((buf) => {
-        const head = new Uint8Array(buf.slice(0, 4096));
+        const bytes = new Uint8Array(buf);
+        const head = bytes.subarray(0, 4096);
         if (head.includes(0)) throw new Error("This file isn’t text, so it can’t be shown here.");
-        set({ text: new TextDecoder().decode(buf) });
+        const info = decodeTextFile(bytes);
+        set({ text: info.text, editable: info.editable, bom: info.bom, eol: info.eol });
       })
       .catch((e) => !ac.signal.aborted && set({ error: (e as Error).message }));
     return () => ac.abort();
@@ -612,30 +663,31 @@ function useText(f: FileEntry, reload: number) {
   return state;
 }
 async function renderMarkdown(src: string) {
-  const [{ marked }, { default: DOMPurify }] = await Promise.all([import("marked"), import("dompurify")]);
-  const html = await marked.parse(src, { gfm: true, breaks: false });
+  const [{ Marked }, { default: DOMPurify }] = await Promise.all([import("marked"), import("dompurify")]);
+  const html = await renderMarkdownHtml(src, Marked);
   return DOMPurify.sanitize(html, { FORBID_TAGS: ["style", "form", "input"], USE_PROFILES: { html: true } });
 }
 function TextView(b: BodyProps) {
   const { f } = b;
   const toast = useToast();
   const [reload, setReload] = useState(0);
-  const { text, error } = useText(f, reload);
+  const { text, error, editable: textEditable, bom, eol } = useText(f, reload);
   const isMd = b.kind === "markdown";
   const [mode, setMode] = useState<"view" | "source" | "edit">(isMd ? "view" : "source");
   const [draft, setDraft] = useState("");
   const [wrap, setWrap] = useState(true);
   const [html, setHtml] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
-  const editable = f.operations.includes("rename") && (f.size ?? 0) <= MAX_TEXT_EDIT;
-  const dirty = mode === "edit" && draft !== text;
+  const plain = text?.replace(/\r\n/g, "\n");
+  const editable = f.operations.includes("rename") && (f.size ?? 0) <= MAX_TEXT_EDIT && textEditable !== false;
+  const dirty = mode === "edit" && draft !== plain;
   useEffect(() => {
     if (isMd && text != null && mode === "view") renderMarkdown(text).then(setHtml, () => setHtml(null));
   }, [text, mode]);
   const save = async () => {
     setSaving(true);
     try {
-      await saveFile(f, new Blob([draft], { type: "text/plain" }));
+      await saveFile(f, new Blob([encodeTextFile(draft, { bom: !!bom, eol: eol ?? "\n" })], { type: "text/plain" }));
       toast("Saved");
       setMode(isMd ? "view" : "source");
       setReload((r) => r + 1);
@@ -668,12 +720,12 @@ function TextView(b: BodyProps) {
               </button>
             )}
             {mode === "source" && (
-              <button className={`icon-btn${wrap ? " on" : ""}`} aria-label="Wrap lines" title="Wrap lines" onClick={() => setWrap((w) => !w)}>
+              <button className={`icon-btn${wrap ? " on" : ""}`} aria-label="Wrap lines" aria-pressed={wrap} title="Wrap lines" onClick={() => setWrap((w) => !w)}>
                 <Icon name="wrap" size={20} />
               </button>
             )}
             {editable && (
-              <button className="btn small" onClick={() => (setDraft(text), setMode("edit"))}>
+              <button className="btn small" onClick={() => (setDraft(plain ?? ""), setMode("edit"))}>
                 <Icon name="pencil" size={17} />
                 Edit
               </button>
@@ -713,13 +765,7 @@ function TextView(b: BodyProps) {
         <article
           className="fv-md"
           dangerouslySetInnerHTML={{ __html: html }}
-          onClick={(e) => {
-            const a = (e.target as HTMLElement).closest("a");
-            if (a?.href) {
-              e.preventDefault();
-              if (/^https?:/.test(a.href)) window.open(a.href, "_blank", "noopener,noreferrer");
-            }
-          }}
+          onClick={(e) => void handleDocumentLinkClick(e)}
         />
       </div>
     );
@@ -771,19 +817,38 @@ function Grid({ rows, editable, onEdit, header }: { rows: string[][]; editable?:
                 const editing = cell?.[0] === ri && cell?.[1] === ci;
                 const v = r[ci] ?? "";
                 return (
-                  <td key={ci} className={editing ? "editing" : /^-?[\d.,]+%?$/.test(v) ? "num" : undefined} onClick={() => editable && setCell([ri, ci])}>
+                  <td
+                    key={ci}
+                    tabIndex={editable ? 0 : undefined}
+                    className={editing ? "editing" : /^-?[\d.,]+%?$/.test(v) ? "num" : undefined}
+                    onClick={() => editable && setCell([ri, ci])}
+                    onKeyDown={(e) => {
+                      if (!editable || editing) return;
+                      if (e.key === "Enter" || e.key === "F2") {
+                        e.preventDefault();
+                        setCell([ri, ci]);
+                      }
+                    }}
+                  >
                     {editing ? (
                       <input
                         autoFocus
                         defaultValue={v}
-                        onBlur={(e) => (onEdit?.(ri, ci, e.target.value), setCell(null))}
+                        onBlur={(e) => {
+                          onEdit?.(ri, ci, e.target.value);
+                          setCell((cur) => (cur && cur[0] === ri && cur[1] === ci ? null : cur));
+                        }}
                         onKeyDown={(e) => {
-                          if (e.key === "Enter" || e.key === "Tab") {
-                            e.preventDefault();
-                            onEdit?.(ri, ci, (e.target as HTMLInputElement).value);
-                            setCell(e.key === "Tab" ? [ri, ci + 1] : [ri + 1, ci]);
+                          if (e.key === "Escape") {
+                            setCell(null);
+                            return;
                           }
-                          if (e.key === "Escape") setCell(null);
+                          const shownRows = Math.min(rows.length, LIMIT);
+                          const next = nextGridCell(ri, ci, cols, shownRows, e.key, e.shiftKey);
+                          if (!next) return;
+                          e.preventDefault();
+                          onEdit?.(ri, ci, (e.target as HTMLInputElement).value);
+                          setCell(next);
                         }}
                       />
                     ) : (
@@ -803,7 +868,7 @@ function Grid({ rows, editable, onEdit, header }: { rows: string[][]; editable?:
 function CsvView(b: BodyProps) {
   const toast = useToast();
   const [reload, setReload] = useState(0);
-  const { text, error } = useText(b.f, reload);
+  const { text, error, editable: textEditable, bom } = useText(b.f, reload);
   const sep = ext(b.f.name) === "tsv" || b.f.type === "text/tab-separated-values" ? "\t" : ",";
   const [rows, setRows] = useState<string[][] | null>(null);
   const [orig, setOrig] = useState<string[][] | null>(null);
@@ -818,13 +883,13 @@ function CsvView(b: BodyProps) {
     });
   }, [text]);
   const dirty = editing && rows !== orig;
-  const editable = b.f.operations.includes("rename") && (b.f.size ?? 0) <= MAX_TEXT_EDIT;
+  const editable = b.f.operations.includes("rename") && (b.f.size ?? 0) <= MAX_TEXT_EDIT && textEditable !== false;
   const save = async () => {
     if (!rows) return;
     setSaving(true);
     try {
       const { toDelimited } = await import("./office");
-      await saveFile(b.f, new Blob([toDelimited(rows, sep)], { type: "text/csv" }));
+      await saveFile(b.f, new Blob([encodeTextFile(toDelimited(rows, sep), { bom: !!bom, eol: "\n" })], { type: "text/csv" }));
       toast("Saved");
       setEditing(false);
       setReload((r) => r + 1);
@@ -864,7 +929,8 @@ function CsvView(b: BodyProps) {
       onEdit={(r, c, v) =>
         setRows((cur) => {
           if (!cur || (cur[r]?.[c] ?? "") === v) return cur;
-          const next = cur.map((x) => x.slice());
+          const next = cur.map((x) => x.slice()) as string[][] & { eol?: "\n" | "\r\n" };
+          next.eol = (cur as { eol?: "\n" | "\r\n" }).eol;
           while (next.length <= r) next.push([]);
           while (next[r].length < c) next[r].push("");
           next[r][c] = v;
@@ -889,7 +955,7 @@ function XlsxView(b: BodyProps) {
       {sheets.length > 1 && (
         <nav className="fv-tabs" aria-label="Sheets">
           {sheets.map((x, n) => (
-            <button key={n} className={n === tab ? "on" : undefined} onClick={() => setTab(n)}>{x.name}</button>
+            <button key={n} className={n === tab ? "on" : undefined} aria-current={n === tab ? "true" : undefined} onClick={() => setTab(n)}>{x.name}</button>
           ))}
         </nav>
       )}
@@ -914,7 +980,11 @@ function DocxView(b: BodyProps) {
   if (loading || html == null) return <Loading />;
   return (
     <div className="fv-scroll fv-paper-bg">
-      <article className="fv-paper" dangerouslySetInnerHTML={{ __html: html || "<p><i>This document is empty.</i></p>" }} />
+      <article
+        className="fv-paper"
+        dangerouslySetInnerHTML={{ __html: html || "<p><i>This document is empty.</i></p>" }}
+        onClick={(e) => void handleDocumentLinkClick(e)}
+      />
     </div>
   );
 }
@@ -942,7 +1012,7 @@ function PptxView(b: BodyProps) {
   }, [deck, cur]);
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (!deck) return;
+      if (!deck || shouldIgnoreViewerKey(e.target)) return;
       if (e.key === "ArrowRight" || e.key === "ArrowDown" || e.key === "PageDown") (e.preventDefault(), go(Math.min(deck.slides.length - 1, cur + 1)));
       if (e.key === "ArrowLeft" || e.key === "ArrowUp" || e.key === "PageUp") (e.preventDefault(), go(Math.max(0, cur - 1)));
     };
@@ -1072,7 +1142,7 @@ function ZipView(b: BodyProps) {
       <div className="fv-zip">
         <p className="muted">{files.length.toLocaleString()} {files.length === 1 ? "file" : "files"} · {bytes(total)} uncompressed</p>
         <ul className="glass">
-          {entries.slice(0, 5000).map((e) => {
+          {entries.slice(0, ZIP_ENTRY_LIMIT).map((e) => {
             const depth = e.name.replace(/\/$/, "").split("/").length - 1;
             const name = e.name.replace(/\/$/, "").split("/").pop();
             return (
@@ -1084,6 +1154,7 @@ function ZipView(b: BodyProps) {
             );
           })}
         </ul>
+        {entries.length > ZIP_ENTRY_LIMIT && <p className="fv-note">{zipTruncatedNote(entries.length)}</p>}
       </div>
     </div>
   );

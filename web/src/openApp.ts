@@ -6,7 +6,7 @@ export type Probe = {result: string; status?: number; location?: string | null; 
 export type OpenResult = {opened: boolean; probe?: Probe | null}
 
 export const askApp = (app: {id: string}) => query<Probe>('apps.probe', {appId: app.id})
-// Opening an app inside Omarchy Server (the page listens for this and shows AppViewer).
+// Opening an app inside My Own Data Center (the page listens for this and shows AppViewer).
 export const VIEW_APP = 'omarchy:view-app'
 export const canShowInside = (app: UserApp) => !(app.requiresHttps && location.protocol !== 'https:')
 
@@ -31,7 +31,7 @@ export function explainProbe(name: string, p: Probe | null | undefined): string 
 	const r = readinessOf(p)
 	if (r === 'ready' || r === 'no-web' || r === 'starting') return null
 	if (r === 'stopped') return `${name} isn’t running. Start it, then open it.`
-	if (r === 'gateway-down') return `${name} is answering, but Omarchy Server couldn’t open its port (another program may be using it). Restart ${name}; if that doesn’t help, restart Omarchy Server.`
+	if (r === 'gateway-down') return `${name} is answering, but its port didn’t open (another program may be using it). Restart ${name}; if that doesn’t help, restart this server.`
 	const how =
 		p.result === 'timeout'
 			? 'accepts connections but hasn’t answered within 6 seconds'
@@ -41,7 +41,7 @@ export function explainProbe(name: string, p: Probe | null | undefined): string 
 	return `${name} is running, but its web page ${how}. It may have moved its page to a different port in its own settings, or it may have run into a problem: check its logs, or restart it.`
 }
 
-// Open an app, inside Omarchy Server when it can be shown there (see canShowInside). While the app is still
+// Open an app, inside My Own Data Center when it can be shown there (see canShowInside). While the app is still
 // starting (Home Assistant often is for its first minute), wait for it, so the tab doesn't land on a
 // dead page. If it's running but not answering, don't wait: say so (see explainProbe) and let the
 // person retry or open the address anyway. `onWaiting` is told while it waits.
@@ -63,7 +63,7 @@ export async function openApp(app: UserApp, url: string, {onWaiting, signal, for
 		await new Promise((r) => setTimeout(r, 2000))
 	}
 	if (signal?.aborted) return {opened: false}
-	// Inside Omarchy Server, full screen with a back button, when the browser allows showing it
+	// Inside My Own Data Center, full screen with a back button, when the browser allows showing it
 	// here. An app that needs https can't be shown inside an http page, so it gets the whole tab.
 	if (canShowInside(app)) window.dispatchEvent(new CustomEvent<UserApp>(VIEW_APP, {detail: app}))
 	else location.assign(url)

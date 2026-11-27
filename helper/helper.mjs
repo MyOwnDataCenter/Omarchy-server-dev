@@ -9,6 +9,11 @@
 //   ping                              is the helper installed and allowed?
 //   smart DEV                         drive health (smartctl JSON)
 //   sleep DEV MINUTES                 spin-down time for a hard drive (0 = never), kept across boots
+//   usb-allow SERIAL                  udev uaccess so the owner’s session can open that USB serial
+//   usb-forget SERIAL                 drop that serial from the USB udev rule
+//   umount DEV                        unmount every mountpoint on a non-system, non-pool whole disk
+//   mount DEV                         mount each filesystem on a non-system, non-pool extra disk at /run/media/$USER
+//   format DEV FS                     wipe a non-system, non-pool, unmounted whole disk (FS is blank, ext4 or exfat)
 //   pool-create NAME PROFILE DEV...   new Btrfs pool on BLANK drives only, mounted at ~/Pools/NAME
 //   pool-add NAME DEV                 add a BLANK drive to a pool, then rebalance in the background
 //   pool-import NAME UUID             mount an existing Btrfs filesystem at ~/Pools/NAME (no changes to it)
@@ -32,17 +37,35 @@
 //   tailscale-setup                   install Tailscale as Omarchy's menu does (official package, the
 //                                     tailscaled service) and make the owner its operator
 //   tailscale-remove                  sign this server out of Tailscale, stop it and remove the package
-//
-// Drives that hold anything (partitions or filesystem signatures) are never erased by this helper.
-// Wiping one is left to a person at a terminal (`sudo wipefs -a /dev/sdX`).
 import {execFile} from 'node:child_process'
-import {chown, mkdir, readdir, readFile, realpath, rename, writeFile} from 'node:fs/promises'
+import {realpathSync} from 'node:fs'
+import {access as fileAccess, chown, constants as fsConstants, mkdir, readdir, readFile, realpath, rename, writeFile} from 'node:fs/promises'
 import {join, sep} from 'node:path'
+import {fileURLToPath} from 'node:url'
 
-const DEV = /^\/dev\/(sd[a-z]{1,2}|vd[a-z]{1,2}|nvme\d{1,2}n\d{1,2}|hd[a-z])$/
+const DEV = /^\/dev\/(sd[a-z]{1,2}|vd[a-z]{1,2}|nvme\d{1,2}n\d{1,2}|mmcblk\d{1,2}|hd[a-z])$/
+const BY_ID = /^\/dev\/disk\/by-id\/[A-Za-z0-9._:+-]+$/
 const NAME = /^[a-z][a-z0-9-]{0,31}$/
+const ZFS_NAME = /^[A-Za-z][A-Za-z0-9_.-]{0,63}$/
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
-const SYSTEM_MOUNTS = new Set(['/', '/boot', '/efi', '/boot/efi', '/home', '/var', '/usr', '[SWAP]'])
+const SYSTEM_MOUNTS = new Set(['/', '/home', '[SWAP]'])
+const SYSTEM_MOUNT_PREFIXES = ['/boot', '/efi', '/var', '/usr', '/opt', '/srv', '/nix']
+const cleanMount = (m) => (typeof m === 'string' && m.length > 1 ? m.replace(/\/+$/, '') || '/' : m)
+function isSystemMount(m, home) {
+	const p = cleanMount(m)
+	if (!p) return false
+	if (SYSTEM_MOUNTS.has(p)) return true
+	const ownerHome = cleanMount(home)
+	if (ownerHome && p === ownerHome) return true
+	return SYSTEM_MOUNT_PREFIXES.some((pre) => p === pre || p.startsWith(`${pre}/`))
+}
+const SKIP_FS = new Set(['crypto_LUKS', 'swap', 'LVM2_member', 'linux_raid_member', 'zfs_member'])
+const FAT_FS = new Set(['vfat', 'exfat', 'ntfs', 'msdos', 'fuseblk'])
+function safeMountName(s) {
+	const n = String(s ?? '').replace(/[^A-Za-z0-9._-]+/g, '_').replace(/^[._-]+|[._-]+$/g, '')
+	if (!n || n === '.' || n === '..') return ''
+	return n.slice(0, 64)
+}
 const FSTAB_MARK = '# omarchy-server pool'
 // nosuid,nodev: a program or device file on a pool (an imported drive could carry one) can never
 // gain root.
@@ -54,11 +77,14 @@ const SMB_CONF = '/etc/samba/smb.conf'
 const SMB_INCLUDE = '/etc/samba/omarchy-server-shares.conf'
 const SMB_MARK = '# Managed by Omarchy Server'
 const UDEV_SLEEP = '/etc/udev/rules.d/69-omarchy-server-sleep.rules'
+const UDEV_USB = '/etc/udev/rules.d/69-omarchy-server-usb.rules'
+const USB_SERIAL = /^[A-Za-z0-9._:-]{1,128}$/
 // One-time sign-in to the Omarchy desktop (the same drop-in Omarchy's own first boot writes, removed again
 // as soon as the session starts).
 const SDDM_ONCE = '/etc/sddm.conf.d/zz-omarchy-server-sign-in.conf'
 const SESSIONS = ['/usr/share/wayland-sessions/omarchy.desktop', '/usr/share/wayland-sessions/hyprland-uwsm.desktop', '/usr/share/wayland-sessions/hyprland.desktop']
 const SLEEP_MINUTES = {0: 0, 10: 120, 20: 240, 30: 241, 60: 242, 120: 244, 240: 248}
+const HELPER_PATH = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin'
 
 export class HelperError extends Error {}
 const fail = (message) => {
@@ -67,7 +93,7 @@ const fail = (message) => {
 
 export function defaultRun(cmd, args, {input} = {}) {
 	return new Promise((resolve, reject) => {
-		const child = execFile(cmd, args, {timeout: 10 * 60_000, maxBuffer: 16 * 1024 * 1024, env: {PATH: '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin', LC_ALL: 'C'}}, (error, stdout, stderr) => {
+		const child = execFile(cmd, args, {timeout: 10 * 60_000, maxBuffer: 16 * 1024 * 1024, env: {PATH: HELPER_PATH, LC_ALL: 'C'}}, (error, stdout, stderr) => {
 			if (error && !(cmd === 'smartctl' && stdout)) return reject(new HelperError(`${cmd}: ${(stderr || error.message).toString().trim().split('\n').slice(-2).join(' ')}`))
 			resolve(stdout.toString())
 		})
@@ -76,8 +102,8 @@ export function defaultRun(cmd, args, {input} = {}) {
 }
 
 // Everything the helper touches comes through ctx, so tests can run it without root.
-export function createHelper({run = defaultRun, user, fs = {readFile, writeFile, mkdir, chown, realpath, rename, readdir}}) {
-	if (!user?.name || !/^[a-z_][a-z0-9_-]{0,31}$/.test(user.name) || !Number.isInteger(user.uid) || user.uid === 0 || !user.home?.startsWith('/')) fail('Run this through sudo as the Omarchy Server owner')
+export function createHelper({run = defaultRun, user, fs = {readFile, writeFile, mkdir, chown, realpath, rename, readdir, access: fileAccess}}) {
+	if (!user?.name || !/^[a-z_][a-z0-9_-]{0,31}$/.test(user.name) || !Number.isInteger(user.uid) || user.uid === 0 || !user.home?.startsWith('/')) fail('Run this through sudo as the owner of this server')
 	const poolsDir = join(user.home, 'Pools')
 	const mountOf = (name) => join(poolsDir, name)
 
@@ -93,14 +119,54 @@ export function createHelper({run = defaultRun, user, fs = {readFile, writeFile,
 		if (!d) fail(`No drive at ${path}`)
 		return d
 	}
+	async function resolveDisk(path) {
+		let p = String(path ?? '')
+		if (BY_ID.test(p) && !/-part\d+$/.test(p)) p = await fs.realpath(p).catch(() => fail(`No drive at ${path}`))
+		return disk(p)
+	}
+	async function commandOnPath(name) {
+		// Tests replace fs and do not carry the machine's programs. The real helper's fs does.
+		if (typeof fs.access !== 'function') return true
+		for (const dir of HELPER_PATH.split(':')) {
+			try {
+				await fs.access(join(dir, name), fsConstants.X_OK)
+				return true
+			} catch {
+				// Another directory on the helper PATH may still have it.
+			}
+		}
+		return false
+	}
+	// Imported pools are identified by GUID. Two pools can share a name; lsblk stores the GUID as the
+	// zfs_member UUID, and `zpool get guid` is the imported pool's GUID.
+	async function zfsPoolGuids() {
+		const guids = new Set()
+		// A pool zpool list named, but whose guid we could not read, still protects disks by name.
+		// An empty guid set must not make those disks look free to format.
+		const namesWithoutGuid = new Set()
+		for (const name of await zfsPoolNames()) {
+			const guid = (await zpool('get', '-H', '-o', 'value', 'guid', name).catch(() => '')).trim()
+			if (guid && guid !== '-') guids.add(guid)
+			else namesWithoutGuid.add(name)
+		}
+		return {guids, namesWithoutGuid}
+	}
+	async function poolMember(d) {
+		if (mounts(d).some((m) => /\/Pools\//.test(m))) return true
+		const text = await fstab()
+		const uuids = new Set(flat(d).map((x) => x.uuid).filter(Boolean))
+		if (text.some((l) => l.includes(FSTAB_MARK) && [...uuids].some((u) => l.includes(u)))) return true
+		const {guids, namesWithoutGuid} = await zfsPoolGuids()
+		return flat(d).some((x) => x.fstype === 'zfs_member' && ((x.uuid && guids.has(x.uuid)) || (x.label && namesWithoutGuid.has(x.label))))
+	}
 	// Blank: no partitions, no filesystem or RAID signature, nothing mounted, not the system drive.
 	async function blankDisk(path) {
 		const d = await disk(path)
-		if (mounts(d).some((m) => SYSTEM_MOUNTS.has(m))) fail(`${path} holds the system`)
+		if (mounts(d).some((m) => isSystemMount(m, user.home))) fail(`${path} holds the system`)
 		if (mounts(d).length) fail(`${path} is in use`)
-		if ((d.children ?? []).length || d.fstype) fail(`${path} isn’t blank. To use it, first erase it yourself in a terminal: sudo wipefs -a ${path}`)
+		if ((d.children ?? []).length || d.fstype) fail(`${path} isn’t blank. Format this drive first (choose blank).`)
 		const sig = (await run('wipefs', ['--no-act', '--json', path]).catch(() => '')).trim()
-		if (sig && (JSON.parse(sig).signatures ?? []).length) fail(`${path} isn’t blank. To use it, first erase it yourself in a terminal: sudo wipefs -a ${path}`)
+		if (sig && (JSON.parse(sig).signatures ?? []).length) fail(`${path} isn’t blank. Format this drive first (choose blank).`)
 		return d
 	}
 
@@ -127,8 +193,14 @@ export function createHelper({run = defaultRun, user, fs = {readFile, writeFile,
 		await fs.mkdir(mountOf(name), {recursive: true})
 		await fs.chown(poolsDir, user.uid, user.gid)
 		await addFstab(name, uuid)
-		await run('systemctl', ['daemon-reload'])
-		await run('mount', [mountOf(name)])
+		try {
+			await run('systemctl', ['daemon-reload'])
+			await run('mount', [mountOf(name)])
+		} catch (error) {
+			await writeAtomic('/etc/fstab', (await fstab()).filter((l) => !l.endsWith(`${FSTAB_MARK} ${name}`)).join('\n')).catch(() => {})
+			await run('systemctl', ['daemon-reload']).catch(() => {})
+			throw error
+		}
 		await fs.chown(mountOf(name), user.uid, user.gid)
 	}
 
@@ -136,12 +208,31 @@ export function createHelper({run = defaultRun, user, fs = {readFile, writeFile,
 		const home = await fs.realpath(user.home)
 		const real = await fs.realpath(path).catch(() => fail(`No folder at ${path}`))
 		if (real === home || !real.startsWith(home + sep)) fail('Only folders inside your home can be shared')
+		if (real.slice(home.length + 1).split(sep).some((part) => part.startsWith('.'))) fail('Hidden folders can’t be shared')
 		return real
 	}
 	// Rules are added whenever ufw is installed, even while it's off, so they're in place the
 	// moment it's turned on (Omarchy turns it on during its own install).
 	async function ufwActive() {
 		return run('ufw', ['status']).then(() => true, () => false)
+	}
+	// SMB (445) is for the home LAN only. Tailscale is a second network (100.64.0.0/10) and is not
+	// included, so shares stay off the tailnet unless you add a rule yourself. Applying or removing
+	// shares closes an older world-open 445 rule and replaces the LAN rules, so they do not stack.
+	const SMB_LAN = ['10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16']
+	async function ufwDelete(port, proto) {
+		if (!(await ufwActive())) return
+		await run('ufw', ['delete', 'allow', `${port}/${proto}`]).catch(() => {})
+		if (Number(port) === 445) for (const cidr of SMB_LAN) await run('ufw', ['delete', 'allow', 'from', cidr, 'to', 'any', 'port', '445', 'proto', proto]).catch(() => {})
+	}
+	async function ufwAllow(port, proto, comment) {
+		if (!(await ufwActive())) return
+		if (Number(port) === 445) {
+			await ufwDelete(445, proto)
+			for (const cidr of SMB_LAN) await run('ufw', ['allow', 'from', cidr, 'to', 'any', 'port', '445', 'proto', proto, 'comment', comment])
+			return
+		}
+		await run('ufw', ['allow', `${port}/${proto}`, 'comment', comment])
 	}
 
 	// ---- ZFS --------------------------------------------------------------------------------------
@@ -168,16 +259,31 @@ export function createHelper({run = defaultRun, user, fs = {readFile, writeFile,
 		const cfg = text.split(/^\s*config:\s*$/m)[1]?.split(/^errors:/m)[0] ?? ''
 		const layout = new Set()
 		const devices = []
+		let section = 'data'
 		for (const line of cfg.split('\n')) {
+			const sec = /^\s+(logs|cache|spares|special|dedup)\s*$/.exec(line)
+			if (sec) {
+				section = sec[1]
+				continue
+			}
+			if (section !== 'data') continue
 			const m = /^\s+(\S+)\s+(ONLINE|DEGRADED|FAULTED|OFFLINE|UNAVAIL|REMOVED)\s+(\d+\S*)\s+(\d+\S*)\s+(\d+\S*)/.exec(line)
 			if (!m) continue
 			if (/^(mirror|raidz[123]?|draid)/.test(m[1])) layout.add(m[1].replace(/-\d+$/, ''))
-			else if (m[1].startsWith('/')) devices.push({path: m[1], state: m[2], errors: [m[3], m[4], m[5]].map((x) => Number.parseInt(x, 10) || 0).reduce((a, b) => a + b, 0)})
+			else if (m[1].startsWith('/')) devices.push({path: m[1], state: m[2], errors: [m[3], m[4], m[5]].map(zfsCounter).reduce((a, b) => a + b, 0)})
 		}
-		return {state, scan, errors, layout: layout.size ? [...layout].join('+') : 'stripe', devices}
+		return {state, scan, errors, layout: layout.size ? [...layout].sort().join('+') : 'stripe', devices}
+	}
+	// zpool status prints large counters as 12K or 1.50M. The suffix is a power of 1000.
+	function zfsCounter(raw) {
+		const m = /^(\d+(?:\.\d+)?)([KMGTP])?$/i.exec(raw)
+		if (!m) return 0
+		const unit = (m[2] ?? '').toUpperCase()
+		const mult = {K: 1e3, M: 1e6, G: 1e9, T: 1e12, P: 1e15}[unit] ?? 1
+		return Math.round(Number(m[1]) * mult)
 	}
 	async function zfsPoolMount(name) {
-		if (!/^[a-z][a-z0-9_.-]{0,31}$/i.test(name ?? '')) fail('Bad pool name')
+		if (!ZFS_NAME.test(name ?? '')) fail('Bad pool name')
 		if (!(await zfsPoolNames()).includes(name)) fail(`No ZFS pool called ${name}`)
 		return name
 	}
@@ -225,13 +331,13 @@ export function createHelper({run = defaultRun, user, fs = {readFile, writeFile,
 			const sessions = await graphicalSessions()
 			if (sessions.some((x) => x.user === user.name)) return 'already'
 			if (sessions.length) fail('Someone else is signed in to this desktop, so it was left alone.')
-			if (!(await exists('/usr/lib/systemd/system/sddm.service'))) fail('This desktop doesn’t use SDDM, so Omarchy Server can’t sign it in.')
+			if (!(await exists('/usr/lib/systemd/system/sddm.service'))) fail('This desktop doesn’t use SDDM, so this server can’t sign it in.')
 			let session = null
 			for (const f of SESSIONS) if (await exists(f)) (session ??= f.split('/').pop())
 			if (!session) fail('No Omarchy desktop session was found to start.')
 			await run('faillock', ['--user', user.name, '--reset']).catch(() => {})
 			await fs.mkdir('/etc/sddm.conf.d', {recursive: true})
-			await fs.writeFile(SDDM_ONCE, `# Omarchy Server: one-time sign-in, removed once the session starts\n[Autologin]\nUser=${user.name}\nSession=${session}\nRelogin=false\n`, {mode: 0o644})
+			await fs.writeFile(SDDM_ONCE, `# MODC: one-time sign-in, removed once the session starts\n[Autologin]\nUser=${user.name}\nSession=${session}\nRelogin=false\n`, {mode: 0o644})
 			try {
 				await run('systemctl', ['restart', 'sddm.service'])
 				for (let i = 0; i < 40; i++) {
@@ -261,7 +367,7 @@ export function createHelper({run = defaultRun, user, fs = {readFile, writeFile,
 
 		smart: async ([dev]) => {
 			await disk(dev)
-			return run('smartctl', ['-j', '-a', dev])
+			return run('smartctl', ['-n', 'standby', '-j', '-a', dev])
 		},
 
 		sleep: async ([dev, minutes]) => {
@@ -274,6 +380,95 @@ export function createHelper({run = defaultRun, user, fs = {readFile, writeFile,
 			const lines = (await fs.readFile(UDEV_SLEEP, 'utf8').catch(() => '')).split('\n').filter((l) => l && !l.startsWith('#') && !l.includes(`ENV{ID_SERIAL_SHORT}=="${d.serial}"`))
 			if (m) lines.push(`ACTION=="add", SUBSYSTEM=="block", ENV{DEVTYPE}=="disk", ENV{ID_SERIAL_SHORT}=="${d.serial}", RUN+="/usr/bin/hdparm -S ${SLEEP_MINUTES[m]} /dev/%k"`)
 			await writeAtomic(UDEV_SLEEP, lines.length ? `# Drive sleep, set by Omarchy Server\n${lines.join('\n')}\n` : '')
+			return 'ok'
+		},
+
+		'usb-allow': async ([serial]) => {
+			if (!USB_SERIAL.test(serial ?? '')) fail('Use the USB serial, letters numbers . _ - only')
+			const keep = (await fs.readFile(UDEV_USB, 'utf8').catch(() => '')).split('\n').filter((l) => l && !l.startsWith('#') && !l.includes(`=="${serial}"`))
+			// OWNER makes the stick the server user's even with nobody signed in to the desktop (a headless
+			// server), which is where its apps and VMs run; uaccess alone only reaches the signed-in seat.
+			keep.push(
+				`SUBSYSTEM=="tty", ENV{ID_USB_SERIAL_SHORT}=="${serial}", OWNER="${user.name}", MODE="0660", TAG+="uaccess"`,
+				`SUBSYSTEM=="tty", ENV{ID_SERIAL_SHORT}=="${serial}", OWNER="${user.name}", MODE="0660", TAG+="uaccess"`,
+			)
+			await writeAtomic(UDEV_USB, `# USB serial access, set by Omarchy Server\n${keep.join('\n')}\n`)
+			await run('udevadm', ['control', '--reload']).catch(() => {})
+			// Only serial devices: re-checking every device on the machine could disturb disks and network.
+			await run('udevadm', ['trigger', '--subsystem-match=tty', '--action=change']).catch(() => {})
+			return 'ok'
+		},
+		'usb-forget': async ([serial]) => {
+			if (!USB_SERIAL.test(serial ?? '')) fail('Use the USB serial, letters numbers . _ - only')
+			const keep = (await fs.readFile(UDEV_USB, 'utf8').catch(() => '')).split('\n').filter((l) => l && !l.startsWith('#') && !l.includes(`=="${serial}"`))
+			await writeAtomic(UDEV_USB, keep.length ? `# USB serial access, set by Omarchy Server\n${keep.join('\n')}\n` : '')
+			await run('udevadm', ['control', '--reload']).catch(() => {})
+			// Hand the stick back to its default owner straight away, not at the next replug.
+			await run('udevadm', ['trigger', '--subsystem-match=tty', '--action=change']).catch(() => {})
+			return 'ok'
+		},
+
+		umount: async ([path]) => {
+			const d = await resolveDisk(path)
+			if (mounts(d).some((m) => isSystemMount(m, user.home))) fail(`${d.path} holds the system`)
+			if (await poolMember(d)) fail(`${d.path} is in a pool`)
+			// A mount inside another mount on this drive is busy until the child is gone.
+			for (const m of mounts(d).slice().sort((a, b) => b.length - a.length)) await run('umount', [m])
+			return 'ok'
+		},
+		mount: async ([path]) => {
+			const d = await resolveDisk(path)
+			if (mounts(d).some((m) => isSystemMount(m, user.home))) fail(`${d.path} holds the system`)
+			if (await poolMember(d)) fail(`${d.path} is in a pool`)
+			if (mounts(d).length) fail(`${d.path} is already mounted`)
+			const nodes = (d.children ?? []).length ? flat(d).filter((x) => x !== d) : [d]
+			const targets = nodes.filter((x) => x.fstype && !SKIP_FS.has(x.fstype))
+			if (!targets.length) fail('Nothing to mount')
+			// Names already mounted under /run/media/$USER, so a second stick with the same label
+			// is placed beside the first instead of on top of it. A path under that name counts too.
+			const media = join('/run/media', user.name)
+			const used = new Set()
+			for (const dev of await blockDevices()) {
+				for (const m of flat(dev).flatMap((x) => (x.mountpoints ?? []).filter(Boolean))) {
+					if (!m.startsWith(`${media}${sep}`)) continue
+					const name = m.slice(media.length + 1).split(sep)[0]
+					if (name) used.add(name)
+				}
+			}
+			for (const t of targets) {
+				let name = safeMountName(t.label) || safeMountName(t.uuid) || safeMountName(t.name) || 'disk'
+				const base = name
+				let n = 2
+				while (used.has(name)) name = `${base}-${n++}`
+				used.add(name)
+				const parent = join('/run/media', user.name)
+				const dest = join(parent, name)
+				await fs.mkdir(dest, {recursive: true})
+				await fs.chown(parent, user.uid, user.gid).catch(() => {})
+				await fs.chown(dest, user.uid, user.gid)
+				const flags = ['nosuid', 'nodev']
+				if (FAT_FS.has(t.fstype)) flags.push(`uid=${user.uid}`, `gid=${user.gid}`)
+				await run('mount', ['-o', flags.join(','), t.path, dest])
+				if (!FAT_FS.has(t.fstype)) await fs.chown(dest, user.uid, user.gid)
+			}
+			return 'ok'
+		},
+		format: async ([path, fsKind]) => {
+			if (!['blank', 'ext4', 'exfat'].includes(fsKind)) fail('Choose blank, ext4 or exfat')
+			const d = await resolveDisk(path)
+			if (mounts(d).some((m) => isSystemMount(m, user.home))) fail(`${d.path} holds the system`)
+			if (await poolMember(d)) fail(`${d.path} is in a pool`)
+			if (mounts(d).length) fail(`${d.path} is in use. Unmount it first.`)
+			// Unlocked encryption, LVM or a running RAID array on it (lsblk shows them as its children),
+			// even with nothing mounted: those are in use.
+			if (flat(d).some((x) => x !== d && x.type !== 'part')) fail(`${d.path} is in use by encryption, LVM or RAID. Stop that first.`)
+			if (fsKind === 'ext4' || fsKind === 'exfat') {
+				const prog = fsKind === 'ext4' ? 'mkfs.ext4' : 'mkfs.exfat'
+				if (!(await commandOnPath(prog))) fail(fsKind === 'exfat' ? `exFAT tools aren't installed on this computer (exfatprogs): mkfs.exfat` : `mkfs.ext4 isn't installed on this computer`)
+			}
+			await run('wipefs', ['-a', d.path])
+			if (fsKind === 'ext4') await run('mkfs.ext4', ['-F', d.path])
+			if (fsKind === 'exfat') await run('mkfs.exfat', [d.path])
 			return 'ok'
 		},
 
@@ -474,9 +669,14 @@ export function createHelper({run = defaultRun, user, fs = {readFile, writeFile,
 				if (!name) continue
 				const st = parseStatus(await zpool('status', '-P', name).catch(() => ''))
 				const mountpoint = (await zfs('get', '-H', '-o', 'value', 'mountpoint', name).catch(() => '')).trim()
+				const space = (await zfs('list', '-H', '-p', '-o', 'used,avail', name).catch(() => '')).trim().split('\n')[0]?.split('\t') ?? []
+				const usable = space.length >= 2 && /^\d+$/.test(space[0]) && /^\d+$/.test(space[1])
+				const usedBytes = usable ? Number(space[0]) : Number(alloc) || 0
+				const freeBytes = usable ? Number(space[1]) : Number(free) || 0
+				const sizeBytes = usable ? usedBytes + freeBytes : Number(size) || 0
 				const bind = tab.find((l) => l.endsWith(`${ZFS_MARK} ${name}`))
 				const folder = bind ? bind.split(/\s+/)[1] : mountpoint.startsWith(`${poolsDir}/`) ? mountpoint : null
-				out.push({name, size: Number(size), used: Number(alloc), free: Number(free), health, mountpoint, folder, ...st})
+				out.push({name, size: sizeBytes, used: usedBytes, free: freeBytes, health, mountpoint, folder, ...st})
 			}
 			return JSON.stringify(out)
 		},
@@ -520,7 +720,7 @@ export function createHelper({run = defaultRun, user, fs = {readFile, writeFile,
 		},
 
 		'zfs-import': async ([name, force]) => {
-			if (!/^[A-Za-z][A-Za-z0-9_.-]{0,63}$/.test(name ?? '')) fail('Bad pool name')
+			if (!ZFS_NAME.test(name ?? '')) fail('Bad pool name')
 			if (force !== undefined && force !== 'force') fail('Bad option')
 			if ((await zfsPoolNames()).includes(name)) fail(`${name} is already imported`)
 			// Import without mounting, check where its datasets would land, then mount.
@@ -562,12 +762,16 @@ export function createHelper({run = defaultRun, user, fs = {readFile, writeFile,
 		'zfs-export': async ([name]) => {
 			await zfsPoolMount(name)
 			const bind = (await fstab()).find((l) => l.endsWith(`${ZFS_MARK} ${name}`))
+			// Export first: a busy pool fails here and the bind mount and fstab line stay.
+			await zpool('export', name).catch(() => fail(`${name} is in use. Stop apps and shares using it, then try again.`))
 			if (bind) {
-				await run('umount', [bind.split(/\s+/)[1]]).catch(() => {})
+				const mnt = bind.split(/\s+/)[1]
+				await run('umount', [mnt]).catch((e) => {
+					if (!/not mounted/.test(e.message)) throw new HelperError(`${name} is in use. Stop apps and shares using it, then try again.`)
+				})
 				await writeAtomic('/etc/fstab', (await fstab()).filter((l) => l !== bind).join('\n'))
 				await run('systemctl', ['daemon-reload'])
 			}
-			await zpool('export', name).catch(() => fail(`${name} is in use. Stop apps and shares using it, then try again.`))
 			return 'ok'
 		},
 
@@ -581,22 +785,25 @@ export function createHelper({run = defaultRun, user, fs = {readFile, writeFile,
 			if (!Array.isArray(body?.shares) || body.shares.length > 64) fail('Bad share list')
 			const seen = new Set()
 			const blocks = []
-			// A share can be open to anyone on your network, without a password (guest ok). Files are
-			// still written as you. Only when at least one such share exists does Samba accept guests at all.
+			// A share can be open to anyone on your LAN, without a password (guest ok). Guest writes
+			// stay as nobody, not as you. Only when at least one such share exists does Samba accept guests at all.
 			const anyGuest = body.shares.some((s) => s?.guest === true)
 			for (const s of body.shares) {
 				const name = String(s?.name ?? '')
-				if (!/^[A-Za-z0-9][A-Za-z0-9 _.-]{0,31}$/.test(name) || seen.has(name.toLowerCase())) fail(`Bad share name: ${name}`)
+				// global, homes, and printers are Samba's own sections. A second [Global] would merge into [global].
+				if (!/^[A-Za-z0-9][A-Za-z0-9 _.-]{0,31}$/.test(name) || /^(global|homes|printers)$/i.test(name) || seen.has(name.toLowerCase())) fail(`Bad share name: ${name}`)
 				seen.add(name.toLowerCase())
 				const path = await inHome(String(s?.path ?? ''))
 				if (/[\n\r]/.test(path)) fail('Bad folder')
-				const who = s.guest === true ? `   guest ok = yes\n` : `   valid users = ${user.name}\n`
-				blocks.push(`[${name}]\n   path = ${path}\n${who}   force user = ${user.name}\n   read only = ${s.readOnly ? 'yes' : 'no'}\n   browseable = yes\n`)
+				// The path parameter substitutes %u and %m. %% is a literal percent.
+				const written = path.replace(/%/g, '%%')
+				const who = s.guest === true ? `   guest ok = yes\n` : `   valid users = ${user.name}\n   force user = ${user.name}\n`
+				blocks.push(`[${name}]\n   path = ${written}\n${who}   read only = ${s.readOnly ? 'yes' : 'no'}\n   browseable = yes\n`)
 			}
-			const shares = `${SMB_MARK}. Edit shares in the Omarchy Server web app.\n\n${blocks.join('\n')}`
+			const shares = `${SMB_MARK}. Edit shares in My Own Data Center.\n\n${blocks.join('\n')}`
 			const current = await fs.readFile(SMB_CONF, 'utf8').catch(() => null)
 			const guests = anyGuest ? `   map to guest = bad user\n   guest account = nobody\n   restrict anonymous = 0\n` : `   map to guest = never\n   restrict anonymous = 2\n`
-			const globalSection = `[global]\n   server string = Omarchy Server\n   server min protocol = SMB2_10\n${guests}   disable netbios = yes\n   smb ports = 445\n`
+			const globalSection = `[global]\n   server string = MODC\n   server min protocol = SMB2_10\n${guests}   disable netbios = yes\n   smb ports = 445\n`
 			if (current === null || current.startsWith(SMB_MARK)) await writeAtomic(SMB_CONF, `${SMB_MARK}\n${globalSection}\n${blocks.join('\n')}`)
 			else {
 				// Your own Samba setup: its [global] section is yours, so guests stay as you set them.
@@ -609,10 +816,10 @@ export function createHelper({run = defaultRun, user, fs = {readFile, writeFile,
 				await samba(() => run('smbd', ['-b']))
 				await run('systemctl', ['enable', '--now', 'smb.service'])
 				await run('smbcontrol', ['smbd', 'reload-config']).catch(() => run('systemctl', ['restart', 'smb.service']))
-				if (await ufwActive()) await run('ufw', ['allow', '445/tcp', 'comment', 'Omarchy Server shares'])
+				await ufwAllow(445, 'tcp', 'Omarchy Server shares')
 			} else {
 				await run('systemctl', ['disable', '--now', 'smb.service']).catch(() => {})
-				if (await ufwActive()) await run('ufw', ['delete', 'allow', '445/tcp']).catch(() => {})
+				await ufwDelete(445, 'tcp')
 			}
 			return 'ok'
 		},
@@ -623,7 +830,7 @@ export function createHelper({run = defaultRun, user, fs = {readFile, writeFile,
 			// smbpasswd won't run without an smb.conf, and Arch's samba package doesn't ship one: start
 			// with Omarchy Server's own (no shares yet; shares-apply fills it in).
 			if ((await fs.readFile(SMB_CONF, 'utf8').catch(() => null)) === null)
-				await writeAtomic(SMB_CONF, `${SMB_MARK}\n[global]\n   server string = Omarchy Server\n   server min protocol = SMB2_10\n   map to guest = never\n   restrict anonymous = 2\n   disable netbios = yes\n   smb ports = 445\n`)
+				await writeAtomic(SMB_CONF, `${SMB_MARK}\n[global]\n   server string = MODC\n   server min protocol = SMB2_10\n   map to guest = never\n   restrict anonymous = 2\n   disable netbios = yes\n   smb ports = 445\n`)
 			await samba(() => run('smbpasswd', ['-s', '-a', user.name], {input: `${pw}\n${pw}\n`}))
 			return 'ok'
 		},
@@ -633,7 +840,7 @@ export function createHelper({run = defaultRun, user, fs = {readFile, writeFile,
 		'firewall-open': async ([port]) => {
 			const p = Number(port)
 			if (!Number.isInteger(p) || p < 1 || p > 65535 || [22, 2021, 5900].includes(p)) fail('Bad port')
-			if (await ufwActive()) for (const proto of ['tcp', 'udp']) await run('ufw', ['allow', `${p}/${proto}`, 'comment', 'Omarchy Server app'])
+			for (const proto of ['tcp', 'udp']) await ufwAllow(p, proto, 'Omarchy Server app')
 			return 'ok'
 		},
 		// Let your (rootless) containers listen on ports from N up, for apps you allowed to use
@@ -643,14 +850,14 @@ export function createHelper({run = defaultRun, user, fs = {readFile, writeFile,
 			if (!Number.isInteger(want) || want < 1 || want > 1024) fail('Bad port')
 			const now = Number((await run('sysctl', ['-n', 'net.ipv4.ip_unprivileged_port_start'])).trim())
 			if (Number.isInteger(now) && now <= want) return 'ok'
-			await fs.writeFile('/etc/sysctl.d/60-omarchy-server-ports.conf', `# Omarchy Server: apps you allowed to use system ports\nnet.ipv4.ip_unprivileged_port_start = ${want}\n`, {mode: 0o644})
+			await fs.writeFile('/etc/sysctl.d/60-omarchy-server-ports.conf', `# MODC: apps you allowed to use system ports\nnet.ipv4.ip_unprivileged_port_start = ${want}\n`, {mode: 0o644})
 			await run('sysctl', ['-w', `net.ipv4.ip_unprivileged_port_start=${want}`])
 			return 'ok'
 		},
 		'firewall-close': async ([port]) => {
 			const p = Number(port)
 			if (!Number.isInteger(p) || p < 1 || p > 65535 || [22, 2021, 5900, 7780].includes(p)) fail('Bad port')
-			if (await ufwActive()) for (const proto of ['tcp', 'udp']) await run('ufw', ['delete', 'allow', `${p}/${proto}`]).catch(() => {})
+			for (const proto of ['tcp', 'udp']) await ufwDelete(p, proto)
 			return 'ok'
 		},
 	}
@@ -670,7 +877,7 @@ async function main() {
 		const name = process.env.SUDO_USER
 		const uid = Number(process.env.SUDO_UID)
 		const gid = Number(process.env.SUDO_GID)
-		if (process.getuid() !== 0 || !name || !uid) fail('Run this through sudo as the Omarchy Server owner')
+		if (process.getuid() !== 0 || !name || !uid) fail('Run this through sudo as the owner of this server')
 		const passwd = (await readFile('/etc/passwd', 'utf8')).split('\n').map((l) => l.split(':')).find((f) => f[0] === name && Number(f[2]) === uid)
 		if (!passwd) fail('Unknown user')
 		let stdin = ''
@@ -683,4 +890,12 @@ async function main() {
 		process.exit(error instanceof HelperError ? 2 : 1)
 	}
 }
-if (process.argv[1] && import.meta.url === `file://${process.argv[1]}`) main()
+function ranAsMain() {
+	if (typeof import.meta.main === 'boolean') return import.meta.main
+	try {
+		return Boolean(process.argv[1]) && realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)
+	} catch {
+		return false
+	}
+}
+if (ranAsMain()) main()

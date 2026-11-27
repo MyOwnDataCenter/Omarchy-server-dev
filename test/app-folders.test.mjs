@@ -1,6 +1,7 @@
 // Folders an app lets you place yourself (its listing's `folders:`), and the proof header its
 // sign-in gateway adds (x-omarchy-gateway) for apps that leave sign-in to Omarchy Server.
 import assert from 'node:assert/strict'
+import {gitArgv} from './git-nosign.mjs'
 import {execFileSync} from 'node:child_process'
 import {mkdir, mkdtemp, rm, stat, symlink, writeFile} from 'node:fs/promises'
 import http from 'node:http'
@@ -26,7 +27,7 @@ test('folder declarations: only sensible ids and names; FOLDER_ variables count 
 
 describe('placing an app’s folders', () => {
 	let root, home, data, d, auth, appPort, calls, upstream, store
-	const git = (args, cwd) => execFileSync('git', args, {cwd, stdio: 'pipe'}).toString()
+	const git = (args, cwd) => execFileSync('git', gitArgv(args), {cwd, stdio: 'pipe'}).toString()
 	const run = async (cmd, args, opts = {}) => {
 		if (cmd === 'git') return git(args, opts.cwd)
 		if (cmd === 'docker-compose') {
@@ -102,9 +103,10 @@ describe('placing an app’s folders', () => {
 		const listing = (await q('appStore.registry'))[0].apps[0]
 		assert.deepEqual(listing.folders, [{id: 'projects', label: 'Your projects', detail: 'Where it keeps your projects.', suggest: 'Projects'}])
 		assert.equal(listing.caution, undefined, 'FOLDER_PROJECTS isn’t an unknown setting')
-		assert.deepEqual(listing.permissions, [], 'kept inside the app, it asks for nothing extra')
+		assert.equal(listing.permissions, undefined, 'permissions are computed at install review, not at index')
 		const review = await q('apps.installReview', {appId: 'devbox'})
 		assert.equal(review.home, home)
+		assert.deepEqual(review.permissions, [], 'kept inside the app, it asks for nothing extra')
 		assert.deepEqual(review.folders, [{id: 'projects', label: 'Your projects', detail: 'Where it keeps your projects.', suggest: join(home, 'Projects'), appId: 'devbox', appName: 'Devbox'}])
 	})
 
@@ -113,6 +115,23 @@ describe('placing an app’s folders', () => {
 		await installed()
 		assert.match(lastEnv().FOLDER_PROJECTS, /\/devbox\/folders\/projects$/)
 		await uninstall()
+	})
+
+	test('climbing out of a folder you placed cannot bind a hidden folder', async () => {
+		const store2 = join(root, 'climb-store')
+		await mkdir(join(store2, 'climber'), {recursive: true})
+		await writeFile(join(store2, 'climber/omarchy-app.yml'), `manifestVersion: 1\nid: climber\nname: Climber\nversion: "1"\nport: ${appPort + 1}\nweb:\n  service: web\n  port: 8787\nfolders:\n  - id: projects\n    label: Your projects\n    suggest: Projects\n`)
+		await writeFile(join(store2, 'climber/docker-compose.yml'), 'services:\n  web:\n    image: x\n    volumes:\n      - ${FOLDER_PROJECTS}/../.ssh:/keys\n')
+		git(['init', '-q', '-b', 'main'], store2)
+		git(['add', '.'], store2)
+		git(['-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'store'], store2)
+		await call('appStore.addRepository', {url: `file://${store2}`})
+		const mine = join(home, 'Projects')
+		const review = await q('apps.installReview', {appId: 'climber'})
+		assert.ok(review.permissions.some((p) => p.id === 'refused'), 'review uses the suggested folder, not the in-app default')
+		await assert.rejects(call('apps.install', {appId: 'climber', folders: [{appId: 'climber', id: 'projects', path: mine}]}), /never gives an app/)
+		assert.equal((await q('apps.list')).find((a) => a.id === 'climber'), undefined)
+		await call('appStore.removeRepository', {url: `file://${store2}`})
 	})
 
 	test('folders Omarchy Server won’t give an app are refused, and nothing installs', async () => {

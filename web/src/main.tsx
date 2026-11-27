@@ -4,20 +4,27 @@ import {QueryClient, QueryClientProvider} from '@tanstack/react-query'
 
 import {App} from './App'
 import {ApiError} from './api'
-import {Providers, applyPrefs, readPrefs, watchKeyboardViewport, watchStandaloneGap} from './ui'
+import {Providers, applyPrefs, readPrefs, watchKeyboardViewport} from './ui'
 import './styles.css'
 
 applyPrefs(readPrefs())
 watchKeyboardViewport()
-watchStandaloneGap()
+
+const noRetry = (error: unknown) =>
+	error instanceof ApiError &&
+	((error.status >= 400 && error.status < 500) || error.code === 'TIMEOUT' || error.code === 'OFFLINE' || error.code === 'ABORTED')
 
 const client = new QueryClient({
 	defaultOptions: {
 		queries: {
-			// Don't hammer omarchyd with retries for auth or permission errors.
-			retry: (count, error) => !(error instanceof ApiError && error.status >= 400 && error.status < 500) && count < 2,
+			// Don't hammer omarchyd with retries for auth/permission errors or requests that already timed out or are offline.
+			retry: (count, error) => !noRetry(error) && count < 2,
 			refetchOnWindowFocus: true,
 			staleTime: 2000,
+		},
+		mutations: {
+			// Let actions fail immediately instead of queueing silently while the browser is offline.
+			networkMode: 'always',
 		},
 	},
 })
@@ -45,6 +52,16 @@ async function reloadIfUpdated() {
 		location.reload()
 	} catch {}
 }
+// Screens load when first opened. If the server was updated while this page stayed open, the old
+// build's files are gone: reload once to pick up the new build instead of showing a blank page.
+window.addEventListener('vite:preloadError', (e) => {
+	const key = 'touch.reloadedForStaleChunk'
+	const last = Number(sessionStorage.getItem(key) ?? 0)
+	if (Date.now() - last < 30_000) return // just reloaded for this: let the error show, don't loop
+	e.preventDefault()
+	sessionStorage.setItem(key, String(Date.now()))
+	location.reload()
+})
 document.addEventListener('visibilitychange', () => document.visibilityState === 'visible' && void reloadIfUpdated())
 window.addEventListener('pageshow', (e) => e.persisted && void reloadIfUpdated())
 void reloadIfUpdated()

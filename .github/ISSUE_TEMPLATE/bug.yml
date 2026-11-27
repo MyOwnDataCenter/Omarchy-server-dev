@@ -1,5 +1,5 @@
 name: Something isn’t working
-description: A bug in Omarchy Server
+description: A bug in My Own Data Center
 labels: [bug]
 body:
   - type: textarea
@@ -16,7 +16,7 @@ body:
   - type: input
     id: version
     attributes:
-      label: Omarchy Server version
+      label: My Own Data Center version
       description: Settings → Software update shows it.
       placeholder: 0.9.12
     validations:
@@ -25,7 +25,11 @@ body:
     id: where
     attributes:
       label: Where
-      options: [Phone or tablet layout, Desktop layout, The server itself (install, services), Not sure]
+      options:
+        - Phone or tablet layout
+        - Desktop layout
+        - The server itself (install, services)
+        - Not sure
   - type: input
     id: machine
     attributes:

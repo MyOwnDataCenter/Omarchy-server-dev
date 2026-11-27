@@ -3,9 +3,10 @@
 #   omarchy-server              status and address
 #   omarchy-server open         open the web app
 #   omarchy-server restart      restart both services (also: start, stop)
-#   omarchy-server logs [-f]    recent log lines (follow with -f)
+#   omarchy-server logs [-f]    recent log lines, including the desktop screen sharing (follow with -f)
 #   omarchy-server widget on    add the status icon to the top bar (off to remove)
 #   omarchy-server uninstall    remove Omarchy Server, keeping your data (--purge deletes that too)
+#   omarchy-server reset-password [--name NAME]  set a forgotten web sign-in password
 set -u
 UNITS=(omarchyd.service omarchy-server-web.service)
 DESKTOP_UNIT=omarchy-server-desktop.service
@@ -15,9 +16,35 @@ PORT=${PORT:-7780}
 WAYBAR="${XDG_CONFIG_HOME:-$HOME/.config}/waybar/config.jsonc"
 MARK='omarchy-server widget'
 
-ip_addr() { ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i = 1; i <= NF; i++) if ($i == "src") { print $(i + 1); exit }}'; }
+# The route lookup is empty when this computer has no default route. Use the first global IPv4 then.
+ip_addr() {
+	local addr
+	addr=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i = 1; i <= NF; i++) if ($i == "src") { print $(i + 1); exit }}')
+	if [ -z "$addr" ]; then
+		addr=$(ip -4 -o addr show scope global 2>/dev/null | awk 'NR == 1 { split($4, a, "/"); print a[1]; exit }')
+	fi
+	printf '%s\n' "$addr"
+}
+# http://ADDRESS:PORT, or nothing. Callers must not print "http://:PORT".
+lan_url() {
+	local addr
+	addr=$(ip_addr)
+	if [ -n "$addr" ]; then
+		printf 'http://%s:%s\n' "$addr" "$PORT"
+	fi
+}
+print_open_line() {
+	local lan
+	lan=$(lan_url)
+	if [ -n "$lan" ]; then
+		printf '\nOpen %s (or http://localhost:%s on this machine)\n' "$lan" "$PORT"
+	else
+		printf '\nOpen http://localhost:%s on this machine\n' "$PORT"
+	fi
+}
 running() { systemctl --user is-active --quiet omarchyd.service 2>/dev/null && systemctl --user is-active --quiet omarchy-server-web.service 2>/dev/null; }
-notify() { command -v notify-send >/dev/null 2>&1 && notify-send -a "Omarchy Server" "Omarchy Server" "$1"; printf '%s\n' "$1"; }
+any_running() { systemctl --user is-active --quiet omarchyd.service 2>/dev/null || systemctl --user is-active --quiet omarchy-server-web.service 2>/dev/null; }
+notify() { command -v notify-send >/dev/null 2>&1 && notify-send -a "MODC" "MODC" "$1"; printf '%s\n' "$1"; }
 reload_bar() { if command -v omarchy-restart-waybar >/dev/null 2>&1; then omarchy-restart-waybar >/dev/null 2>&1; else pkill -SIGUSR2 waybar 2>/dev/null; fi; }
 
 # uninstall: take Omarchy Server off this machine. By default your data stays (account, apps and their
@@ -59,20 +86,20 @@ can_ask() {
 do_uninstall() {
 	local purge=$1 yes=$2 left word answer link
 	if [ "$purge" = 1 ] && ! can_ask; then
-		echo "Couldn't ask podman and libvirt what Omarchy Server still has, so nothing was deleted. That takes podman, virsh and node on this shell's PATH. Nothing was changed."
+		echo "Couldn't ask podman and libvirt what this server still has, so nothing was deleted. That takes podman, virsh and node on this shell's PATH. Nothing was changed."
 		exit 1
 	fi
 	left=$(leftovers)
 	if [ "$purge" = 1 ] && [ -n "$left" ]; then
-		printf 'These apps and machines were made by Omarchy Server and still exist:\n%s\n\n' "$left"
+		printf 'These apps and machines were made by this server and still exist:\n%s\n\n' "$left"
 		echo "Remove them first (Apps, then Uninstall; Machines, then Delete), then run this again. Nothing was changed."
 		exit 1
 	fi
 	if [ "$purge" = 1 ]; then
-		printf 'This removes Omarchy Server AND everything it keeps (%s, %s):\n' "$BASE" "$(du -sh "$BASE" 2>/dev/null | cut -f1)"
+		printf 'This removes My Own Data Center AND everything it keeps (%s, %s):\n' "$BASE" "$(du -sh "$BASE" 2>/dev/null | cut -f1)"
 		echo "  your account, installed apps and their data, machines and their disks."
 	else
-		echo "This removes Omarchy Server's program, services, launcher entries, top-bar icon, storage helper and firewall rules."
+		echo "This removes the program, services, launcher entries, top-bar icon, storage helper and firewall rules."
 		echo "It keeps your account, apps and their data, and machines and their disks ($BASE),"
 		echo "so installing again picks up where you left off. Add --purge to delete those too."
 		[ -n "$left" ] && printf '\nThese keep running, because their data stays:\n%s\n' "$left"
@@ -86,8 +113,106 @@ do_uninstall() {
 		[ "$answer" = "$word" ] || { echo "Nothing was changed."; exit 1; }
 	fi
 
+	# The root steps need sudo. With -y and no terminal there may be nobody to type a password.
+	# 445 is the share port (the open rule and the three home-LAN rules). Other app ports stay.
+	# Do them before stopping omarchyd. A terminal opened in the web app is in that service's cgroup,
+	# so `systemctl --user disable --now` kills this script and would leave the root helper behind.
+	rules="$PORT/tcp 40000:49999/tcp 40000:49999/udp 7800:7899/tcp 445/tcp"
+	lan445="10.0.0.0/8 172.16.0.0/12 192.168.0.0/16"
+	ports_conf=${OMARCHY_SERVER_PORTS_CONF:-/etc/sysctl.d/60-omarchy-server-ports.conf}
+	smb_conf=${OMARCHY_SERVER_SMB_CONF:-/etc/samba/smb.conf}
+	smb_managed=0
+	if [ -f "$smb_conf" ]; then
+		IFS= read -r smb_first <"$smb_conf" || smb_first=
+		[ "$smb_first" = "# Managed by Omarchy Server" ] && smb_managed=1
+	fi
+	ports_exist=0
+	[ -f "$ports_conf" ] && ports_exist=1
+	failed=
+	if sudo -n true >/dev/null 2>&1 || ( : </dev/tty ) 2>/dev/null; then
+		echo "Removing the storage helper and firewall rules (sudo needed)"
+		if command -v ufw >/dev/null 2>&1; then
+			for rule in $rules; do sudo ufw delete allow "$rule" >/dev/null 2>&1 || true; done
+			for cidr in $lan445; do sudo ufw delete allow from "$cidr" to any port 445 proto tcp >/dev/null 2>&1 || true; done
+		fi
+		sudo rm -f /etc/sudoers.d/omarchy-server || failed=1
+		sudo rm -rf /usr/local/libexec/omarchy-server || failed=1
+		sudo rm -f /etc/udev/rules.d/69-omarchy-server-sleep.rules /etc/udev/rules.d/69-omarchy-server-usb.rules || failed=1
+		sudo udevadm control --reload >/dev/null 2>&1 || true
+		sudo rm -f "$ports_conf" || failed=1
+		if [ "$ports_exist" = 1 ]; then
+			sudo sysctl -w net.ipv4.ip_unprivileged_port_start=1024 >/dev/null 2>&1 || failed=1
+		fi
+		sudo sysctl --system >/dev/null 2>&1 || true
+		# smb.conf is ours only when it starts with the marker. A machine that already ran Samba keeps it.
+		if [ "$smb_managed" = 1 ]; then
+			sudo systemctl disable --now smb.service >/dev/null 2>&1 || true
+		else
+			echo "Your own Samba was not touched."
+		fi
+		sudo rm -f /etc/samba/omarchy-server-shares.conf || failed=1
+		# smb.conf is ours only when it starts with the marker. Otherwise drop just the include we added.
+		sudo bash -s >/dev/null 2>&1 <<'EOS' || true
+set -euo pipefail
+conf=/etc/samba/smb.conf
+[ -f "$conf" ] || exit 0
+IFS= read -r first <"$conf" || exit 0
+if [ "$first" = "# Managed by Omarchy Server" ]; then
+	rm -f "$conf"
+	exit 0
+fi
+grep -q "include = /etc/samba/omarchy-server-shares.conf" "$conf" || exit 0
+tmp=$(mktemp)
+awk '
+$0 == "# Added by Omarchy Server" { hold = $0; next }
+$0 ~ /^[[:space:]]*include = \/etc\/samba\/omarchy-server-shares\.conf$/ { hold = ""; next }
+hold != "" { print hold; hold = "" }
+{ print }
+END { if (hold != "") print hold }
+' "$conf" >"$tmp"
+cat "$tmp" >"$conf"
+rm -f "$tmp"
+EOS
+	else
+		failed=1
+	fi
+
 	"$0" widget off >/dev/null 2>&1 || true
-	systemctl --user disable --now "${UNITS[@]}" "$DESKTOP_UNIT" >/dev/null 2>&1
+	rm -rf "$BASE/app" "$BASE/install.log" "$BASE/.widget-offered"
+	if [ "$purge" = 1 ]; then
+		# App folders can belong to the apps' own user ids, so they go through podman, as the server does.
+		podman unshare rm -rf "$BASE/omarchyd/apps" >/dev/null 2>&1
+		rm -rf "$BASE"
+		echo "My Own Data Center and its data are gone."
+		echo "Firewall rules for individual app ports are not removed: see 'sudo ufw status'."
+	else
+		echo "My Own Data Center is removed. Your data is still in $BASE."
+	fi
+	echo "Left as they were: the installed packages, the 'run while logged out' setting, and ~/Pools."
+	if [ -n "$failed" ]; then
+		printf '\nThe steps that need sudo could not be done here. Run these yourself:\n'
+		printf '  sudo rm -f /etc/sudoers.d/omarchy-server\n'
+		printf '  sudo rm -rf /usr/local/libexec/omarchy-server\n'
+		printf '  sudo rm -f /etc/udev/rules.d/69-omarchy-server-sleep.rules /etc/udev/rules.d/69-omarchy-server-usb.rules\n'
+		printf '  sudo udevadm control --reload\n'
+		printf '  sudo rm -f /etc/sysctl.d/60-omarchy-server-ports.conf\n'
+		printf '  sudo sysctl --system\n'
+		printf '  sudo sysctl -w net.ipv4.ip_unprivileged_port_start=1024\n'
+		if [ "$smb_managed" = 1 ]; then
+			printf '  sudo systemctl disable --now smb.service\n'
+		else
+			printf '  Your own Samba was not touched.\n'
+		fi
+		printf '  sudo rm -f /etc/samba/omarchy-server-shares.conf\n'
+		printf '  If /etc/samba/smb.conf starts with "# Managed by Omarchy Server", remove that file.\n'
+		printf '  If it is yours, delete only the comment "# Added by Omarchy Server" and this line:\n'
+		printf '    include = /etc/samba/omarchy-server-shares.conf\n'
+		if command -v ufw >/dev/null 2>&1; then
+			for rule in $rules; do printf '  sudo ufw delete allow %s\n' "$rule"; done
+			for cidr in $lan445; do printf '  sudo ufw delete allow from %s to any port 445 proto tcp\n' "$cidr"; done
+		fi
+	fi
+
 	rm -f "$UNIT_DIR/omarchyd.service" "$UNIT_DIR/omarchy-server-web.service" "$UNIT_DIR/$DESKTOP_UNIT"
 	systemctl --user daemon-reload
 	systemctl --user reset-failed >/dev/null 2>&1
@@ -95,70 +220,193 @@ do_uninstall() {
 	link="$HOME/.local/bin/omarchy-server"
 	[ "$(readlink "$link" 2>/dev/null)" = "$BASE/app/bin/omarchy-server" ] && rm -f "$link"
 
-	# The root steps need sudo. With -y and no terminal there may be nobody to type a password.
-	rules="$PORT/tcp 40000:49999/tcp 40000:49999/udp 7800:7899/tcp"
-	failed=
-	if sudo -n true >/dev/null 2>&1 || ( : </dev/tty ) 2>/dev/null; then
-		echo "Removing the storage helper and firewall rules (sudo needed)"
-		if command -v ufw >/dev/null 2>&1; then
-			for rule in $rules; do sudo ufw delete allow "$rule" >/dev/null 2>&1 || true; done
-		fi
-		sudo rm -f /etc/sudoers.d/omarchy-server || failed=1
-		sudo rm -rf /usr/local/libexec/omarchy-server || failed=1
-	else
-		failed=1
-	fi
-
-	rm -rf "$BASE/app" "$BASE/install.log" "$BASE/.widget-offered"
-	if [ "$purge" = 1 ]; then
-		# App folders can belong to the apps' own user ids, so they go through podman, as the server does.
-		podman unshare rm -rf "$BASE/omarchyd/apps" >/dev/null 2>&1
-		rm -rf "$BASE"
-		echo "Omarchy Server and its data are gone."
-		echo "Firewall rules for individual app ports and any SMB shares you set up are not removed: see 'sudo ufw status' and your Samba settings."
-	else
-		echo "Omarchy Server is removed. Your data is still in $BASE."
-	fi
-	echo "Left as they were: the installed packages, the 'run while logged out' setting, and ~/Pools."
-	if [ -n "$failed" ]; then
-		printf '\nThe steps that need sudo could not be done here. Run these yourself:\n  sudo rm -f /etc/sudoers.d/omarchy-server\n  sudo rm -rf /usr/local/libexec/omarchy-server\n'
-		command -v ufw >/dev/null 2>&1 && for rule in $rules; do printf '  sudo ufw delete allow %s\n' "$rule"; done
-		exit 1
-	fi
+	# Last user-level step: stopping omarchyd kills this script when it was started from the app.
+	systemctl --user disable --now "${UNITS[@]}" "$DESKTOP_UNIT" >/dev/null 2>&1
+	if [ -n "$failed" ]; then exit 1; fi
 	exit 0
 }
 
-case "${1:-status}" in
+usage() {
+	case "${1:-}" in
+		status) echo "Use: omarchy-server [status]" ;;
+		open) echo "Use: omarchy-server open" ;;
+		start | stop | restart) echo "Use: omarchy-server $1" ;;
+		logs) echo "Use: omarchy-server logs [-f|--follow] [-n N] [--since TIME]" ;;
+		waybar) echo "Use: omarchy-server waybar" ;;
+		widget) echo "Use: omarchy-server widget on|off" ;;
+		uninstall) echo "Use: omarchy-server uninstall [--purge] [-y]" ;;
+		reset-password) echo "Use: omarchy-server reset-password [--name NAME]   set a forgotten web sign-in password (signs everyone out)" ;;
+		*)
+			cat <<'EOF'
+omarchy-server: check, open, start, stop and restart My Own Data Center on this machine.
+  omarchy-server              status and address
+  omarchy-server open         open the web app
+  omarchy-server restart      restart both services (also: start, stop)
+  omarchy-server logs [-f|--follow] [-n N] [--since TIME]  recent log lines
+  omarchy-server widget on    add the status icon to the top bar (off to remove)
+  omarchy-server uninstall    remove My Own Data Center, keeping your data (--purge deletes that too)
+  omarchy-server reset-password [--name NAME]  set a forgotten web sign-in password
+EOF
+			;;
+	esac
+}
+
+wants_help() {
+	local a
+	for a in "$@"; do
+		case "$a" in -h | --help) return 0 ;; esac
+	done
+	return 1
+}
+
+no_extra_args() {
+	local cmd=$1
+	shift
+	if wants_help "$@"; then
+		usage "$cmd"
+		exit 0
+	fi
+	if [ $# -gt 0 ]; then
+		echo "Use: omarchy-server $cmd" >&2
+		exit 2
+	fi
+}
+
+if [ $# -eq 0 ]; then
+	cmd=status
+else
+	cmd=$1
+	shift
+fi
+
+case "$cmd" in
 	status)
+		no_extra_args status "$@"
 		for u in "${UNITS[@]}" "$DESKTOP_UNIT"; do printf '%-34s %s\n' "$u" "$(systemctl --user is-active "$u" 2>/dev/null)"; done
-		running && printf '\nOpen http://%s:%s (or http://localhost:%s on this machine)\n' "$(ip_addr)" "$PORT" "$PORT"
+		running && print_open_line
 		;;
-	open) xdg-open "http://localhost:$PORT" >/dev/null 2>&1 & ;;
-	start | stop | restart)
-		systemctl --user "$1" "${UNITS[@]}"
+	open)
+		no_extra_args open "$@"
+		up=0
+		running && up=1
+		if [ "$up" = 0 ]; then
+			echo "My Own Data Center is not running."
+		fi
+		# A display is required; over ssh, or with no xdg-open, print the address instead.
+		opened=0
+		if command -v xdg-open >/dev/null 2>&1 && { [ -n "${DISPLAY:-}" ] || [ -n "${WAYLAND_DISPLAY:-}" ]; }; then
+			if xdg-open "http://localhost:$PORT" >/dev/null 2>&1; then
+				opened=1
+			fi
+		fi
+		if [ "$opened" = 0 ] || [ "$up" = 0 ]; then
+			print_open_line
+		fi
+		[ "$opened" = 1 ] || exit 1
+		;;
+	start | restart)
+		no_extra_args "$cmd" "$@"
+		fail=0
+		systemctl --user "$cmd" "${UNITS[@]}" || fail=1
 		# Desktop sharing only runs inside a signed-in Omarchy session.
-		systemctl --user is-active --quiet graphical-session.target 2>/dev/null && systemctl --user "$1" "$DESKTOP_UNIT" 2>/dev/null
+		systemctl --user is-active --quiet graphical-session.target 2>/dev/null && systemctl --user "$cmd" "$DESKTOP_UNIT" 2>/dev/null
 		sleep 1
-		if [ "$1" = stop ]; then notify "Stopped"; elif running; then notify "Running at http://$(ip_addr):$PORT"; else notify "Didn't start. See: omarchy-server logs"; fi
+		if [ "$fail" = 0 ] && running; then
+			lan=$(lan_url)
+			if [ -n "$lan" ]; then
+				notify "Running at $lan"
+			else
+				notify "Running"
+			fi
+		else
+			notify "Didn't start. See: omarchy-server logs"
+			exit 1
+		fi
+		;;
+	stop)
+		no_extra_args stop "$@"
+		fail=0
+		systemctl --user stop "${UNITS[@]}" || fail=1
+		# Desktop sharing only runs inside a signed-in Omarchy session.
+		systemctl --user is-active --quiet graphical-session.target 2>/dev/null && systemctl --user stop "$DESKTOP_UNIT" 2>/dev/null
+		sleep 1
+		if [ "$fail" = 0 ] && ! any_running; then
+			notify "Stopped"
+		else
+			notify "Couldn't stop. See: omarchy-server logs"
+			exit 1
+		fi
 		;;
 	logs)
-		if [ "${2:-}" = -f ]; then journalctl --user -u omarchyd -u omarchy-server-web -f; else journalctl --user -u omarchyd -u omarchy-server-web -n 80 --no-pager; fi
+		if wants_help "$@"; then usage logs; exit 0; fi
+		follow=0
+		has_lines=0
+		lines=80
+		since=
+		while [ $# -gt 0 ]; do
+			case "$1" in
+				-f | --follow) follow=1; shift ;;
+				-n | --lines)
+					[ $# -ge 2 ] || { echo "Use: omarchy-server logs [-f|--follow] [-n N] [--since TIME]" >&2; exit 2; }
+					case "$2" in '' | *[!0-9]*) echo "Use: omarchy-server logs [-f|--follow] [-n N] [--since TIME]" >&2; exit 2 ;; esac
+					lines="$2"; has_lines=1; shift 2 ;;
+				-n[0-9]*)
+					n="${1#-n}"
+					case "$n" in '' | *[!0-9]*) echo "Use: omarchy-server logs [-f|--follow] [-n N] [--since TIME]" >&2; exit 2 ;; esac
+					lines="$n"; has_lines=1; shift ;;
+				--lines=*)
+					n="${1#--lines=}"
+					case "$n" in '' | *[!0-9]*) echo "Use: omarchy-server logs [-f|--follow] [-n N] [--since TIME]" >&2; exit 2 ;; esac
+					lines="$n"; has_lines=1; shift ;;
+				--since)
+					[ $# -ge 2 ] && [ -n "$2" ] || { echo "Use: omarchy-server logs [-f|--follow] [-n N] [--since TIME]" >&2; exit 2; }
+					since="$2"; shift 2 ;;
+				--since=*)
+					since="${1#--since=}"
+					[ -n "$since" ] || { echo "Use: omarchy-server logs [-f|--follow] [-n N] [--since TIME]" >&2; exit 2; }
+					shift ;;
+				*) echo "Use: omarchy-server logs [-f|--follow] [-n N] [--since TIME]" >&2; exit 2 ;;
+			esac
+		done
+		jargs=(--user -u omarchyd -u omarchy-server-web -u omarchy-server-desktop -u omarchy-server-desktop-now)
+		[ -n "$since" ] && jargs+=(--since "$since")
+		if [ "$follow" = 1 ]; then
+			[ "$has_lines" = 1 ] && jargs+=(-n "$lines")
+			jargs+=(-f)
+		else
+			if [ "$has_lines" = 1 ] || [ -z "$since" ]; then jargs+=(-n "$lines"); fi
+			jargs+=(--no-pager)
+		fi
+		journalctl "${jargs[@]}"
 		;;
 	waybar)
+		no_extra_args waybar "$@"
 		# One line of JSON for Waybar's custom module.
 		if running; then
-			printf '{"text":"󰒋","class":"running","tooltip":"Omarchy Server is running\\nhttp://%s:%s\\n\\nClick: open · Right-click: restart"}\n' "$(ip_addr)" "$PORT"
+			lan=$(lan_url)
+			if [ -n "$lan" ]; then
+				printf '{"text":"󰒋","class":"running","tooltip":"MODC is running\\n%s\\n\\nClick: open · Right-click: restart"}\n' "$lan"
+			else
+				printf '{"text":"󰒋","class":"running","tooltip":"MODC is running\\n\\nClick: open · Right-click: restart"}\n'
+			fi
 		else
-			printf '{"text":"󰒋 off","class":"stopped","tooltip":"Omarchy Server is stopped\\n\\nRight-click: start it"}\n'
+			printf '{"text":"󰒋 off","class":"stopped","tooltip":"MODC is stopped\\n\\nRight-click: start it"}\n'
 		fi
 		;;
 	widget)
+		if wants_help "$@"; then usage widget; exit 0; fi
+		[ $# -le 1 ] || { echo "Use: omarchy-server widget on|off" >&2; exit 2; }
+		mode="${1:-on}"
+		case "$mode" in
+			on | off) ;;
+			*) echo "Use: omarchy-server widget on|off" >&2; exit 2 ;;
+		esac
 		# Current Omarchy draws its own top bar (omarchy-shell, configured in ~/.config/omarchy/shell.json);
 		# older Omarchy used Waybar. The icon goes into whichever this desktop has.
 		SHELL_JSON="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/shell.json"
 		OM_PATH="${OMARCHY_PATH:-}"; [ -z "$OM_PATH" ] && for d in /usr/share/omarchy "$HOME/.local/share/omarchy"; do [ -d "$d" ] && { OM_PATH=$d; break; }; done
 		if [ -f "$SHELL_JSON" ] || [ -f "$OM_PATH/config/omarchy/shell.json" ]; then
-			node - "${2:-on}" "$SHELL_JSON" "$OM_PATH/config/omarchy/shell.json" "$HOME/.local/bin/omarchy-server" <<'EOF' || { echo "Couldn't update the top bar; your bar settings are unchanged."; exit 1; }
+			node - "$mode" "$SHELL_JSON" "$OM_PATH/config/omarchy/shell.json" "$HOME/.local/bin/omarchy-server" <<'EOF' || { echo "Couldn't update the top bar; your bar settings are unchanged."; exit 1; }
 const fs = require('node:fs')
 const [mode, file, defaults, bin] = process.argv.slice(2)
 const read = (f) => JSON.parse(fs.readFileSync(f, 'utf8'))
@@ -170,23 +418,24 @@ const has = sections.some((s) => s.some((e) => e?.id === 'omarchy-server'))
 if (mode === 'on') {
   if (has) { console.log('The widget is already on.'); process.exit(0) }
   cfg.bar.layout.right ??= []
-  cfg.bar.layout.right.unshift({id: 'omarchy-server', type: 'command', exec: `${bin} waybar`, interval: 10, tooltip: 'Omarchy Server', onClick: `${bin} open`})
+  cfg.bar.layout.right.unshift({id: 'omarchy-server', type: 'command', exec: `${bin} waybar`, interval: 10, tooltip: 'MODC', onClick: `${bin} open`})
 } else if (mode === 'off') {
   if (!has) { console.log('The widget is not on.'); process.exit(0) }
   for (const k of Object.keys(cfg.bar.layout)) if (Array.isArray(cfg.bar.layout[k])) cfg.bar.layout[k] = cfg.bar.layout[k].filter((e) => e?.id !== 'omarchy-server')
 } else { console.log('Use: omarchy-server widget on|off'); process.exit(2) }
-if (fs.existsSync(file)) fs.copyFileSync(file, `${file}.omarchy-server.bak`)
-fs.mkdirSync(require('node:path').dirname(file), {recursive: true})
-const tmp = `${file}.tmp-${process.pid}`
+const target = fs.existsSync(file) ? fs.realpathSync(file) : file
+if (fs.existsSync(file)) fs.copyFileSync(file, `${target}.omarchy-server.bak`)
+fs.mkdirSync(require('node:path').dirname(target), {recursive: true})
+const tmp = `${target}.tmp-${process.pid}`
 fs.writeFileSync(tmp, JSON.stringify(cfg, null, 2) + '\n')
-fs.renameSync(tmp, file)
-console.log(mode === 'on' ? 'Added the Omarchy Server icon to the top bar. Remove it with: omarchy-server widget off' : 'Removed the Omarchy Server icon.')
+fs.renameSync(tmp, target)
+console.log(mode === 'on' ? 'Added the MODC icon to the top bar. Remove it with: omarchy-server widget off' : 'Removed the MODC icon.')
 EOF
 			command -v omarchy-shell >/dev/null 2>&1 && omarchy-shell shell reloadConfig >/dev/null 2>&1
 			exit 0
 		fi
 		[ -f "$WAYBAR" ] || { echo "No Omarchy top bar settings found (shell.json or Waybar)."; exit 1; }
-		case "${2:-on}" in
+		case "$mode" in
 			on)
 				grep -q "$MARK" "$WAYBAR" && { echo "The widget is already on."; exit 0; }
 				cp "$WAYBAR" "$WAYBAR.omarchy-server.bak"
@@ -196,36 +445,84 @@ const [file, mark] = process.argv.slice(2)
 let text = fs.readFileSync(file, 'utf8')
 const list = /"modules-right"\s*:\s*\[/
 if (!list.test(text) || !/^\s*\{/.test(text)) process.exit(1)
-text = text.replace(list, (m) => `${m}\n    "custom/omarchy-server", // ${mark}`)
+text = text.replace(list, (m) => `${m}\n    "custom/omarchy-server", // ${mark}\n`)
 const bin = `${process.env.HOME}/.local/bin/omarchy-server`
 const def = `\n  // ${mark} start\n  "custom/omarchy-server": {\n    "exec": "${bin} waybar",\n    "return-type": "json",\n    "interval": 10,\n    "on-click": "${bin} open",\n    "on-click-right": "${bin} restart"\n  },\n  // ${mark} end`
 text = text.replace(/^(\s*)\{/, (m) => `${m}${def}`)
 fs.writeFileSync(file, text)
 EOF
 				reload_bar
-				echo "Added the Omarchy Server icon to the top bar. Remove it with: omarchy-server widget off"
+				echo "Added the MODC icon to the top bar. Remove it with: omarchy-server widget off"
 				;;
 			off)
 				grep -q "$MARK" "$WAYBAR" || { echo "The widget isn't on."; exit 0; }
 				sed -i "/\/\/ $MARK start/,/\/\/ $MARK end/d; /\/\/ $MARK\$/d" "$WAYBAR"
 				reload_bar
-				echo "Removed the Omarchy Server icon."
+				echo "Removed the MODC icon."
 				;;
-			*) echo "Use: omarchy-server widget on|off"; exit 2 ;;
+			*) echo "Use: omarchy-server widget on|off" >&2; exit 2 ;;
 		esac
 		;;
 	uninstall)
-		shift
+		if wants_help "$@"; then usage uninstall; exit 0; fi
 		purge=0 yes=0
 		for a in "$@"; do
 			case "$a" in
 				--purge) purge=1 ;;
 				-y | --yes) yes=1 ;;
-				*) echo "Use: omarchy-server uninstall [--purge] [-y]"; exit 2 ;;
+				*) echo "Use: omarchy-server uninstall [--purge] [-y]" >&2; exit 2 ;;
 			esac
 		done
 		do_uninstall "$purge" "$yes"
 		;;
-	-h | --help | help) sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//' ;;
-	*) echo "Unknown command: $1 (try: omarchy-server help)"; exit 2 ;;
+	reset-password)
+		if wants_help "$@"; then usage reset-password; exit 0; fi
+		name_args=()
+		while [ $# -gt 0 ]; do
+			case "$1" in
+				--name) [ $# -ge 2 ] || { usage reset-password >&2; exit 2; }; name_args=(--name "$2"); shift 2 ;;
+				*) usage reset-password >&2; exit 2 ;;
+			esac
+		done
+		# The same node, backend and data folder the service runs, read from its unit.
+		exec_line=$(sed -n 's/^ExecStart=//p' "$UNIT_DIR/omarchyd.service" 2>/dev/null | head -1)
+		read -r node_bin cli_path _ <<<"$exec_line"
+		data_dir=$(sed -n 's/.* --data \([^ ]*\).*/\1/p' <<<"$exec_line")
+		if [ -z "$node_bin" ] || [ -z "$cli_path" ] || [ -z "$data_dir" ]; then
+			echo "Can't find the MODC backend service ($UNIT_DIR/omarchyd.service). Is My Own Data Center installed?" >&2
+			exit 1
+		fi
+		was_running=0
+		systemctl --user is-active --quiet omarchyd.service 2>/dev/null && was_running=1
+		# omarchyd keeps the accounts in memory and would write the old password back, so it stops first.
+		if [ "$was_running" = 1 ]; then
+			echo "Stopping the MODC backend while the password is changed…"
+			systemctl --user stop omarchyd.service || { echo "Couldn't stop omarchyd. See: omarchy-server logs" >&2; exit 1; }
+		fi
+		status=0
+		"$node_bin" "$cli_path" reset-password "${name_args[@]}" --data "$data_dir" </dev/tty || status=$?
+		if [ "$was_running" = 1 ]; then
+			systemctl --user start omarchyd.service || { echo "Couldn't start omarchyd again. Run: omarchy-server start" >&2; exit 1; }
+		fi
+		exit "$status"
+		;;
+	-h | --help | help)
+		if [ "$cmd" = help ] && [ $# -gt 0 ]; then
+			if [ $# -eq 1 ]; then
+				case "$1" in
+					-h | --help | help) usage ;;
+					status | open | start | stop | restart | logs | waybar | widget | uninstall | reset-password) usage "$1" ;;
+					*) printf 'Unknown command: %s (try: omarchy-server help)\n' "$1" >&2; exit 2 ;;
+				esac
+			elif wants_help "$@"; then
+				usage
+			else
+				echo "Use: omarchy-server help [command]" >&2
+				exit 2
+			fi
+		else
+			usage
+		fi
+		;;
+	*) printf 'Unknown command: %s (try: omarchy-server help)\n' "$cmd" >&2; exit 2 ;;
 esac

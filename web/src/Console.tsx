@@ -13,10 +13,17 @@ import {useCallback, useEffect, useRef, useState} from 'react'
 import {createPortal} from 'react-dom'
 import * as RFBModule from '@novnc/novnc/lib/rfb.js'
 
-import {mutate, type Machine} from './api'
+import {mutate, query, type Machine} from './api'
+import {HyprlandView, supportsWebCodecs, type HyprlandStatus, type HyprlandWindow} from './HyprlandView'
+import {isClipTarget, markClipTarget, unmarkClipTarget} from './clipPasteTarget'
+import {clipImage, clipText} from './clips'
+import {consoleShouldTakeFocus} from './consoleFocus'
+import {BTN, bindConsoleWheel, charKeySteps, consoleDisconnectAction, consoleFailureMessage, effectiveConsoleScale, handleConsoleWheel, keysymOfChar, mouseButtonFromEvent, PASTE_STEP_MS, pasteKeySequence, pasteKeySteps, pointToFb, readConsoleMetrics, resolveSuperKey, screenshotFilename, shouldSendConsoleInput, touchReleaseAction, type Pt, type SuperKey} from './consoleHelpers'
+import {overlayBackUsesHistory, popstateClosesOverlay} from './overlayHistory'
 import {Icon} from './icons'
-import {haptic, settleViewport, usePortalRoot, useToast} from './ui'
-import {useScreenLock} from './Terminal'
+import {keysymFromEvent, setConsoleKeyHandler} from './desktop/hyprland/consoleBridge'
+import {useMenuFocus} from './focus'
+import {haptic, settleViewport, usePortalRoot, useScreenLock, useToast} from './ui'
 
 type RFBClass = typeof import('@novnc/novnc/lib/rfb.js').default
 // noVNC ships CommonJS; depending on the bundler the class is the default or default.default.
@@ -35,49 +42,32 @@ const readScale = (): Scale => {
 }
 // Which key on this computer acts as the machine's Super key. Many computers keep the Windows/⌘/
 // Super key for themselves (an Omarchy or Windows desktop never hands Super+Enter to a browser),
-// so a key the browser does receive can stand in for it.
-type SuperKey = 'meta' | 'altright' | 'ctrlright'
+// so Right Alt or Right Ctrl can be chosen in the Keys menu as a stand-in, keeping AltGr working by default.
 const SUPER_CODES: Record<SuperKey, string[]> = {meta: ['MetaLeft', 'MetaRight', 'OSLeft', 'OSRight'], altright: ['AltRight'], ctrlright: ['ControlRight']}
 const SUPER_LABEL: Record<SuperKey, string> = {meta: 'Windows / ⌘ key', altright: 'Right Alt', ctrlright: 'Right Ctrl'}
 function readSuperKey(): SuperKey {
 	try {
-		const v = localStorage.getItem('omarchy-server:console-super')
-		if (v === 'altright' || v === 'ctrlright' || v === 'meta') return v
+		return resolveSuperKey(localStorage.getItem('omarchy-server:console-super'))
 	} catch {
-		/* not saved */
+		return 'meta'
 	}
-	// A Linux desktop (Omarchy, GNOME…) keeps Super for itself, so Right Alt stands in there unless
-	// you choose otherwise. The Super key itself still works whenever the browser receives it.
-	return typeof navigator !== 'undefined' && /Linux/.test(navigator.userAgent) && !/Android/.test(navigator.userAgent) ? 'altright' : 'meta'
 }
 const F = (n: number) => 0xffbd + n // F1 = 0xffbe
 const KEY = {Escape: 0xff1b, Tab: 0xff09, Enter: 0xff0d, Backspace: 0xff08, Up: 0xff52, Down: 0xff54, Left: 0xff51, Right: 0xff53, Ctrl: 0xffe3, Alt: 0xffe9, Super: 0xffeb, Shift: 0xffe1}
-const BTN = {left: 1, middle: 2, right: 4, wheelUp: 8, wheelDown: 16, wheelLeft: 32, wheelRight: 64}
 const MIN_ZOOM = 1
 const MAX_ZOOM = 5
 const LONG_PRESS_MS = 450
 const TAP_SLOP = 9
-const keysymOf = (ch: string) => {
-	const cp = ch.codePointAt(0)!
-	return cp < 0x100 ? cp : 0x01000000 | cp
-}
+type KeySender = {sendKey: (keysym: number, code: string | null, down?: boolean) => void}
 // The VM's keyboard works in physical keys (US layout): '|' is Shift + backslash, 'A' is Shift + 'a'.
 // Sending '|' alone types a backslash, so characters that need Shift are wrapped in a Shift press.
-const NEEDS_SHIFT = /^[A-Z~!@#$%^&*()_+{}|:"<>?]$/
-type KeySender = {sendKey: (keysym: number, code: string | null, down?: boolean) => void}
 function sendChar(r: KeySender, ch: string, shiftHeld = false) {
-	const k = ch === '\n' ? KEY.Enter : ch === '\t' ? KEY.Tab : keysymOf(ch)
-	const shift = !shiftHeld && NEEDS_SHIFT.test(ch)
-	if (shift) r.sendKey(KEY.Shift, null, true)
-	r.sendKey(k, null, true)
-	r.sendKey(k, null, false)
-	if (shift) r.sendKey(KEY.Shift, null, false)
+	for (const step of charKeySteps(ch, shiftHeld)) r.sendKey(step.keysym, null, step.down)
 }
 
 type State = 'connecting' | 'connected' | 'lost' | 'superseded' | 'error'
 type Mode = 'touch' | 'mouse'
 type View = {z: number; x: number; y: number}
-type Pt = {x: number; y: number}
 
 const HINT: Record<Mode, string> = {
 	touch: 'Touch: tap to click · hold to right-click · pinch to zoom',
@@ -92,25 +82,63 @@ const readMode = (): Mode => {
 	}
 }
 
-export function Console({machine, onClose, embedded}: {machine: Machine; onClose: () => void; embedded?: boolean}) {
+export function Console({machine, onClose, embedded, windowId}: {machine: Machine; onClose: () => void; embedded?: boolean; windowId?: string}) {
 	const portalRoot = usePortalRoot()
 	const rootRef = useRef<HTMLDivElement>(null)
 	const screenRef = useRef<HTMLDivElement>(null) // the visible viewport
 	const stageRef = useRef<HTMLDivElement>(null) // zoomed/panned layer holding noVNC
 	const canvasHost = useRef<HTMLDivElement>(null)
+	const touchRef = useRef<HTMLDivElement>(null)
 	const cursorRef = useRef<HTMLDivElement>(null)
 	const input = useRef<HTMLTextAreaElement>(null)
 	const rfbRef = useRef<InstanceType<RFBClass>>()
+	const pasteTimer = useRef(0)
+	const pasteGen = useRef(0)
+	const pasteDown = useRef<number[]>([])
 	useScreenLock(rootRef, false, !embedded)
 	// In a desktop window with a mouse, noVNC gets the real mouse and keyboard directly
 	// (like any desktop VNC client) and the console gets a desktop toolbar instead of touch controls.
 	const deskUi = !!embedded && typeof matchMedia !== 'undefined' && matchMedia('(pointer: fine)').matches
 	const [scale, setScaleState] = useState<Scale>(readScale)
-	const [canResize, setCanResize] = useState(false)
+	// null until a connected desktop reports whether it can change resolution. false is known-no.
+	const [canResize, setCanResize] = useState<boolean | null>(null)
+	const canResizeRef = useRef(canResize)
+	canResizeRef.current = canResize
+	const toldFitted = useRef(false)
+	const shownScale = effectiveConsoleScale(scale, canResize)
+	// Phone layout only. An embedded desktop window must not push its own history entry.
+	const onCloseRef = useRef(onClose)
+	onCloseRef.current = onClose
+	const overlayClosed = useRef(false)
+	useEffect(() => {
+		if (embedded) return
+		overlayClosed.current = false
+		const id = 'console'
+		history.pushState({omarchyOverlay: id}, '', location.href)
+		const onPop = (e: PopStateEvent) => {
+			if (!popstateClosesOverlay(e.state, id)) return
+			overlayClosed.current = true
+			onCloseRef.current()
+		}
+		window.addEventListener('popstate', onPop)
+		return () => window.removeEventListener('popstate', onPop)
+	}, [embedded])
+	const back = () => {
+		if (embedded) {
+			onClose()
+			return
+		}
+		haptic(6)
+		if (overlayBackUsesHistory(overlayClosed.current, history.state, 'console')) history.back()
+		else onClose()
+	}
 	const [res, setRes] = useState<{w: number; h: number} | null>(null)
 	const [fullscreen, setFullscreen] = useState(false)
 	const [barShown, setBarShown] = useState(true)
 	const [keysOpen, setKeysOpen] = useState(false)
+	const keysMenuRef = useRef<HTMLDivElement>(null)
+	// Focus moves into the Keys menu when it opens; arrows, Home and End move between items, Escape or Tab close it and focus goes back to the button.
+	useMenuFocus(keysOpen, keysMenuRef, () => setKeysOpen(false))
 	const [typing, setTyping] = useState<string | null>(null)
 	const [state, setState] = useState<State>('connecting')
 	const [message, setMessage] = useState('')
@@ -122,9 +150,61 @@ export function Console({machine, onClose, embedded}: {machine: Machine; onClose
 	const lastSuperTap = useRef(0)
 	const remoteClip = useRef('') // what the machine's clipboard holds, as far as we know
 	const [attempt, setAttempt] = useState(0)
+	const [hyprStatus, setHyprStatus] = useState<HyprlandStatus | null>(null)
+	const [hyprWindows, setHyprWindows] = useState<HyprlandWindow[]>([])
+	const [hyprTarget, setHyprTarget] = useState<{mode: 'output' | 'window'; address: string; title: string}>({mode: 'output', address: '', title: 'Full Desktop'})
+	const [renderMode, setRenderMode] = useState<'auto' | 'direct' | 'vnc'>(() => {
+		try {
+			const v = localStorage.getItem('omarchy-server:desktop-render')
+			return v === 'vnc' || v === 'direct' ? v : 'auto'
+		} catch {
+			return 'auto'
+		}
+	})
+	const canDirectGpu = machine.id === 'desktop' && supportsWebCodecs() && !!hyprStatus?.available
+	const directGpu = canDirectGpu && renderMode !== 'vnc'
+	const switchRenderMode = (next: 'direct' | 'vnc') => {
+		setRenderMode(next)
+		try {
+			localStorage.setItem('omarchy-server:desktop-render', next)
+		} catch {}
+	}
+	useEffect(() => {
+		if (machine.id !== 'desktop' || !supportsWebCodecs()) return
+		let gone = false
+		query<HyprlandStatus>('hyprland.status')
+			.then((st) => {
+				if (!gone) setHyprStatus(st)
+			})
+			.catch(() => {})
+		return () => {
+			gone = true
+		}
+	}, [machine.id])
+	useEffect(() => {
+		if (!directGpu) return
+		let gone = false
+		const load = () =>
+			query<HyprlandWindow[]>('hyprland.windows')
+				.then((list) => {
+					if (!gone) setHyprWindows(list)
+				})
+				.catch(() => {})
+		load()
+		const t = window.setInterval(load, 5000)
+		return () => {
+			gone = true
+			window.clearInterval(t)
+		}
+	}, [directGpu])
 	const [mode, setModeState] = useState<Mode>(readMode)
 	const [zoomLabel, setZoomLabel] = useState(100)
 	const [keyboardOpen, setKeyboardOpen] = useState(false)
+	// Phones: once the keyboard is opened with the keyboard button it stays up until that button
+	// puts it away. Tapping or dragging on the screen used to close it (the tap took focus).
+	const keyboardStays = useRef(false)
+	const touchLostKeyboard = useRef(false)
+	const touching = useRef(false)
 	const view = useRef<View>({z: 1, x: 0, y: 0})
 	const cursor = useRef<Pt>({x: -1, y: -1}) // framebuffer coordinates
 	const mask = useRef(0)
@@ -143,10 +223,16 @@ export function Console({machine, onClose, embedded}: {machine: Machine; onClose
 
 	// ---- connection ---------------------------------------------------------------
 	useEffect(() => {
+		if (directGpu) return
 		let disposed = false
 		let retry: number | undefined
 		let rfb: InstanceType<RFBClass> | undefined
 		let socket: WebSocket | undefined
+		let connects = 0
+		// Tries in a row that never showed the screen. A computer that refuses (its screen sharing
+		// won't start, say) says why; that's shown instead of reconnecting forever.
+		let failedStarts = 0
+		let everShown = false // once it has worked, a drop (a restart, Wi-Fi) just reconnects
 
 		const connect = async () => {
 			if (disposed || !canvasHost.current) return
@@ -163,9 +249,14 @@ export function Console({machine, onClose, embedded}: {machine: Machine; onClose
 				return
 			}
 			let closeCode: number | undefined
+			let closeReason = ''
+			let shown = false
 			const scheme = location.protocol === 'https:' ? 'wss:' : 'ws:'
 			socket = new WebSocket(`${scheme}//${location.host}/api/console?machineId=${encodeURIComponent(machine.id)}`, ['binary'])
-			socket.addEventListener('close', (e) => (closeCode = e.code))
+			socket.addEventListener('close', (e) => {
+				closeCode = e.code
+				closeReason = e.reason || ''
+			})
 			canvasHost.current.replaceChildren()
 			const r = new RFB(canvasHost.current, socket, {shared: true})
 			rfb = r
@@ -177,7 +268,7 @@ export function Console({machine, onClose, embedded}: {machine: Machine; onClose
 			if (deskUi) {
 				r.focusOnClick = true
 				;(r as any).showDotCursor = true
-				applyScale(r, readScale())
+				applyScale(r, effectiveConsoleScale(readScale(), canResizeRef.current))
 			}
 			// The machine copied something: put it on this computer's clipboard too (browsers allow
 			// that on https:// while this page has focus).
@@ -186,14 +277,24 @@ export function Console({machine, onClose, embedded}: {machine: Machine; onClose
 				if (!text) return
 				remoteClip.current = text
 				if (window.isSecureContext && document.hasFocus()) navigator.clipboard?.writeText(text).catch(() => {})
+				clipText(text, 'desktop').catch((err: Error) => toast(err.message, true))
 			})
 			r.addEventListener('connect', () => {
+				shown = true
+				everShown = true
+				failedStarts = 0
+				connects += 1
+				const connectCount = connects
 				setState('connected')
 				haptic(8)
 				if (deskUi) {
 					window.setTimeout(() => {
-						setCanResize(!!(r as any)._supportsSetDesktopSize)
-						r.focus()
+						if (disposed || rfbRef.current !== r) return
+						const metrics = readConsoleMetrics(r as any)
+						setCanResize(metrics.canResize)
+						applyScale(r, effectiveConsoleScale(readScale(), metrics.canResize))
+						const host = rootRef.current?.closest('.win') ?? rootRef.current
+						if (consoleShouldTakeFocus({firstConnect: connectCount === 1, activeElement: document.activeElement, windowEl: host})) r.focus()
 					}, 600)
 				}
 				try {
@@ -211,10 +312,24 @@ export function Console({machine, onClose, embedded}: {machine: Machine; onClose
 				}, 300)
 			})
 			r.addEventListener('disconnect', (e) => {
-				if (disposed) return
-				if (closeCode === SUPERSEDED) return setState('superseded')
+				const action = consoleDisconnectAction({
+					disposed: disposed || rfbRef.current !== r,
+					superseded: closeCode === SUPERSEDED,
+					clean: (e as CustomEvent<{clean: boolean}>).detail?.clean,
+				})
+				if (action === 'ignore') return
+				if (action === 'superseded') return setState('superseded')
+				if (!shown && !everShown) {
+					failedStarts += 1
+					if (closeReason || failedStarts >= 3) {
+						setMessage(consoleFailureMessage(closeReason))
+						setState('error')
+						return
+					}
+				}
 				setState('lost')
-				if (!(e as CustomEvent<{clean: boolean}>).detail.clean) retry = window.setTimeout(connect, 1500)
+				window.clearTimeout(retry)
+				retry = window.setTimeout(connect, 1500)
 			})
 		}
 		connect()
@@ -231,7 +346,7 @@ export function Console({machine, onClose, embedded}: {machine: Machine; onClose
 			rfbRef.current = undefined
 		}
 		// eslint-disable-next-line react-hooks/exhaustive-deps
-	}, [machine.id, attempt])
+	}, [machine.id, attempt, directGpu])
 
 	// ---- desktop console ---------------------------------------------------------------
 	function applyScale(r: InstanceType<RFBClass>, sc: Scale) {
@@ -247,18 +362,37 @@ export function Console({machine, onClose, embedded}: {machine: Machine; onClose
 			/* not saved */
 		}
 		const r = rfbRef.current
+		const next = effectiveConsoleScale(sc, canResize)
 		if (r) {
-			applyScale(r, sc)
+			applyScale(r, next)
 			r.focus()
 		}
-		if (sc === 'remote' && !canResize) toast('This machine can’t change its resolution from here; showing it fitted instead.')
+		if (sc === 'remote' && canResize === false) noteFitted()
 	}
-	// Resolution readout (noVNC has no public resize event).
+	// One toast per time we have to show Fit in place of a saved or chosen Resize VM.
+	const noteFitted = () => {
+		if (toldFitted.current) return
+		toldFitted.current = true
+		toast('This machine can’t change its resolution from here; showing it fitted instead.')
+	}
+	// Saved Resize VM is fitted once the machine is known not to resize. The saved choice stays remote.
+	useEffect(() => {
+		if (!deskUi) return
+		const r = rfbRef.current
+		if (r) applyScale(r, shownScale)
+		if (scale === 'remote' && canResize === false) noteFitted()
+		else toldFitted.current = false
+		// eslint-disable-next-line react-hooks/exhaustive-deps
+	}, [deskUi, shownScale, scale, canResize])
+	// Resolution readout and late resize-capability detection (noVNC has no public resize event).
 	useEffect(() => {
 		if (!deskUi) return
 		const t = window.setInterval(() => {
-			const fb = fbSize()
-			setRes((cur) => (fb && (cur?.w !== fb.w || cur?.h !== fb.h) ? fb : cur))
+			const rfb = rfbRef.current
+			if (!rfb) return
+			const next = readConsoleMetrics(rfb as any)
+			setRes((cur) => (next.res && (cur?.w !== next.res.w || cur?.h !== next.res.h) ? next.res : cur))
+			setCanResize((cur) => (cur === next.canResize ? cur : next.canResize))
 		}, 1000)
 		return () => window.clearInterval(t)
 		// eslint-disable-next-line react-hooks/exhaustive-deps
@@ -297,13 +431,29 @@ export function Console({machine, onClose, embedded}: {machine: Machine; onClose
 		root.addEventListener('keydown', onKey, true)
 		root.addEventListener('keyup', onKey, true)
 		window.addEventListener('blur', release)
+		const onInject = (e: {type: string; code: string; key: string}) => {
+			const mapped = keysymFromEvent(e)
+			if (mapped === 'super') {
+				// The Super button holds it down until clicked again, the same as a real Super key.
+				sendSuper(e.type === 'keydown' || superHeld)
+				return
+			}
+			if (!mapped) return
+			rfbRef.current?.sendKey(mapped.keysym, mapped.code, e.type === 'keydown')
+		}
+		if (windowId) setConsoleKeyHandler(windowId, onInject)
 		return () => {
 			root.removeEventListener('keydown', onKey, true)
 			root.removeEventListener('keyup', onKey, true)
 			window.removeEventListener('blur', release)
+			if (windowId) setConsoleKeyHandler(windowId, null)
 		}
 		// eslint-disable-next-line react-hooks/exhaustive-deps
-	}, [superKey, superHeld])
+	}, [superKey, superHeld, windowId])
+	// Closing the console never leaves Super held down on the machine. (Only on close: this effect
+	// above also re-runs when the Super button is toggled, and must not let go of a held Super then.)
+	// eslint-disable-next-line react-hooks/exhaustive-deps
+	useEffect(() => () => sendSuper(false), [])
 	const toggleSuperHeld = () => {
 		const next = !superHeld
 		setSuperHeld(next)
@@ -331,6 +481,34 @@ export function Console({machine, onClose, embedded}: {machine: Machine; onClose
 		remoteClip.current = clean
 		r.clipboardPasteFrom(clean)
 	}
+	// A clip pasted as text goes to the screen used last, not to every open one.
+	const clipTarget = useRef({})
+	useEffect(() => {
+		const me = clipTarget.current
+		markClipTarget(me)
+		// Listening on the document, because the screen's own element can be swapped out.
+		const mark = (e: Event) => {
+			if (e.target instanceof Node && rootRef.current?.contains(e.target)) markClipTarget(me)
+		}
+		document.addEventListener('focusin', mark)
+		document.addEventListener('pointerdown', mark, true)
+		const onClipPaste = (e: Event) => {
+			const text = (e as CustomEvent<{text?: string}>).detail?.text
+			if (!text || !isClipTarget(me)) return
+			const r = rfbRef.current
+			if (!r) return
+			const clean = text.replace(/\r\n?/g, '\n')
+			remoteClip.current = clean
+			r.clipboardPasteFrom(clean)
+		}
+		window.addEventListener('omarchy-clip-paste', onClipPaste)
+		return () => {
+			window.removeEventListener('omarchy-clip-paste', onClipPaste)
+			document.removeEventListener('focusin', mark)
+			document.removeEventListener('pointerdown', mark, true)
+			unmarkClipTarget(me)
+		}
+	}, [])
 	const syncClipboard = () => {
 		if (!window.isSecureContext || !navigator.clipboard?.readText || !document.hasFocus()) return
 		navigator.clipboard.readText().then(pushClipboard, () => {})
@@ -338,33 +516,47 @@ export function Console({machine, onClose, embedded}: {machine: Machine; onClose
 	useEffect(() => {
 		const root = rootRef.current
 		if (!root || !deskUi) return
-		let pending: {meta: boolean; timer: number} | null = null
-		const sendV = (meta: boolean) => {
+		const heldCtrl = new Set<string>()
+		const heldShift = new Set<string>()
+		let pending: {meta: boolean; shift: boolean; timer: number} | null = null
+		let sendTimer = 0
+		const sendV = (meta: boolean, shift: boolean) => {
 			const r = rfbRef.current
 			if (!r) return
-			if (meta) {
-				sendSuper(false)
-				r.sendKey(KEY.Ctrl, 'ControlLeft', true)
-			}
-			r.sendKey(0x76, 'KeyV', true)
-			r.sendKey(0x76, 'KeyV', false)
-			if (meta) r.sendKey(KEY.Ctrl, 'ControlLeft', false)
+			const seq = pasteKeySequence({meta, shift, ctrlHeld: heldCtrl.size > 0, shiftHeld: heldShift.size > 0})
+			if (seq.releaseSuper) sendSuper(false)
+			for (const k of seq.keys) r.sendKey(k.keysym, k.code, k.down)
 		}
 		const finish = (text?: string) => {
 			if (!pending) return
-			const {meta, timer} = pending
+			const {meta, shift, timer} = pending
 			window.clearTimeout(timer)
 			pending = null
 			if (text) pushClipboard(text)
 			// A moment for the machine to take the new clipboard before the keystroke.
-			window.setTimeout(() => sendV(meta), text ? 60 : 0)
+			window.clearTimeout(sendTimer)
+			sendTimer = window.setTimeout(() => sendV(meta, shift), text ? 60 : 0)
 		}
 		const onKey = (e: KeyboardEvent) => {
-			if (e.code !== 'KeyV' || !(e.ctrlKey || e.metaKey) || e.altKey || !canvasHost.current?.contains(e.target as Node)) return
+			if (!canvasHost.current?.contains(e.target as Node)) return
+			if (e.type === 'keydown') {
+				if (e.code === 'ControlLeft' || e.code === 'ControlRight') heldCtrl.add(e.code)
+				if (e.code === 'ShiftLeft' || e.code === 'ShiftRight') heldShift.add(e.code)
+			}
+			if (e.code !== 'KeyV' || !(e.ctrlKey || e.metaKey) || e.altKey) return
 			// noVNC mustn't send the V yet; the browser's default action stays, so it fires "paste".
 			e.stopImmediatePropagation()
 			if (e.type !== 'keydown' || e.repeat) return
-			pending = {meta: e.metaKey && !e.ctrlKey, timer: window.setTimeout(() => finish(), 400)}
+			if (pending) window.clearTimeout(pending.timer)
+			pending = {meta: e.metaKey && !e.ctrlKey, shift: e.shiftKey, timer: window.setTimeout(() => finish(), 400)}
+		}
+		const onWinKeyUp = (e: KeyboardEvent) => {
+			heldCtrl.delete(e.code)
+			heldShift.delete(e.code)
+		}
+		const clearHeld = () => {
+			heldCtrl.clear()
+			heldShift.clear()
 		}
 		const onPaste = (e: ClipboardEvent) => {
 			if (!pending) return
@@ -379,13 +571,19 @@ export function Console({machine, onClose, embedded}: {machine: Machine; onClose
 		root.addEventListener('pointerdown', onPointer, true)
 		root.addEventListener('pointerenter', syncClipboard)
 		document.addEventListener('paste', onPaste, true)
+		window.addEventListener('keyup', onWinKeyUp, true)
+		window.addEventListener('blur', clearHeld)
 		window.addEventListener('focus', syncClipboard)
 		return () => {
+			if (pending) window.clearTimeout(pending.timer)
+			window.clearTimeout(sendTimer)
 			root.removeEventListener('keydown', onKey, true)
 			root.removeEventListener('keyup', onKey, true)
 			root.removeEventListener('pointerdown', onPointer, true)
 			root.removeEventListener('pointerenter', syncClipboard)
 			document.removeEventListener('paste', onPaste, true)
+			window.removeEventListener('keyup', onWinKeyUp, true)
+			window.removeEventListener('blur', clearHeld)
 			window.removeEventListener('focus', syncClipboard)
 		}
 		// eslint-disable-next-line react-hooks/exhaustive-deps
@@ -434,12 +632,41 @@ export function Console({machine, onClose, embedded}: {machine: Machine; onClose
 		for (const k of [...syms].reverse()) r.sendKey(k, null, false)
 		r.focus()
 	}
+	// One key event at a time. A burst overflows QEMU's keyboard queue when the guest terminal
+	// pauses at the right edge, and the next character then repeats.
+	const releasePasteDown = () => {
+		const live = rfbRef.current
+		const down = pasteDown.current
+		pasteDown.current = []
+		if (!live) return
+		for (const keysym of [...down].reverse()) live.sendKey(keysym, null, false)
+	}
 	const typeText = (text: string) => {
 		const r = rfbRef.current
-		if (!r) return
-		for (const ch of text.replace(/\r\n?/g, '\n')) sendChar(r, ch)
+		if (!r || !text) return
+		window.clearTimeout(pasteTimer.current)
+		releasePasteDown()
+		const gen = ++pasteGen.current
+		const steps = pasteKeySteps(text)
+		let i = 0
+		const tick = () => {
+			if (pasteGen.current !== gen) return
+			const live = rfbRef.current
+			if (!live || i >= steps.length) return
+			const step = steps[i++]
+			live.sendKey(step.keysym, null, step.down)
+			if (step.down) pasteDown.current = [...pasteDown.current, step.keysym]
+			else pasteDown.current = pasteDown.current.filter((k) => k !== step.keysym)
+			if (i < steps.length) pasteTimer.current = window.setTimeout(tick, PASTE_STEP_MS)
+		}
+		tick()
 		r.focus()
 	}
+	useEffect(() => () => {
+		window.clearTimeout(pasteTimer.current)
+		pasteGen.current += 1
+		releasePasteDown()
+	}, [])
 	const screenshot = async () => {
 		const canvas = canvasHost.current?.querySelector('canvas')
 		if (!canvas) return
@@ -447,10 +674,18 @@ export function Console({machine, onClose, embedded}: {machine: Machine; onClose
 			if (!blob) return
 			const a = document.createElement('a')
 			a.href = URL.createObjectURL(blob)
-			a.download = `${machine.name.replace(/[^\w.-]+/g, '-')}-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.png`
+			a.download = screenshotFilename(machine.name)
 			a.click()
 			window.setTimeout(() => URL.revokeObjectURL(a.href), 2000)
 			toast('Screenshot saved')
+		}, 'image/png')
+	}
+	const clipShot = () => {
+		const canvas = canvasHost.current?.querySelector('canvas')
+		if (!canvas) return
+		canvas.toBlob((blob) => {
+			if (!blob) return
+			clipImage(blob).then(() => toast('Saved to the clip book'), (err: Error) => toast(err.message, true))
 		}, 'image/png')
 	}
 	const OMARCHY_COMBOS: {label: string; keys: number[]}[] = [
@@ -481,14 +716,11 @@ export function Console({machine, onClose, embedded}: {machine: Machine; onClose
 	const canvasRect = () => canvasHost.current?.querySelector('canvas')?.getBoundingClientRect() ?? null
 	// Screen (client) point -> framebuffer pixel. Works at any zoom because the
 	// canvas's on-screen box already includes our transform.
-	const toFb = (p: Pt): Pt | null => {
-		const fb = fbSize()
+	const toFb = (p: Pt, clamp = true): Pt | null => pointToFb(p, canvasRect(), fbSize(), {clamp})
+	// Whether a point on screen is on the remote picture (not the bars around it).
+	const onPicture = (p: Pt) => {
 		const r = canvasRect()
-		if (!fb || !r || !r.width) return null
-		return {
-			x: Math.round(Math.min(fb.w - 1, Math.max(0, ((p.x - r.left) / r.width) * fb.w))),
-			y: Math.round(Math.min(fb.h - 1, Math.max(0, ((p.y - r.top) / r.height) * fb.h))),
-		}
+		return !!r && p.x >= r.left && p.x <= r.right && p.y >= r.top && p.y <= r.bottom
 	}
 	const toScreen = (p: Pt): Pt | null => {
 		const fb = fbSize()
@@ -508,6 +740,25 @@ export function Console({machine, onClose, embedded}: {machine: Machine; onClose
 		// eslint-disable-next-line react-hooks/exhaustive-deps
 	}, [])
 
+	// Where the remote picture sits in the screen area at 100% (it's fitted and centered, so a desktop
+	// that isn't the phone's shape has bars around it). Measured from the canvas as it's shown now.
+	const pictureAt100 = () => {
+		const s = screenRef.current
+		const canvas = s?.querySelector('canvas')
+		if (!s || !canvas) return null
+		const sr = s.getBoundingClientRect()
+		const cr = canvas.getBoundingClientRect()
+		const v = view.current
+		if (!cr.width || !cr.height || !v.z) return null
+		return {x: (cr.left - sr.left - v.x) / v.z, y: (cr.top - sr.top - v.y) / v.z, w: cr.width / v.z, h: cr.height / v.z}
+	}
+	// How far the view can move on one axis: a picture smaller than the screen can slide anywhere
+	// inside it (up and out of the keyboard's way, say), a bigger one pans to its edges (issue #91).
+	const span = (size: number, at: number, len: number, z: number) => {
+		const a = -at * z
+		const b = size - (at + len) * z
+		return [Math.min(a, b), Math.max(a, b)]
+	}
 	const applyView = (v: View, animate = false) => {
 		const s = screenRef.current
 		const stage = stageRef.current
@@ -515,8 +766,11 @@ export function Console({machine, onClose, embedded}: {machine: Machine; onClose
 		const w = s.clientWidth
 		const h = s.clientHeight
 		const z = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, v.z))
-		const x = Math.min(0, Math.max(w - w * z, v.x))
-		const y = Math.min(0, Math.max(h - h * z, v.y))
+		const pic = pictureAt100() ?? {x: 0, y: 0, w, h}
+		const [x0, x1] = span(w, pic.x, pic.w, z)
+		const [y0, y1] = span(h, pic.y, pic.h, z)
+		const x = Math.min(x1, Math.max(x0, v.x))
+		const y = Math.min(y1, Math.max(y0, v.y))
 		view.current = {z, x, y}
 		stage.style.transition = animate ? 'transform .28s cubic-bezier(.2,.8,.2,1)' : 'none'
 		stage.style.transform = `translate(${x}px, ${y}px) scale(${z})`
@@ -545,6 +799,15 @@ export function Console({machine, onClose, embedded}: {machine: Machine; onClose
 		haptic(5)
 		applyView({z: 1, x: 0, y: 0}, true)
 	}
+	// Fill the screen with the picture (no bars), centered; drag to see the rest.
+	const fill = () => {
+		haptic(5)
+		const s = screenRef.current
+		const pic = pictureAt100()
+		if (!s || !pic) return
+		const z = Math.min(MAX_ZOOM, Math.max(s.clientWidth / pic.w, s.clientHeight / pic.h))
+		applyView({z, x: s.clientWidth / 2 - (pic.x + pic.w / 2) * z, y: s.clientHeight / 2 - (pic.y + pic.h / 2) * z}, true)
+	}
 	// Refit whenever the screen area changes size (rotation, keyboard, window), not only on window resize.
 	useEffect(() => {
 		const el = screenRef.current
@@ -556,44 +819,57 @@ export function Console({machine, onClose, embedded}: {machine: Machine; onClose
 	}, [])
 	// Phones: keep the console exactly the size of the visible area, so the on-screen keyboard
 	// shrinks the picture instead of covering it, and nothing is left behind when it closes.
-	// iOS doesn't always send a resize when the keyboard goes away, so check again while it animates.
+	// Always sized to the visual viewport (issue #93): guessing whether it's "the whole window" from
+	// innerHeight is unreliable on iOS and left a bar. iOS doesn't always send a resize when the
+	// keyboard or the address bar moves, so check again while they animate, and refit the remote
+	// picture to the new size each time (noVNC only notices a change of its own element's size).
 	useEffect(() => {
 		if (deskUi || embedded) return
 		const vv = window.visualViewport
 		const root = rootRef.current
 		if (!vv || !root) return
 		let timers: number[] = []
+		let last = ''
 		const sync = () => {
-			const full = Math.abs(window.innerHeight - vv.height) < 2 && vv.offsetTop < 1
-			if (full) {
-				root.style.top = ''
-				root.style.height = ''
-				if (window.scrollY !== 0 || document.documentElement.scrollTop !== 0) window.scrollTo(0, 0)
-			} else {
-				root.style.top = `${vv.offsetTop}px`
-				root.style.height = `${vv.height}px`
-			}
+			const box = `${vv.offsetTop},${vv.offsetLeft},${vv.width},${vv.height}`
+			root.style.top = `${vv.offsetTop}px`
+			root.style.left = `${vv.offsetLeft}px`
+			root.style.width = `${vv.width}px`
+			root.style.height = `${vv.height}px`
+			root.style.bottom = 'auto'
+			root.style.right = 'auto'
+			if (vv.offsetTop < 1 && (window.scrollY !== 0 || document.documentElement.scrollTop !== 0)) window.scrollTo(0, 0)
+			if (box === last) return
+			last = box
+			requestAnimationFrame(() => {
+				// noVNC's own resize check can think nothing changed; refit directly.
+				const r = rfbRef.current as any
+				r?._updateClip?.()
+				r?._updateScale?.()
+				applyView(view.current)
+			})
 		}
 		const settle = () => {
 			sync()
 			timers.forEach(window.clearTimeout)
-			timers = [60, 180, 350, 600, 1000].map((ms) => window.setTimeout(sync, ms))
+			timers = [60, 180, 350, 600, 1000, 1600].map((ms) => window.setTimeout(sync, ms))
 		}
 		vv.addEventListener('resize', settle)
 		vv.addEventListener('scroll', sync)
 		window.addEventListener('orientationchange', settle)
+		window.addEventListener('resize', settle)
 		root.addEventListener('focusin', settle)
 		root.addEventListener('focusout', settle)
-		sync()
+		settle()
 		return () => {
 			timers.forEach(window.clearTimeout)
 			vv.removeEventListener('resize', settle)
 			vv.removeEventListener('scroll', sync)
 			window.removeEventListener('orientationchange', settle)
+			window.removeEventListener('resize', settle)
 			root.removeEventListener('focusin', settle)
 			root.removeEventListener('focusout', settle)
-			root.style.top = ''
-			root.style.height = ''
+			for (const k of ['top', 'left', 'width', 'height', 'bottom', 'right'] as const) root.style[k] = ''
 			window.scrollTo(0, 0)
 			settleViewport()
 		}
@@ -678,25 +954,30 @@ export function Console({machine, onClose, embedded}: {machine: Machine; onClose
 	}
 
 	const onPointerDown = (e: React.PointerEvent) => {
+		// With the on-screen keyboard up, touching the desktop mustn't take focus from it (that closes
+		// the keyboard): the same as the dock's keys (issue #92).
+		if (keyboardOpen && e.pointerType !== 'mouse') e.preventDefault()
 		if (state !== 'connected') return
 		const st = g.current
-		;(e.target as Element).setPointerCapture?.(e.pointerId)
 		const p = {x: e.clientX, y: e.clientY}
 
 		// A real mouse (desktop) maps straight through.
 		if (e.pointerType === 'mouse') {
-			st.kind = 'mouse'
+			const button = mouseButtonFromEvent(e.button)
+			if (button === null) return
 			// On a desktop, clicking the screen gives the VM your physical keyboard
 			// (noVNC's own handler: every key and shortcut, modifiers included).
 			if (embedded) window.setTimeout(() => rfbRef.current?.focus(), 0)
-			const fb = toFb(p)
+			const fb = toFb(p, false)
 			if (!fb) return
+			st.kind = 'mouse'
+			;(e.target as Element).setPointerCapture?.(e.pointerId)
 			cursor.current = fb
-			const button = e.button === 2 ? BTN.right : e.button === 1 ? BTN.middle : BTN.left
 			press(fb, button)
 			return
 		}
 
+		;(e.target as Element).setPointerCapture?.(e.pointerId)
 		st.pointers.set(e.pointerId, p)
 		if (st.pointers.size === 1) {
 			st.kind = 'one'
@@ -708,15 +989,16 @@ export function Console({machine, onClose, embedded}: {machine: Machine; onClose
 			st.dragging = false
 			st.panning = false
 			window.clearTimeout(st.longTimer)
-			if (mode === 'touch') {
+			if (mode === 'touch' && onPicture(p)) {
 				st.longTimer = window.setTimeout(() => {
 					if (st.kind !== 'one' || st.moved) return
+					const fb = toFb(st.start, false)
+					if (!fb) return
 					st.held = true
 					haptic(15)
-					const fb = toFb(st.start)
-					if (fb) ripple(fb, true)
+					ripple(fb, true)
 				}, LONG_PRESS_MS)
-			} else if (performance.now() - st.lastTapTime < 320) {
+			} else if (mode === 'mouse' && performance.now() - st.lastTapTime < 320) {
 				// Mouse mode: double-tap and hold = press the left button for dragging.
 				st.dragging = true
 				press(cursor.current, BTN.left)
@@ -767,7 +1049,7 @@ export function Console({machine, onClose, embedded}: {machine: Machine; onClose
 							send(fb, 0)
 							press(fb, BTN.left)
 						}
-					} else if (view.current.z > 1.01) st.panning = true
+					} else if (view.current.z > 1.01 || !onPicture(st.start)) st.panning = true
 					else {
 						st.dragging = true
 						const fb = toFb(st.start)
@@ -840,12 +1122,17 @@ export function Console({machine, onClose, embedded}: {machine: Machine; onClose
 		}
 	}
 
-	const onPointerUp = (e: React.PointerEvent) => {
+	const endPointer = (e: React.PointerEvent, cancelled: boolean) => {
 		const st = g.current
 		const p = {x: e.clientX, y: e.clientY}
 		if (e.pointerType === 'mouse') {
+			if (cancelled) {
+				if (mask.current) send(toFb(p) ?? cursor.current, 0)
+				return
+			}
+			const button = mouseButtonFromEvent(e.button)
+			if (button === null || !(mask.current & button)) return
 			const fb = toFb(p) ?? cursor.current
-			const button = e.button === 2 ? BTN.right : e.button === 1 ? BTN.middle : BTN.left
 			release(fb, button)
 			return
 		}
@@ -853,53 +1140,127 @@ export function Console({machine, onClose, embedded}: {machine: Machine; onClose
 		const wasCount = st.pointers.size
 		st.pointers.delete(e.pointerId)
 		const quick = performance.now() - st.startTime < 280
+		if (cancelled && st.kind === 'two') st.moved = true
+		if (st.kind === 'one' && wasCount === 1) window.clearTimeout(st.longTimer)
 
-		if (st.kind === 'one' && wasCount === 1) {
-			window.clearTimeout(st.longTimer)
-			if (mode === 'touch') {
-				const fb = toFb(st.start)
-				if (st.dragging) release(toFb(p) ?? cursor.current, BTN.left)
-				else if (!st.moved && fb) {
-					if (st.held) click(fb, BTN.right)
-					else click(fb, BTN.left)
-					haptic(5)
-				}
-			} else {
-				if (st.dragging) release(cursor.current, BTN.left)
-				else if (!st.moved && quick) {
-					click(cursor.current, BTN.left)
-					haptic(5)
-					st.lastTapTime = performance.now()
-				}
+		const outcome = touchReleaseAction({
+			cancelled,
+			mode,
+			kind: st.kind,
+			wasCount,
+			remaining: st.pointers.size,
+			moved: st.moved,
+			held: st.held,
+			dragging: st.dragging,
+			quick,
+			maxPointers: st.two.maxPointers,
+		})
+		if (outcome.action === 'release-drag') {
+			release(mode === 'touch' ? (toFb(p) ?? cursor.current) : cursor.current, BTN.left)
+		} else if (outcome.action === 'click') {
+			const at = outcome.target === 'cursor' ? cursor.current : outcome.target === 'start' ? toFb(st.start, false) : toFb(st.two.mid, false)
+			if (at) {
+				click(at, outcome.button)
+				haptic(outcome.haptic)
+				if (outcome.updateLastTap) st.lastTapTime = performance.now()
 			}
+		}
+		if (st.kind === 'two' && st.pointers.size === 0 && view.current.z < 1.05) {
+			// Snap back if the pinch left us just above 100%.
+			applyView({...view.current, z: 1}, true)
+		}
+		if (st.pointers.size === 0) {
+			st.dragging = false
+			st.held = false
+			st.panning = false
 			st.kind = 'none'
-		} else if (st.kind === 'two') {
-			if (st.pointers.size === 0) {
-				// Two-finger tap = right-click (three-finger tap = middle).
-				if (!st.moved && quick) {
-					const at = mode === 'mouse' ? cursor.current : (toFb(st.two.mid) ?? cursor.current)
-					click(at, st.two.maxPointers >= 3 ? BTN.middle : BTN.right)
-					haptic(10)
-				}
-				st.kind = 'none'
-				// Snap back if the pinch left us just above 100%.
-				if (view.current.z < 1.05) applyView({z: 1, x: 0, y: 0}, true)
-			}
 		}
-		if (st.pointers.size === 0) st.kind = 'none'
 	}
 
-	const onWheel = (e: React.WheelEvent) => {
-		if (state !== 'connected') return
-		const p = {x: e.clientX, y: e.clientY}
-		if (e.ctrlKey) {
-			// trackpad pinch / ctrl+wheel on desktop zooms the view
-			zoomAt(view.current.z * Math.exp(-e.deltaY / 200), p)
-			return
-		}
-		const fb = toFb(p)
-		if (fb) wheel(fb, e.deltaY > 0 ? BTN.wheelDown : BTN.wheelUp)
+	const onWheelRef = useRef<(e: WheelEvent) => void>(() => {})
+	onWheelRef.current = (e: WheelEvent) => {
+		handleConsoleWheel(e, {
+			connected: state === 'connected',
+			onZoom: (dy, p) => zoomAt(view.current.z * Math.exp(-dy / 200), p),
+			onScroll: (buttons, p) => {
+				const fb = toFb(p)
+				if (fb) for (const b of buttons) wheel(fb, b)
+			},
+		})
 	}
+	useEffect(() => {
+		const el = touchRef.current
+		if (!el || deskUi) return
+		return bindConsoleWheel(el, (e) => onWheelRef.current(e))
+	}, [deskUi])
+
+	// Ask for the whole screen, not just what changed. A VNC server sends only the parts of the screen
+	// that change; when the remote screen's size changes (a monitor added or rescaled, a resolution
+	// change) the new area stays black until something is drawn there, and on a still desktop that can
+	// be never (half the picture black). The same after the phone was away and comes back. A full
+	// update request is part of the protocol and cheap: one picture.
+	useEffect(() => {
+		if (state !== 'connected' || directGpu) return
+		let last = ''
+		const full = (force = false) => {
+			const r = rfbRef.current as any
+			const w = r?._fbWidth
+			const h = r?._fbHeight
+			if (!r?._sock || !w || !h) return
+			const key = `${w}x${h}`
+			if (!force && key === last) return
+			const resized = last !== '' && key !== last
+			last = key
+			// The remote screen changed size: fit the new picture to this screen again (a phone kept
+			// the old fit, which showed part of the picture and black beside it).
+			if (resized || force) {
+				r._updateScale?.()
+				if (!deskUi) requestAnimationFrame(() => applyView(view.current))
+			}
+			try {
+				;(RFB as any).messages.fbUpdateRequest(r._sock, false, 0, 0, w, h)
+			} catch {
+				/* the connection is closing */
+			}
+		}
+		const first = window.setTimeout(() => full(true), 400)
+		const watch = window.setInterval(() => full(false), 1000)
+		const onVisible = () => document.visibilityState === 'visible' && full(true)
+		document.addEventListener('visibilitychange', onVisible)
+		return () => {
+			window.clearTimeout(first)
+			window.clearInterval(watch)
+			document.removeEventListener('visibilitychange', onVisible)
+		}
+	}, [state, directGpu])
+
+	// Touches on the screen keep the on-screen keyboard: the browser's own focus change on a tap is
+	// cancelled, and if the keyboard still went away during a touch, the end of that touch (a user
+	// gesture, so phones allow it) brings it back. Buttons and fields keep their normal behaviour.
+	useEffect(() => {
+		const root = rootRef.current
+		if (!root) return
+		const isControl = (t: EventTarget | null) => t instanceof Element && !!t.closest('button, a, input, textarea, select, [role="button"], [contenteditable="true"]')
+		const start = (e: TouchEvent) => {
+			touching.current = true
+			touchLostKeyboard.current = false
+			if (keyboardStays.current && document.activeElement === input.current && !isControl(e.target)) e.preventDefault()
+		}
+		const end = (e: TouchEvent) => {
+			if (e.touches.length) return
+			touching.current = false
+			if (keyboardStays.current && touchLostKeyboard.current && !isControl(e.target)) input.current?.focus({preventScroll: true})
+			touchLostKeyboard.current = false
+		}
+		root.addEventListener('touchstart', start, {passive: false})
+		root.addEventListener('touchend', end)
+		root.addEventListener('touchcancel', end)
+		return () => {
+			root.removeEventListener('touchstart', start)
+			root.removeEventListener('touchend', end)
+			root.removeEventListener('touchcancel', end)
+		}
+	}, [directGpu, state])
 
 	// ---- keyboard ----------------------------------------------------------------
 	const tapKey = (keysym: number) => {
@@ -916,7 +1277,7 @@ export function Console({machine, onClose, embedded}: {machine: Machine; onClose
 	const typeChar = (ch: string) => {
 		const rfb = rfbRef.current
 		if (!rfb) return
-		if (mods.Ctrl || mods.Alt || mods.Super) return tapKey(ch === '\n' ? KEY.Enter : keysymOf(ch.toLowerCase()))
+		if (mods.Ctrl || mods.Alt || mods.Super) return tapKey(ch === '\n' ? KEY.Enter : keysymOfChar(ch.toLowerCase()))
 		if (mods.Shift) {
 			rfb.sendKey(KEY.Shift, null, true)
 			sendChar(rfb, ch, true)
@@ -925,10 +1286,21 @@ export function Console({machine, onClose, embedded}: {machine: Machine; onClose
 		}
 		sendChar(rfb, ch)
 	}
-	const onInput = (e: React.FormEvent<HTMLTextAreaElement>) => {
-		const el = e.currentTarget
-		for (const ch of el.value) typeChar(ch)
+	const sendTyped = (el: HTMLTextAreaElement) => {
+		const value = el.value
 		el.value = ''
+		if (value.length > 1) typeText(value)
+		else if (value) typeChar(value)
+	}
+	const onInput = (e: React.FormEvent<HTMLTextAreaElement>) => {
+		const native = e.nativeEvent
+		const isComposing = native instanceof InputEvent && native.isComposing
+		if (!shouldSendConsoleInput({type: 'input', isComposing})) return
+		sendTyped(e.currentTarget)
+	}
+	const onCompositionEnd = (e: React.CompositionEvent<HTMLTextAreaElement>) => {
+		if (!shouldSendConsoleInput({type: 'compositionend', isComposing: true})) return
+		sendTyped(e.currentTarget)
 	}
 	// Paste: on HTTPS a tap reads the clipboard; anywhere, press and hold the key for iOS's own Paste.
 	const pasteText = (text: string) => {
@@ -957,8 +1329,13 @@ export function Console({machine, onClose, embedded}: {machine: Machine; onClose
 		haptic(8)
 		const el = input.current
 		if (!el) return
-		if (document.activeElement === el) el.blur()
-		else el.focus({preventScroll: true})
+		if (document.activeElement === el) {
+			keyboardStays.current = false
+			el.blur()
+		} else {
+			keyboardStays.current = true
+			el.focus({preventScroll: true})
+		}
 	}
 
 	const keys: {label: string; sym?: number; mod?: keyof typeof mods}[] = [
@@ -977,13 +1354,38 @@ export function Console({machine, onClose, embedded}: {machine: Machine; onClose
 	]
 	const live = state === 'connected'
 
+	if (directGpu) {
+		return createPortal(
+			<div
+				ref={rootRef}
+				className={`console${embedded ? ' embedded' : ''}${deskUi ? ' desk-ui' : ''}${fullscreen ? ' fs' : ''}`}
+				role="dialog"
+				aria-modal={!embedded}
+				aria-label={`${machine.name} direct GPU desktop`}
+			>
+				<HyprlandView
+					mode={hyprTarget.mode}
+					address={hyprTarget.address}
+					fps={60}
+					bitrate={10000}
+					title={hyprTarget.title}
+					windows={hyprWindows}
+					onSelectTarget={(next) => setHyprTarget(next)}
+					onFallbackVnc={() => switchRenderMode('vnc')}
+					onClose={embedded ? undefined : back}
+				/>
+			</div>,
+			portalRoot,
+		)
+	}
+
 	return createPortal(
 		<div
 			ref={rootRef}
 			className={`console${embedded ? ' embedded' : ''}${deskUi ? ' desk-ui' : ''}${fullscreen ? ' fs' : ''}${barShown ? ' bar-shown' : ''}`}
 			role="dialog"
 			aria-modal={!embedded}
-			aria-label={`${machine.name} console`}
+			aria-label={`${machine.name} desktop`}
 >
 			{fullscreen && !barShown && <div className="ct-hotzone" onMouseEnter={() => setBarShown(true)} aria-hidden="true" />}
 			{deskUi ? (
@@ -994,27 +1396,33 @@ export function Console({machine, onClose, embedded}: {machine: Machine; onClose
 						{res && <span className="ct-res">{res.w} × {res.h}</span>}
 					</span>
 					<div className="ct-scale" role="radiogroup" aria-label="Display">
-						<button role="radio" aria-checked={scale === 'fit'} className={scale === 'fit' ? 'on' : ''} onClick={() => setScale('fit')} title="Scale the picture to fit the window">
+						<button role="radio" aria-checked={shownScale === 'fit'} className={shownScale === 'fit' ? 'on' : ''} onClick={() => setScale('fit')} title="Scale the picture to fit the window">
 							<Icon name="win-max" size={14} />
 							Fit
 						</button>
-						<button role="radio" aria-checked={scale === 'actual'} className={scale === 'actual' ? 'on' : ''} onClick={() => setScale('actual')} title="Show every pixel at 100%, with scrollbars">
+						<button role="radio" aria-checked={shownScale === 'actual'} className={shownScale === 'actual' ? 'on' : ''} onClick={() => setScale('actual')} title="Show every pixel at 100%, with scrollbars">
 							100%
 						</button>
 						<button
 							role="radio"
-							aria-checked={scale === 'remote'}
-							className={scale === 'remote' ? 'on' : ''}
+							aria-checked={shownScale === 'remote'}
+							className={shownScale === 'remote' ? 'on' : ''}
 							onClick={() => setScale('remote')}
 							disabled={live && !canResize}
-							title={canResize || !live ? 'Change the machine’s resolution to match this window' : 'This machine doesn’t support changing its resolution remotely'}
+							title={canResize !== false || !live ? 'Change the machine’s resolution to match this window' : 'This machine doesn’t support changing its resolution remotely'}
 						>
 							Resize VM
 						</button>
 					</div>
 					<span className="ct-spacer" />
+					{canDirectGpu && (
+						<button className="ct-btn" onClick={() => switchRenderMode('direct')} title="Render Hyprland directly with GPU WebCodecs instead of VNC">
+							<Icon name="gpu" size={16} />
+							Direct GPU
+						</button>
+					)}
 					<div className="ct-menu-wrap">
-						<button className={`ct-btn${keysOpen ? ' on' : ''}`} disabled={!live} onClick={() => setKeysOpen((o) => !o)} aria-expanded={keysOpen}>
+						<button className={`ct-btn${keysOpen ? ' on' : ''}`} disabled={!live} onClick={() => setKeysOpen((o) => !o)} aria-haspopup="menu" aria-expanded={keysOpen}>
 							<Icon name="keyboard" size={17} />
 							Keys
 							<Icon name="chevron-down" size={13} />
@@ -1022,7 +1430,7 @@ export function Console({machine, onClose, embedded}: {machine: Machine; onClose
 						{keysOpen && (
 							<>
 								<button className="ct-scrim" aria-label="Close" onClick={() => setKeysOpen(false)} />
-								<div className="ct-menu" role="menu">
+								<div ref={keysMenuRef} className="ct-menu" role="menu" aria-label="Keys" tabIndex={-1}>
 									{machine.id === 'desktop' &&
 										OMARCHY_COMBOS.map((k) => (
 											<button
@@ -1078,6 +1486,9 @@ export function Console({machine, onClose, embedded}: {machine: Machine; onClose
 					<button className="ct-btn icon" disabled={!live} onClick={screenshot} title="Save a screenshot" aria-label="Save a screenshot">
 						<Icon name="image" size={17} />
 					</button>
+					<button className="ct-btn icon" disabled={!live} onClick={clipShot} title="Save a screenshot to the clip book" aria-label="Save a screenshot to the clip book">
+						<Icon name="clipboard" size={17} />
+					</button>
 					<button className="ct-btn icon" onClick={toggleFullscreen} title={fullscreen ? 'Exit full screen' : 'Full screen'} aria-label={fullscreen ? 'Exit full screen' : 'Full screen'}>
 						<Icon name={fullscreen ? 'fullscreen-exit' : 'fullscreen'} size={17} />
 					</button>
@@ -1124,7 +1535,7 @@ export function Console({machine, onClose, embedded}: {machine: Machine; onClose
 				</header>
 			) : (
 			<header className="console-bar">
-				<button className="round-btn" aria-label="Close console" onClick={onClose}>
+				<button className="round-btn" aria-label="Close desktop" onClick={back}>
 					<Icon name="back" size={20} />
 				</button>
 				<div className="console-title">
@@ -1152,12 +1563,12 @@ export function Console({machine, onClose, embedded}: {machine: Machine; onClose
 				</div>
 				{/* Every touch lands here, above noVNC's canvas, so our gestures decide what the VM gets. */}
 				{!deskUi && <div
+					ref={touchRef}
 					className="console-touch"
 					onPointerDown={onPointerDown}
 					onPointerMove={onPointerMove}
-					onPointerUp={onPointerUp}
-					onPointerCancel={onPointerUp}
-					onWheel={onWheel}
+					onPointerUp={(e) => endPointer(e, false)}
+					onPointerCancel={(e) => endPointer(e, true)}
 					onContextMenu={(e) => e.preventDefault()}
 				/>}
 				<div ref={cursorRef} className={`console-cursor${mode === 'mouse' && !deskUi ? '' : ' hidden'}`} aria-hidden="true">
@@ -1167,7 +1578,13 @@ export function Console({machine, onClose, embedded}: {machine: Machine; onClose
 				</div>
 
 				{live && !deskUi && (
-					<div className="console-float right" onPointerDown={(e) => e.stopPropagation()}>
+					<div
+						className="console-float right"
+						onPointerDown={(e) => {
+							e.stopPropagation()
+							if (keyboardOpen) e.preventDefault()
+						}}
+					>
 						<button aria-label="Zoom out" onClick={() => zoomBy(1 / 1.5)} disabled={zoomLabel <= 100}>
 							<Icon name="zoom-out" size={18} />
 						</button>
@@ -1176,6 +1593,9 @@ export function Console({machine, onClose, embedded}: {machine: Machine; onClose
 						</button>
 						<button aria-label="Zoom in" onClick={() => zoomBy(1.5)} disabled={zoomLabel >= MAX_ZOOM * 100}>
 							<Icon name="zoom-in" size={18} />
+						</button>
+						<button aria-label="Fill the screen" title="Fill the screen" onClick={fill}>
+							<Icon name="fullscreen" size={18} />
 						</button>
 					</div>
 				)}
@@ -1194,7 +1614,7 @@ export function Console({machine, onClose, embedded}: {machine: Machine; onClose
 							) : (
 							<>
 								<Icon name={state === 'superseded' ? 'machine' : 'alert'} size={34} />
-								<b>{state === 'superseded' ? 'This console was opened somewhere else' : 'Console unavailable'}</b>
+								<b>{state === 'superseded' ? 'This desktop was opened somewhere else' : 'Desktop unavailable'}</b>
 								{state === 'error' && <span>{message}</span>}
 								<button
 									className="btn primary small"
@@ -1288,9 +1708,13 @@ export function Console({machine, onClose, embedded}: {machine: Machine; onClose
 				autoComplete="off"
 				spellCheck={false}
 				onInput={onInput}
+				onCompositionEnd={onCompositionEnd}
 				onKeyDown={onKeyDown}
 				onFocus={() => setKeyboardOpen(true)}
-				onBlur={() => setKeyboardOpen(false)}
+				onBlur={() => {
+					if (touching.current && keyboardStays.current) touchLostKeyboard.current = true
+					setKeyboardOpen(false)
+				}}
 			/>}
 		</div>,
 		portalRoot,
@@ -1298,7 +1722,7 @@ export function Console({machine, onClose, embedded}: {machine: Machine; onClose
 }
 
 // The Omarchy desktop is at its sign-in screen (or locked out after wrong passwords): sign the
-// owner in from here, once, after confirming their Omarchy Server password.
+// owner in from here, once, after confirming their My Own Data Center password.
 function DesktopSignIn({onDone}: {onDone: () => void}) {
 	const [password, setPassword] = useState('')
 	const [busy, setBusy] = useState(false)
@@ -1324,10 +1748,10 @@ function DesktopSignIn({onDone}: {onDone: () => void}) {
 			<span>
 				The Omarchy desktop is at its sign-in screen, so there’s nothing to show yet. Sign it in from here: this also clears a lockout after too many wrong passwords.
 			</span>
-			<input type="password" autoComplete="current-password" placeholder="Your Omarchy Server password" value={password} onChange={(e) => setPassword(e.target.value)} aria-label="Your Omarchy Server password" />
-			{error && <span className="desk-signin-error">{error}</span>}
+			<input type="password" autoComplete="current-password" placeholder="Your password" value={password} onChange={(e) => setPassword(e.target.value)} aria-label="Your password" />
+			{error && <span className="desk-signin-error" role="alert">{error}</span>}
 			<button className="btn primary small" disabled={busy || !password}>
-				{busy ? <span className="spinner" /> : 'Sign in to the desktop'}
+				{busy ? <><span className="spinner" /><span className="sr-only">Sign in to the desktop</span></> : 'Sign in to the desktop'}
 			</button>
 		</form>
 	)

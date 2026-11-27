@@ -1,6 +1,6 @@
 ## What this changes
 
-<!-- What someone using Omarchy Server will notice, in a sentence or two. -->
+<!-- What someone using My Own Data Center will notice, in a sentence or two. -->
 
 ## How you tested it
 

@@ -11,6 +11,7 @@ import {execFile} from 'node:child_process'
 import {randomBytes} from 'node:crypto'
 import {readFile, readdir, rename, rm, mkdir} from 'node:fs/promises'
 import {join} from 'node:path'
+import {stoppedMessage} from './exec-error.mjs'
 
 export const CATALOG_URLS = ['https://plugins.omarchy.org/catalog.json', 'https://raw.githubusercontent.com/omacom/omarchy-plugin-marketplace/main/site/catalog.json']
 export const SITE = 'https://plugins.omarchy.org'
@@ -20,8 +21,15 @@ const ID = /^[A-Za-z0-9][A-Za-z0-9._-]*$/
 
 const execRun = (cmd, args, opts = {}) =>
 	new Promise((resolve, reject) =>
-		execFile(cmd, args, {timeout: 120_000, maxBuffer: 8 << 20, ...opts}, (e, out, err) => (e ? reject(new Error(String(err || e.message).trim().split('\n').pop())) : resolve(String(out)))),
+		execFile(cmd, args, {timeout: 120_000, maxBuffer: 8 << 20, ...opts}, (e, out, err) => (e ? reject(new Error(stoppedMessage(cmd, e, opts.timeout ?? 120_000) ?? String(err || e.message).trim().split('\n').pop())) : resolve(String(out)))),
 	)
+
+// One page of a filtered list. limit stays capped so a response is not the whole registry.
+export function pluginPage(rows, input = {}) {
+	const offset = Math.max(0, Math.floor(Number(input?.offset) || 0))
+	const limit = Math.min(60, Math.max(1, Math.floor(Number(input?.limit) || 30)))
+	return {offset, limit, slice: rows.slice(offset, offset + limit)}
+}
 
 // What the store shows from one registry entry, or null when it isn't offered here.
 export function toListing(p) {
@@ -81,7 +89,7 @@ export function createOmarchyPlugins({home, theme, run = execRun, fetchImpl = fe
 		const out = new Set()
 		for (const e of await readdir(DIR, {withFileTypes: true}).catch(() => [])) {
 			if (e.name.startsWith('.') || !(e.isDirectory() || e.isSymbolicLink())) continue
-			const m = await readFile(join(DIR, e.name, 'manifest.json'), 'utf8').then(JSON.parse, () => null)
+			const m = await readFile(join(DIR, e.name, 'manifest.json'), 'utf8').then((text) => JSON.parse(text)).catch(() => null)
 			if (m?.id) out.add(String(m.id))
 			out.add(e.name)
 		}
@@ -97,14 +105,13 @@ export function createOmarchyPlugins({home, theme, run = execRun, fetchImpl = fe
 		let rows = all.filter((p) => (!category || p.category === category) && (!q || `${p.name} ${p.description} ${p.author} ${p.tags.join(' ')}`.toLowerCase().includes(q)))
 		if (input?.installedOnly) rows = rows.filter((p) => mine.has(p.id))
 		rows = [...rows].sort((a, b) => (sort === 'new' ? b.addedAt.localeCompare(a.addedAt) : b.stars - a.stars) || a.name.localeCompare(b.name))
-		const offset = Math.max(0, Math.floor(Number(input?.offset) || 0))
-		const limit = Math.min(60, Math.max(1, Math.floor(Number(input?.limit) || 30)))
+		const page = pluginPage(rows, input)
 		const categories = [...new Set(all.map((p) => p.category))].sort()
 		return {
 			total: rows.length,
 			categories,
 			available: !!(await theme.findCommand('omarchy-plugin-validate')),
-			plugins: rows.slice(offset, offset + limit).map((p) => ({...p, installed: mine.has(p.id), job: jobs.get(p.id) ?? null})),
+			plugins: page.slice.map((p) => ({...p, installed: mine.has(p.id), job: jobs.get(p.id) ?? null})),
 		}
 	}
 

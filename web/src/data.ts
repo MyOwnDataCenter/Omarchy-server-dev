@@ -2,19 +2,19 @@ import {createContext, useContext} from 'react'
 import {useMutation, useQuery, useQueryClient} from '@tanstack/react-query'
 
 import {
+	ApiError,
 	mutate,
 	query,
 	type Bootstrap,
-	type CpuUsage,
-	type DiskUsage,
-	type Temperature,
 	type InstallReview,
 	type Machine,
-	type MemoryUsage,
 	type Registry,
+	type SystemStats,
 	type User,
 	type UserApp,
 } from './api'
+import {OFFLINE_ACTION_MESSAGE, isBrowserOnline} from './connection'
+import {applyOptimisticAppState, rollbackOptimisticAppState} from './optimisticApps'
 import {isAppBusy, useToast} from './ui'
 
 export const BootstrapContext = createContext<Bootstrap | null>(null)
@@ -34,13 +34,18 @@ export const useUser = () => useQuery({queryKey: ['user.get'], queryFn: () => qu
 export const useRecent = () =>
 	useQuery({queryKey: ['apps.recentlyOpened'], queryFn: () => query<string[]>('apps.recentlyOpened'), staleTime: 30_000, retry: false})
 
-const live = (key: string, ms = 3000) => ({queryKey: [key], queryFn: () => query(key), refetchInterval: ms})
-export const useCpu = () => useQuery({...live('system.cpuUsage'), queryFn: () => query<CpuUsage>('system.cpuUsage')})
-export const useMemory = () => useQuery({...live('system.memoryUsage'), queryFn: () => query<MemoryUsage>('system.memoryUsage')})
-export const useDisk = () => useQuery({...live('system.diskUsage', 30_000), queryFn: () => query<DiskUsage>('system.diskUsage')})
-export const useTemp = () =>
-	useQuery({...live('system.cpuTemperature', 10_000), queryFn: () => query<Temperature>('system.cpuTemperature')})
-export const useUptime = () => useQuery({...live('system.uptime', 60_000), queryFn: () => query<number>('system.uptime')})
+const statsQuery = {
+	queryKey: ['system.stats'] as const,
+	queryFn: () => query<SystemStats>('system.stats'),
+	refetchInterval: 3000,
+}
+export const useCpu = () => useQuery({...statsQuery, select: (s) => s.cpu})
+export const useMemory = () => useQuery({...statsQuery, select: (s) => s.memory})
+export const useDisk = () => useQuery({...statsQuery, select: (s) => s.disk})
+export const useTemp = () => useQuery({...statsQuery, select: (s) => s.temp})
+export const useGpus = () => useQuery({...statsQuery, select: (s) => s.gpu})
+export const useBattery = () => useQuery({...statsQuery, select: (s) => s.battery})
+export const useUptime = () => useQuery({...statsQuery, select: (s) => s.uptime})
 export const useNotifications = () =>
 	useQuery({queryKey: ['notifications.get'], queryFn: () => query<string[]>('notifications.get'), refetchInterval: 30_000})
 export const useMachines = () =>
@@ -66,15 +71,12 @@ export function useAction() {
 	const qc = useQueryClient()
 	const toast = useToast()
 	return useMutation({
-		mutationFn: async (a: {path: string; input?: unknown; optimistic?: {appId: string; state: UserApp['state']}; adding?: Pick<UserApp, 'id' | 'name' | 'icon'>[]; done?: string}) =>
-			mutate(a.path, a.input),
-		onMutate: (a) => {
-			if (a.optimistic) {
-				qc.setQueryData<UserApp[]>(['apps.list'], (apps) =>
-					apps?.map((app) => (app.id === a.optimistic!.appId ? {...app, state: a.optimistic!.state} : app)),
-				)
-			}
+		networkMode: 'always',
+		mutationFn: async (a: {path: string; input?: unknown; optimistic?: {appId: string; state: UserApp['state']}; adding?: Pick<UserApp, 'id' | 'name' | 'icon'>[]; done?: string}) => {
+			if (!isBrowserOnline()) throw new ApiError(OFFLINE_ACTION_MESSAGE, 'OFFLINE', 0)
+			return mutate(a.path, a.input)
 		},
+		onMutate: (a) => (a.optimistic ? applyOptimisticAppState(qc, a.optimistic) : undefined),
 		onSuccess: (_, a) => {
 			// A new install shows (installing) right away, everywhere the app list is shown, even
 			// before the list is fetched again.
@@ -85,7 +87,10 @@ export function useAction() {
 				])
 			if (a.done) toast(a.done)
 		},
-		onError: (error: Error) => toast(error.message, true),
+		onError: (error: Error, _a, ctx) => {
+			rollbackOptimisticAppState(qc, ctx)
+			toast(error.message, true)
+		},
 		onSettled: (_, __, a) => {
 			const domain = a.path.split('.')[0]
 			if (domain === 'apps') {
@@ -93,6 +98,7 @@ export function useAction() {
 				qc.invalidateQueries({queryKey: ['apps.updates']})
 			}
 			if (domain === 'machines') qc.invalidateQueries({queryKey: ['machines.list']})
+			if (domain === 'usb') qc.invalidateQueries({queryKey: ['usb.list']})
 			if (domain === 'notifications') qc.invalidateQueries({queryKey: ['notifications.get']})
 		},
 	})

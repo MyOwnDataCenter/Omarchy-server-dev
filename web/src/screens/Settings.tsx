@@ -1,15 +1,24 @@
-// Full settings, backed by the same omarchyd calls Omarchy Server uses.
-import {useContext, useEffect, useState, type CSSProperties, type FormEvent, type ReactNode} from 'react'
+// Full settings, backed by the same omarchyd calls My Own Data Center uses.
+import {useContext, useEffect, useRef, useState, type CSSProperties, type FormEvent, type ReactNode} from 'react'
 import {useMutation, useQuery, useQueryClient} from '@tanstack/react-query'
 
-import {logout, mutate, query, type ActiveSession} from '../api'
+import {mutate, query, type ActiveSession, type AssistantApi, type AssistantCheck, type AssistantEffort, type AssistantKey, type AssistantModel, type AssistantProvider, type AssistantVerify} from '../api'
+import {patchDeskConfig} from '../desktop/config'
 import {useBootstrap, useUser} from '../data'
+import {checkLiveText} from '../focus'
 import {Icon, type IconName} from '../icons'
-import {InWindow, Segmented, Sheet, SheetHeader, haptic, initials, setLayoutPref, useConfirm, useLayout, useOmarchyThemes, useToast, type LayoutPref, type Prefs} from '../ui'
-import {Appearance} from './More'
-import {OmarchyThemes} from '../OmarchyThemes'
+import {Card, Field, Group, InWindow, Row, Segmented, Sheet, SheetHeader, Switch, VersionTag, haptic, initials, scrollPhoneToTop, useConfirm, useToast, type Prefs} from '../ui'
+import {agoText} from '../plural'
+import {Personalize} from '../desktop/Personalize'
+import {AssistantAppearanceSettings} from '../character/widgets'
 import {StoragePage} from './Storage'
+import {OmarchyThemes} from '../OmarchyThemes'
+import {UnraidPage} from '../unraid'
+import {OidcSheet} from './Oidc'
 import {WhatsNewSheet, allReleases} from '../WhatsNew'
+import {clearTotpSetupQuery} from './twoFactorQuery'
+import {MIN_PASSWORD_LENGTH, PASSWORD_SHEET_SUBTITLE, browserName, updateFinished, updateStartFailure} from './settingsHelpers'
+import {safeSession} from '../safeStorage'
 
 
 function useQ<T>(path: string, input?: unknown, opts: {enabled?: boolean; refetchInterval?: number | false; staleTime?: number; refetchOnWindowFocus?: boolean; refetchOnReconnect?: boolean} = {}) {
@@ -30,72 +39,6 @@ function useSave() {
 			for (const key of a.refresh ?? []) qc.invalidateQueries({queryKey: [key]})
 		},
 	})
-}
-
-function Row({icon, color, label, value, onClick, href, trailing}: {icon: IconName; color: string; label: string; value?: ReactNode; onClick?: () => void; href?: string; trailing?: ReactNode}) {
-	const inner = (
-		<>
-			<span className="row-ico" style={{'--c': color} as CSSProperties}>
-				<Icon name={icon} size={19} />
-			</span>
-			<span className="main">
-				<b style={{fontWeight: 550}}>{label}</b>
-			</span>
-			{value !== undefined && <span className="trail">{value}</span>}
-			{trailing ?? (onClick || href ? <Icon name="chevron" size={18} className="chev" /> : null)}
-		</>
-	)
-	if (href)
-		return (
-			<a className="row" href={href} target="_blank" rel="noopener noreferrer" style={{minHeight: 56}}>
-				{inner}
-			</a>
-		)
-	if (onClick)
-		return (
-			<button className="row" onClick={onClick} style={{minHeight: 56}}>
-				{inner}
-			</button>
-		)
-	return (
-		<div className="row static" style={{minHeight: 56}}>
-			{inner}
-		</div>
-	)
-}
-
-export function Switch({on, onChange, label, disabled}: {on: boolean; onChange: (v: boolean) => void; label: string; disabled?: boolean}) {
-	return (
-		<button
-			className="switch"
-			role="switch"
-			aria-checked={on}
-			aria-label={label}
-			disabled={disabled}
-			onClick={() => {
-				haptic(6)
-				onChange(!on)
-			}}
-		/>
-	)
-}
-
-function Group({title, children, footer}: {title: string; children: ReactNode; footer?: ReactNode}) {
-	return (
-		<section>
-			<div className="section-head">
-				<h2>{title}</h2>
-			</div>
-			<div className="glass group" style={{'--inset': '62px'} as CSSProperties}>
-				{children}
-			</div>
-			{footer && (
-				<p className="footer-note" style={{textAlign: 'left', margin: '10px 6px 0'}}>
-					{footer}
-				</p>
-			)}
-		</section>
-	)
 }
 
 function FormSheet({open, title, subtitle, onClose, onSubmit, busy, submit, danger, children, disabled}: {
@@ -128,49 +71,47 @@ function FormSheet({open, title, subtitle, onClose, onSubmit, busy, submit, dang
 	)
 }
 
-const ago = (t: number) => {
-	const s = Math.max(0, (Date.now() - t) / 1000)
-	if (s < 90) return 'just now'
-	if (s < 3600) return `${Math.round(s / 60)} min ago`
-	if (s < 86400) return `${Math.round(s / 3600)} h ago`
-	return `${Math.round(s / 86400)} days ago`
-}
+const ago = (t: number) => agoText((Date.now() - t) / 1000)
 function describeSession(s: ActiveSession) {
 	if (s.client.type === 'native') {
-		const name = s.client.id === 'omarchy-server' || !s.client.id ? 'Omarchy Server' : s.client.id
+		const name = s.client.id === 'omarchy-server' || !s.client.id ? 'MODC' : s.client.id
 		return {icon: 'phone' as IconName, name, detail: [s.client.platform, s.client.appVersion && `v${s.client.appVersion}`].filter(Boolean).join(' · ')}
 	}
 	const ua = s.client.userAgent ?? ''
-	const browser = /Edg\//.test(ua) ? 'Edge' : /Firefox\//.test(ua) ? 'Firefox' : /Chrome\//.test(ua) ? 'Chrome' : /Safari\//.test(ua) ? 'Safari' : 'Browser'
+	const browser = browserName(ua)
 	const os = /iPhone|iPad/.test(ua) ? 'iOS' : /Android/.test(ua) ? 'Android' : /Windows/.test(ua) ? 'Windows' : /Mac OS/.test(ua) ? 'macOS' : /Linux/.test(ua) ? 'Linux' : ''
 	return {icon: 'browser' as IconName, name: `${browser}${os ? ` on ${os}` : ''}`, detail: ''}
 }
 
-type SheetId = null | 'name' | 'password' | '2fa' | 'hostname' | 'wifi' | 'logs' | 'reset'
+type SheetId = null | 'name' | 'password' | '2fa' | 'oidc'
 
 export function Settings({prefs, setPrefs, onBack, onSignedOut}: {prefs: Prefs; setPrefs: (p: Prefs) => void; onBack: () => void; onSignedOut: () => void}) {
 	const boot = useBootstrap()
 	const user = useUser()
 	const confirm = useConfirm()
 	const save = useSave()
-	const qc = useQueryClient()
 	const [sheet, setSheet] = useState<SheetId>(null)
 	const inWindow = useContext(InWindow)
-	const layout = useLayout()
-	type Page = 'main' | 'appearance' | 'storage' | 'omarchy-themes'
-	const [page, setPage] = useState<Page>(() => (sessionStorage.getItem('omarchy-server:settings-page') as Page) || 'main')
+	type Page = 'main' | 'appearance' | 'storage' | 'unraid' | 'omarchy-themes' | 'assistant'
+	const [page, setPage] = useState<Page>(() => {
+		const saved = safeSession.get('omarchy-server:settings-page')
+		return saved === 'appearance' || saved === 'storage' || saved === 'unraid' || saved === 'omarchy-themes' || saved === 'assistant' ? saved : 'main'
+	})
 	const openPage = (p: Page) => {
 		haptic(5)
-		if (p === 'main') sessionStorage.removeItem('omarchy-server:settings-page')
-		else sessionStorage.setItem('omarchy-server:settings-page', p)
+		if (p === 'main') safeSession.remove('omarchy-server:settings-page')
+		else safeSession.set('omarchy-server:settings-page', p)
 		setPage(p)
-		window.scrollTo({top: 0})
+		scrollPhoneToTop()
 	}
 	const close = () => setSheet(null)
 	const owner = user.data?.role !== 'member'
-	const omarchyTheme = useOmarchyThemes(page === 'appearance')
 
 	const twoFactor = useQ<boolean>('user.is2faEnabled')
+	const oidc = useQ<{clientCount: number}>('oidc.status', undefined, {enabled: owner})
+	// Starts after a restart or power cut with nobody signed in (headless servers).
+	const bootStart = useQ<{startsAtBoot: boolean | null; diskLock?: {encrypted: boolean; unlocksItself: boolean} | null}>('system.bootStart', undefined, {enabled: owner})
+	const diskWaits = !!bootStart.data?.diskLock?.encrypted && !bootStart.data.diskLock.unlocksItself
 	const sessions = useQ<ActiveSession[]>('user.listSessions')
 	const check = useQ<{available: boolean; version: string; name: string; releaseNotes?: string}>('system.checkUpdate', undefined, {enabled: owner})
 	const [updating, setUpdating] = useState(false)
@@ -181,23 +122,22 @@ export function Settings({prefs, setPrefs, onBack, onSignedOut}: {prefs: Prefs; 
 		enabled: owner && updating,
 		refetchInterval: updating ? 1500 : false,
 	})
-	const hostname = useQ<string>('system.getHostname', undefined, {enabled: owner})
-	const ips = useQ<string[]>('system.getIpAddresses')
-	const wifiSupported = useQ<boolean>('wifi.supported', undefined, {enabled: owner})
-	const wifi = useQ<{status: 'connected' | 'disconnected'; ssid?: string}>('wifi.connected', undefined, {enabled: owner && !!wifiSupported.data})
-
 	const startUpdate = async () => {
 		const ok = await confirm({
 			title: `Update to ${check.data?.name ?? check.data?.version}?`,
-			body: 'Omarchy Server downloads the update, then restarts. Your apps and machines stop briefly. Keep the server powered on.',
+			body: 'The update downloads, then this server restarts. Your apps and machines stop briefly. Keep the server powered on.',
 			confirm: 'Update now',
 			icon: 'update',
 		})
 		if (!ok) return
 		setUpdateError(null)
 		setUpdating(true)
-		mutate('system.update').catch(() => {
-			/* the server restarts mid-request; progress comes from updateStatus */
+		mutate('system.update').catch((e) => {
+			// A dropped connection is fine (progress comes from updateStatus); a refusal from the server is not.
+			const failure = updateStartFailure(e)
+			if (failure === null) return
+			setUpdateError(failure)
+			setUpdating(false)
 		})
 	}
 	useEffect(() => {
@@ -206,6 +146,17 @@ export function Settings({prefs, setPrefs, onBack, onSignedOut}: {prefs: Prefs; 
 			setUpdating(false)
 		}
 	}, [status.data?.error])
+	// The panel promises "this page reloads by itself": once the server has restarted and says the update is done,
+	// load the new build. `sawRunning` keeps an "Updated to X" left by an earlier update from reloading at once.
+	const sawRunning = useRef(false)
+	useEffect(() => {
+		if (!updating) {
+			sawRunning.current = false
+			return
+		}
+		if (status.data?.running) sawRunning.current = true
+		else if (updateFinished(sawRunning.current, status.data)) location.reload()
+	}, [updating, status.data])
 
 	const revoke = async (s: ActiveSession) => {
 		const d = describeSession(s)
@@ -213,23 +164,14 @@ export function Settings({prefs, setPrefs, onBack, onSignedOut}: {prefs: Prefs; 
 		save.mutate({path: 'user.revokeSession', input: {sessionId: s.id}, done: `${d.name} signed out`, refresh: ['user.listSessions']})
 	}
 	const revokeOthers = async () => {
-		if (!(await confirm({title: 'Sign out all other devices?', body: 'Every browser and app signed in to your server, except this phone, is signed out.', confirm: 'Sign out others', danger: true})))
+		if (!(await confirm({title: 'Sign out all other devices?', body: 'Every browser and app signed in to your server, except this device, is signed out.', confirm: 'Sign out others', danger: true})))
 			return
 		save.mutate({path: 'user.revokeOtherSessions', done: 'Other devices signed out', refresh: ['user.listSessions']})
 	}
-	const power = async (kind: 'restart' | 'shutdown') => {
-		const ok = await confirm({
-			title: kind === 'restart' ? 'Restart your server?' : 'Shut down your server?',
-			body: kind === 'restart' ? 'Apps and machines stop, then come back after the restart.' : 'You’ll need to turn the server back on yourself (for a VM, from its host).',
-			confirm: kind === 'restart' ? 'Restart' : 'Shut down',
-			danger: true,
-			icon: kind === 'restart' ? 'restart' : 'power',
-		})
-		if (ok) save.mutate({path: `system.${kind}`, done: kind === 'restart' ? 'Your server is restarting' : 'Your server is shutting down'})
-	}
-
-
-	if (page === 'storage') return <StoragePage onBack={() => openPage('main')} />
+	if (page === 'unraid' && owner) return <UnraidPage onBack={() => openPage('main')} />
+	if (page === 'assistant') return <AssistantPage onBack={() => openPage('main')} />
+	// Drives, pools, drive health and sleep on the host server (also under Machines › the server).
+	if (page === 'storage' && owner) return <StoragePage onBack={() => openPage('main')} target="host" />
 	if (page === 'omarchy-themes')
 		return (
 			<div className="stagger">
@@ -239,7 +181,13 @@ export function Settings({prefs, setPrefs, onBack, onSignedOut}: {prefs: Prefs; 
 					</button>
 					<h1 className="title">Themes</h1>
 				</div>
-				<OmarchyThemes owner={owner} />
+				<OmarchyThemes
+					owner={owner}
+					onSwitched={() => {
+						setPrefs({...prefs, theme: 'omarchy', pictureTheme: 'omarchy', solidColor: null})
+						patchDeskConfig({preset: null, wallpaper: 'omarchy'})
+					}}
+				/>
 			</div>
 		)
 	if (page === 'appearance')
@@ -251,39 +199,7 @@ export function Settings({prefs, setPrefs, onBack, onSignedOut}: {prefs: Prefs; 
 					</button>
 					<h1 className="title">Appearance</h1>
 				</div>
-				<Appearance prefs={prefs} setPrefs={setPrefs} wallpaper={user.data?.wallpaper} />
-				<section>
-					<div className="section-head">
-						<h2>Omarchy</h2>
-					</div>
-					<div className="glass group" style={{'--inset': '62px'} as CSSProperties}>
-						<Row icon="palette" color="var(--blue)" label="Themes" value={omarchyTheme.data?.label ?? undefined} onClick={() => openPage('omarchy-themes')} />
-					</div>
-					<p className="footer-note" style={{textAlign: 'left', margin: '10px 6px 0'}}>
-						Your Omarchy desktop’s themes. Switch the whole desktop, or get more from the Omarchy manual.
-					</p>
-				</section>
-				<section>
-					<div className="section-head">
-						<h2>Layout</h2>
-					</div>
-					<Segmented<LayoutPref>
-						label="Layout"
-						value={layout.pref}
-						options={[
-							{id: 'auto', label: 'Automatic'},
-							{id: 'desktop', label: 'Desktop'},
-							{id: 'phone', label: 'Phone'},
-						]}
-						onChange={(v) => {
-							haptic(6)
-							setLayoutPref(v)
-						}}
-					/>
-					<p className="footer-note" style={{textAlign: 'left', margin: '10px 6px 0'}}>
-						Desktop gives you windows, a dock and Activities, like Ubuntu. Automatic uses it on wide screens with a mouse or trackpad. Saved on this device only.
-					</p>
-				</section>
+				<Personalize embedded prefs={prefs} setPrefs={setPrefs} onOpenThemes={() => openPage('omarchy-themes')} />
 			</div>
 		)
 
@@ -315,6 +231,7 @@ export function Settings({prefs, setPrefs, onBack, onSignedOut}: {prefs: Prefs; 
 					<Row icon="user" color="var(--blue)" label="Name" value={user.data?.name} onClick={() => setSheet('name')} />
 					<Row icon="key" color="#8e8e93" label="Password" onClick={() => setSheet('password')} />
 					<Row icon="shield" color="var(--green)" label="Two-factor authentication" value={twoFactor.data === undefined ? '' : twoFactor.data ? 'On' : 'Off'} onClick={() => setSheet('2fa')} />
+					{owner && <Row icon="link" color="var(--blue)" label="Sign-in for apps" value={oidc.data ? `${oidc.data.clientCount} ${oidc.data.clientCount === 1 ? 'app' : 'apps'}` : ''} onClick={() => setSheet('oidc')} />}
 				</div>
 			</div>
 
@@ -322,7 +239,16 @@ export function Settings({prefs, setPrefs, onBack, onSignedOut}: {prefs: Prefs; 
 				<div className="section-head" style={{marginTop: 18}} />
 				<div className="glass group" style={{'--inset': '62px'} as CSSProperties}>
 					<Row icon="palette" color="var(--pink, #ec4899)" label="Appearance" onClick={() => openPage('appearance')} />
-					{owner && <Row icon="disk" color="var(--teal)" label="Storage" onClick={() => openPage('storage')} />}
+					<Row icon="info" color="var(--blue)" label="Restore tutorials" sub="Show the notes you have dismissed" onClick={() => setPrefs({...prefs, dismissedTutorials: []})} />
+					{owner && <Row icon="disk" color="var(--teal)" label="Storage" sub="Drives, pools, drive health and sleep" onClick={() => openPage('storage')} />}
+					{owner && <Row icon="move" color="var(--orange, #f59e0b)" label="Move from Unraid" onClick={() => openPage('unraid')} />}
+				</div>
+			</div>
+
+			<div>
+				<div className="section-head" style={{marginTop: 18}} />
+				<div className="glass group" style={{'--inset': '62px'} as CSSProperties}>
+					<Row icon="sparkle" color="var(--accent)" label="Assistant" onClick={() => openPage('assistant')} />
 				</div>
 			</div>
 
@@ -336,7 +262,7 @@ export function Settings({prefs, setPrefs, onBack, onSignedOut}: {prefs: Prefs; 
 							</span>
 							<span className="main">
 								<b style={{fontWeight: 550}}>{d.name}</b>
-								<span>{s.current ? 'This phone' : `Active ${ago(s.lastSeenAt)}`}{d.detail ? ` · ${d.detail}` : ''}</span>
+								<span>{s.current ? 'This device' : `Active ${ago(s.lastSeenAt)}`}{d.detail ? ` · ${d.detail}` : ''}</span>
 							</span>
 							{!s.current && (
 								<button className="btn get" style={{color: 'var(--red)'}} onClick={() => revoke(s)}>
@@ -352,9 +278,42 @@ export function Settings({prefs, setPrefs, onBack, onSignedOut}: {prefs: Prefs; 
 
 			{owner && (
 				<Group title="Software update">
-					<Row icon="sparkle" color="var(--pink)" label="What’s new" value={boot.touch.version} onClick={() => setNotes(true)} />
+					<Row icon="sparkle" color="var(--pink)" label="What’s new" value={<VersionTag version={boot.touch.version} info={boot.server} />} onClick={() => setNotes(true)} />
 					{notes && <WhatsNewSheet releases={allReleases(boot.touch.version)} version={boot.touch.version} onClose={() => setNotes(false)} />}
-					<Row icon="server" color="var(--blue)" label="Omarchy Server" value={boot.server?.version} />
+					<Row icon="server" color="var(--blue)" label="MODC" value={<VersionTag version={boot.server?.version} info={boot.server} />} />
+					{diskWaits && (
+						<div className="row static update-error" role="alert">
+							<span className="row-ico" style={{'--c': 'var(--orange, var(--peach))'} as CSSProperties}>
+								<Icon name="key" size={19} />
+							</span>
+							<span className="main">
+								<b style={{fontWeight: 600}}>Waits for the disk password after a restart</b>
+								<span>
+									This computer’s disk is encrypted. After a restart or power cut it stops at the disk password screen, before this server or remote access can start, so someone has to type it at the computer. To have it start by itself, set the disk to unlock with the computer’s TPM chip (it then unlocks only on this computer, as long as its startup isn’t changed).
+								</span>
+							</span>
+						</div>
+					)}
+					{bootStart.data?.startsAtBoot === false ? (
+						<div className="row static update-error" role="alert">
+							<span className="row-ico" style={{'--c': 'var(--orange, var(--peach))'} as CSSProperties}>
+								<Icon name="power" size={19} />
+							</span>
+							<span className="main">
+								<b style={{fontWeight: 600}}>Doesn’t start after a restart</b>
+								<span>After a restart or power cut, this server stays off until someone signs in on it. Turn this on for a server with no screen.</span>
+							</span>
+							<button
+								className="btn small"
+								disabled={save.isPending}
+								onClick={() => save.mutate({path: 'system.enableBootStart', done: 'This server now starts after a restart', refresh: ['system.bootStart']})}
+							>
+								Turn on
+							</button>
+						</div>
+					) : bootStart.data?.startsAtBoot === true ? (
+						<Row icon="power" color="var(--green)" label="Starts after a restart" value="On" />
+					) : null}
 					{updateError && !updating && (
 						<div className="row static update-error" role="alert">
 							<span className="row-ico" style={{'--c': 'var(--red)'} as CSSProperties}>
@@ -378,7 +337,7 @@ export function Settings({prefs, setPrefs, onBack, onSignedOut}: {prefs: Prefs; 
 							<span className="progress">
 								<i style={{width: `${status.data?.progress ?? 2}%`}} />
 							</span>
-							<span className="muted" style={{fontSize: 12.5}}>Omarchy Server restarts when this finishes, and this page reloads by itself.</span>
+							<span className="muted" style={{fontSize: 12.5}}>This server restarts when this finishes, and this page reloads by itself.</span>
 						</div>
 					) : check.data?.available ? (
 						<>
@@ -417,19 +376,11 @@ export function Settings({prefs, setPrefs, onBack, onSignedOut}: {prefs: Prefs; 
 				</Group>
 			)}
 
-			{owner && (
-				<Group title="Network & privacy">
-					<Row icon="network" color="var(--teal)" label="Device name" value={hostname.data ? `${hostname.data}.local` : ''} onClick={() => setSheet('hostname')} />
-					<Row icon="networking" color="var(--blue)" label="IP address" value={(ips.data ?? []).join(', ') || '–'} />
-					{wifiSupported.data && <Row icon="wifi" color="var(--blue)" label="Wi-Fi" value={wifi.data?.status === 'connected' ? wifi.data.ssid : 'Off'} onClick={() => setSheet('wifi')} />}
-				</Group>
-			)}
-
 			<Group
 				title="Secure connection"
 				footer={
 					<>
-						Apps such as Brave (HTTPS), Vaultwarden and Actual only work on https:// pages. Omarchy Server answers https:// on the same address with its own
+						Apps such as Brave (HTTPS), Vaultwarden and Actual only work on https:// pages. This server answers https:// on the same address with its own
 						certificate. To stop the browser warning, trust it on each device: iPhone and iPad, open the downloaded profile in Settings → General → VPN &
 						Device Management, then turn it on in General → About → Certificate Trust Settings. Mac: open it, then in Keychain Access set it to Always Trust.
 						Windows: open it and install it under Trusted Root Certification Authorities. Android: Settings → Security → Install a certificate → CA certificate.
@@ -443,42 +394,960 @@ export function Settings({prefs, setPrefs, onBack, onSignedOut}: {prefs: Prefs; 
 
 			{owner && <SecurityGroup />}
 
-			<Group title="More">
-				{owner && <Row icon="logfile" color="#8e8e93" label="System logs" onClick={() => setSheet('logs')} />}
-				{owner && <Row icon="restart" color="var(--peach)" label="Restart server" onClick={() => power('restart')} />}
-				{owner && <Row icon="power" color="var(--red)" label="Shut down server" onClick={() => power('shutdown')} />}
-				{owner && <Row icon="danger" color="var(--red)" label="Factory reset" onClick={() => setSheet('reset')} />}
-			</Group>
-			<p className="footer-note">Omarchy Server {boot.touch.version}</p>
+			<p className="footer-note">
+				<VersionTag prefix="MODC " version={boot.touch.version} info={boot.server} />
+			</p>
 
 			<NameSheet open={sheet === 'name'} current={user.data?.name ?? ''} onClose={close} />
-			<PasswordSheet open={sheet === 'password'} onClose={close} onSignedOut={onSignedOut} />
+			<PasswordSheet open={sheet === 'password'} onClose={close} />
 			<TwoFactorSheet open={sheet === '2fa'} enabled={!!twoFactor.data} onClose={close} />
-			<HostnameSheet open={sheet === 'hostname'} current={hostname.data ?? ''} onClose={close} />
-			{sheet === 'wifi' && <WifiSheet onClose={close} connected={wifi.data?.status === 'connected' ? wifi.data.ssid : undefined} />}
-			{sheet === 'logs' && <LogsSheet onClose={close} />}
-			<ResetSheet
-				open={sheet === 'reset'}
-				onClose={close}
-				onDone={async () => {
-					await logout().catch(() => {})
-					qc.clear()
-					onSignedOut()
-				}}
-			/>
+			{sheet === 'oidc' && <OidcSheet onClose={close} />}
 		</div>
 	)
 }
 
 // ---- sheets -------------------------------------------------------------------
 
-function Field({id, label, hint, ...input}: {id: string; label: string; hint?: string} & React.InputHTMLAttributes<HTMLInputElement>) {
+const PROVIDER_LABEL: Record<AssistantProvider, string> = {
+	spacexai: 'Grok (SpaceXAI)',
+	openai: 'OpenAI API',
+	anthropic: 'Anthropic API',
+	'openai-compatible': 'Custom endpoint',
+	chatgpt: 'ChatGPT plan',
+	hermes: 'Hermes Agent',
+}
+
+const MODEL_PLACEHOLDER: Record<AssistantProvider, string> = {
+	spacexai: 'grok-4.7',
+	openai: 'gpt-5.5',
+	anthropic: 'claude-sonnet-5-5',
+	'openai-compatible': 'llama3.2',
+	chatgpt: 'gpt-5.5',
+	hermes: 'hermes-agent',
+}
+
+// The result of a live check, under a key or in Add provider.
+function CheckLine({check, busy}: {check: Pick<AssistantCheck, 'ok' | 'message'> | null; busy?: boolean}) {
+	const style: CSSProperties = {textAlign: 'left', margin: '2px 6px 8px', display: 'flex', gap: 6, alignItems: 'center'}
+	const live = checkLiveText(check, busy)
 	return (
-		<div className="field">
-			<label htmlFor={id}>{label}</label>
-			<input id={id} {...input} />
-			{hint && <span className="hint">{hint}</span>}
+		<>
+			<div role="status" aria-live="polite" aria-atomic="true">
+				{live.status ? (
+					<p className="footer-note" style={busy ? style : {...style, color: 'var(--green)'}}>
+						{busy ? <span className="spinner" /> : <Icon name="check" size={15} />}
+						{live.status}
+					</p>
+				) : null}
+			</div>
+			<div role="alert" aria-live="assertive" aria-atomic="true">
+				{live.alert ? (
+					<p className="footer-note" style={{...style, color: 'var(--red)'}}>
+						<Icon name="alert" size={15} />
+						{live.alert}
+					</p>
+				) : null}
+			</div>
+		</>
+	)
+}
+
+// Checks the endpoint (and so the key) a moment after the details stop changing, and keeps its model list.
+function useEndpointCheck(target: Record<string, unknown> | null, model: string) {
+	const [result, setResult] = useState<AssistantVerify | null>(null)
+	const [busy, setBusy] = useState(false)
+	const sig = target ? JSON.stringify(target) : ''
+	useEffect(() => {
+		setResult(null)
+		if (!sig) return
+		let live = true
+		const t = setTimeout(async () => {
+			setBusy(true)
+			try {
+				const r = await mutate<AssistantVerify>('assistant.verifyKey', JSON.parse(sig))
+				if (live) setResult(r)
+			} catch (e) {
+				if (live) setResult({ok: false, status: 'error', message: (e as Error).message, at: Date.now(), modelFound: null, models: []})
+			} finally {
+				if (live) setBusy(false)
+			}
+		}, 600)
+		return () => {
+			live = false
+			clearTimeout(t)
+			setBusy(false)
+		}
+	}, [sig])
+	const models = result?.models ?? []
+	const wanted = model.trim()
+	let check: Pick<AssistantCheck, 'ok' | 'message'> | null = result
+	// The list is already here, so the model being typed is judged without asking the endpoint again.
+	if (result && (result.status === 'ok' || result.status === 'no-model') && wanted && models.length) {
+		check = models.some((m) => m.id === wanted)
+			? {ok: true, message: `Connected · ${models.length} model${models.length === 1 ? '' : 's'} available`}
+			: {ok: false, message: `Key works, but ${wanted} isn’t one of the ${models.length} models this endpoint serves`}
+	}
+	return {busy, check, models}
+}
+
+const API_OPTIONS: {id: AssistantApi; label: string}[] = [
+	{id: 'chat', label: 'Chat Completions'},
+	{id: 'responses', label: 'Responses'},
+]
+const EFFORT_OPTIONS: {id: AssistantEffort; label: string}[] = [
+	{id: '', label: 'Default'},
+	{id: 'low', label: 'Low'},
+	{id: 'medium', label: 'Medium'},
+	{id: 'high', label: 'High'},
+]
+
+// OpenAI and most local servers (Ollama, vLLM, LM Studio) serve both.
+const pickApi = (provider: AssistantProvider) => provider === 'openai' || provider === 'openai-compatible'
+const defaultApi = (provider: AssistantProvider): AssistantApi => (provider === 'openai' ? 'responses' : 'chat')
+
+function ModelField({id, value, onChange, models, provider}: {id: string; value: string; onChange: (v: string) => void; models: AssistantModel[]; provider: AssistantProvider}) {
+	const listId = `${id}-models`
+	return (
+		<>
+			<Field
+				id={id}
+				label="Model"
+				value={value}
+				onChange={(e) => onChange(e.target.value)}
+				placeholder={MODEL_PLACEHOLDER[provider] ?? models[0]?.id}
+				list={models.length ? listId : undefined}
+				hint={models.length ? `${models.length} models from the endpoint. Pick one or type an id.` : 'Must match a model id the endpoint serves.'}
+				autoCapitalize="off"
+				autoCorrect="off"
+				spellCheck={false}
+			/>
+			{models.length > 0 && (
+				<datalist id={listId}>
+					{models.map((m) => (
+						<option key={m.id} value={m.id}>
+							{m.name ?? ''}
+						</option>
+					))}
+				</datalist>
+			)}
+		</>
+	)
+}
+
+type HermesStatus = {
+	found: boolean
+	where?: 'local' | 'remote'
+	home: string | null
+	cli: boolean
+	apiServer: {enabled: boolean; port: number | null; local: boolean; reachable: boolean; baseUrl?: string | null}
+	connected: boolean
+	mode: 'full' | 'read'
+	engine: 'builtin' | 'hermes'
+	model: string | null
+}
+
+// Which assistant answers in chat: the built-in one, or Hermes Agent if it's already set up on this
+// server. Connecting imports that Hermes (its API server, plus this server as tools it can use).
+function AssistantEngine({owner}: {owner: boolean}) {
+	const qc = useQueryClient()
+	const toast = useToast()
+	const confirm = useConfirm()
+	const st = useQ<HermesStatus>('hermes.status', undefined, {enabled: owner})
+	const [busy, setBusy] = useState(false)
+	const [remoteForm, setRemoteForm] = useState(false)
+	const [setup, setSetup] = useState(false)
+	if (!owner || !st.data) return null
+	const h = st.data
+	const refresh = () => {
+		qc.invalidateQueries({queryKey: ['hermes.status']})
+		qc.invalidateQueries({queryKey: ['assistant.keys']})
+	}
+	const run = async (path: string, input: unknown, done: string) => {
+		setBusy(true)
+		try {
+			const r = await mutate<HermesStatus & {needsRestart?: boolean}>(path, input)
+			toast(r?.needsRestart ? `${done}. Start Hermes’ gateway (hermes gateway) so it picks up the change.` : done)
+		} catch (e) {
+			toast((e as Error).message, true)
+		} finally {
+			setBusy(false)
+			refresh()
+		}
+	}
+	const remote = h.where === 'remote'
+	const pick = async (engine: 'builtin' | 'hermes') => {
+		haptic(6)
+		if (engine === 'hermes' && !h.connected) return h.found && !remote ? run('hermes.connect', {}, 'Hermes connected') : setRemoteForm(true)
+		return run('assistant.setEngine', {engine}, engine === 'hermes' ? 'Chats now go to Hermes' : 'Chats now go to the built-in assistant')
+	}
+	const disconnect = async () => {
+		const ok = await confirm({title: 'Disconnect Hermes?', body: 'Hermes stops being able to use this server, and chats go back to the built-in assistant. Hermes itself and its settings stay.', confirm: 'Disconnect', danger: true})
+		if (ok) run('hermes.disconnect', {}, 'Hermes disconnected')
+	}
+	return (
+		<>
+			<Group title="Assistant">
+				<div className="row static" style={{minHeight: 62}}>
+					<span className="main">
+						<b style={{fontWeight: 550}}>Who answers in chat</b>
+						<span>{h.engine === 'hermes' ? 'Hermes, with its own model, memory and skills' : 'The built-in assistant, with the provider below'}</span>
+					</span>
+				</div>
+				<div className="row static">
+					<Segmented<'builtin' | 'hermes'>
+						label="Assistant"
+						value={h.engine}
+						options={[
+							{id: 'builtin', label: 'Built-in'},
+							{id: 'hermes', label: 'Hermes'},
+						]}
+						onChange={(v) => !busy && pick(v)}
+					/>
+				</div>
+			</Group>
+			{(
+				<Group
+					title="Hermes"
+					footer={
+						h.connected
+							? h.mode === 'read'
+								? 'Hermes can look at this server (apps, files, machines, storage, backups) but can’t change anything.'
+								: 'Hermes can look after this server from anywhere it runs: here, Telegram, Discord or its CLI. Changes run as you.'
+							: h.found
+								? `Found on this server at ${h.home}. Connecting turns on Hermes’ API server on this machine only and adds this server to its tools. A copy of each Hermes file is kept first.`
+								: 'No Hermes on this server. If it runs on another computer or in the cloud, connect it by its address.'
+					}
+				>
+					{!h.connected ? (
+						<>
+							{h.found && <Row icon="sparkle" color="var(--mauve)" label={busy ? 'Connecting…' : 'Connect Hermes on this server'} sub="Import it and use it as the assistant" disabled={busy} onClick={() => pick('hermes')} />}
+							<Row icon="server" color="var(--blue)" label="Hermes on another computer or in the cloud" sub="Connect by its address and API key" disabled={busy} onClick={() => setRemoteForm(true)} />
+						</>
+					) : (
+						<>
+							<Row
+								icon="sparkle"
+								color="var(--mauve)"
+								label="Hermes Agent"
+								value={h.apiServer.reachable ? (h.model ?? 'Connected') : 'Not running'}
+								sub={h.apiServer.reachable ? (remote ? h.apiServer.baseUrl ?? undefined : undefined) : remote ? `Can’t reach Hermes at ${h.apiServer.baseUrl}` : 'Start Hermes’ gateway on this server: hermes gateway'}
+							/>
+							{remote && <Row icon="settings" color="var(--blue)" label="Let Hermes use this server" sub="What to add on the Hermes machine" onClick={() => setSetup(true)} />}
+							<div className="row static">
+								<Segmented<'full' | 'read'>
+									label="What Hermes can do"
+									value={h.mode}
+									options={[
+										{id: 'full', label: 'Full control'},
+										{id: 'read', label: 'Read only'},
+									]}
+									onChange={(mode) => !busy && run('hermes.setMode', {mode}, mode === 'read' ? 'Hermes is now read only' : 'Hermes can now make changes')}
+								/>
+							</div>
+							<Row icon="signout" color="var(--red)" label="Disconnect Hermes" disabled={busy} onClick={disconnect} />
+						</>
+					)}
+				</Group>
+			)}
+			{remoteForm && <HermesRemoteForm onClose={() => setRemoteForm(false)} onDone={() => (setRemoteForm(false), refresh(), setSetup(true))} />}
+			{setup && <HermesSetup onClose={() => setSetup(false)} />}
+		</>
+	)
+}
+
+function HermesRemoteForm({onClose, onDone}: {onClose: () => void; onDone: () => void}) {
+	const toast = useToast()
+	const [baseUrl, setBaseUrl] = useState('')
+	const [apiKey, setApiKey] = useState('')
+	const [busy, setBusy] = useState(false)
+	return (
+		<FormSheet
+			open
+			title="Connect Hermes"
+			subtitle="Hermes on another computer or in the cloud"
+			onClose={onClose}
+			submit="Connect"
+			busy={busy}
+			disabled={!baseUrl.trim() || apiKey.trim().length < 8}
+			onSubmit={async () => {
+				setBusy(true)
+				try {
+					await mutate('hermes.connectRemote', {baseUrl: baseUrl.trim(), apiKey: apiKey.trim()})
+					toast('Hermes connected')
+					onDone()
+				} catch (e) {
+					toast((e as Error).message, true)
+				} finally {
+					setBusy(false)
+				}
+			}}
+		>
+			<Field
+				id="hermes-url"
+				label="Hermes address"
+				value={baseUrl}
+				onChange={(e) => setBaseUrl(e.target.value)}
+				placeholder="http://192.168.1.50:8642"
+				hint="Its API server must listen on the network: API_SERVER_HOST=0.0.0.0 (port 8642 unless changed) in that machine’s ~/.hermes/.env."
+				autoCapitalize="off"
+				autoCorrect="off"
+				spellCheck={false}
+				autoFocus
+			/>
+			<Field id="hermes-key" label="API key" type="password" value={apiKey} onChange={(e) => setApiKey(e.target.value)} hint="API_SERVER_KEY from that machine’s ~/.hermes/.env" autoComplete="off" />
+		</FormSheet>
+	)
+}
+
+// What to add on the Hermes machine so it can use this server: the address it should reach this
+// server at, and the token. The address is the one this page is open at (a cloud Hermes needs one it
+// can reach, such as a Tailscale address).
+function HermesSetup({onClose}: {onClose: () => void}) {
+	const toast = useToast()
+	const qc = useQueryClient()
+	const boot = useBootstrap()
+	const info = useQ<{token: string; path: string; name: string}>('hermes.remoteSetup')
+	const loopback = /^(localhost|127\.|\[::1\])/.test(location.hostname)
+	const origin = loopback && boot.server?.host ? `${location.protocol}//${boot.server.host}${location.port ? `:${location.port}` : ''}` : location.origin
+	const t = info.data
+	const yaml = t ? `mcp_servers:\n  ${t.name}:\n    url: "${origin}${t.path}"\n    headers:\n      Authorization: "Bearer \${MODC_MCP_TOKEN}"\n    timeout: 120` : ''
+	const envLine = t ? `MODC_MCP_TOKEN=${t.token}` : ''
+	const copy = (text: string, what: string) => navigator.clipboard?.writeText(text).then(() => toast(`${what} copied`), () => toast('Select and copy it from the box', true))
+	return (
+		<Sheet open onClose={onClose} label="Let Hermes use this server">
+			<SheetHeader title="Let Hermes use this server" subtitle="Add these on the computer Hermes runs on, then restart its gateway" onClose={onClose} />
+			<div className="hermes-setup">
+				{!t ? (
+					<span className="spinner" />
+				) : (
+					<>
+						<p className="footer-note">1. In ~/.hermes/config.yaml (merge into mcp_servers if it’s already there):</p>
+						<pre className="hermes-snippet">{yaml}</pre>
+						<button className="btn small" onClick={() => copy(yaml, 'Config')}>
+							Copy config
+						</button>
+						<p className="footer-note">2. In ~/.hermes/.env (keep it private: it lets Hermes use this server):</p>
+						<pre className="hermes-snippet">{envLine}</pre>
+						<button className="btn small" onClick={() => copy(envLine, 'Token')}>
+							Copy token line
+						</button>
+						<p className="footer-note">3. Restart Hermes’ gateway (or run /reload-mcp in a Hermes chat).</p>
+						<p className="footer-note">
+							Hermes must be able to reach {origin}. On your network that works as is. For a Hermes in the cloud, use an address it can reach, such as this server’s Tailscale address, and open this page from that address before copying.
+						</p>
+						<button
+							className="btn small"
+							onClick={async () => {
+								try {
+									await mutate('hermes.rotateToken')
+									qc.invalidateQueries({queryKey: ['hermes.remoteSetup']})
+									toast('New token made. Update it on the Hermes machine.')
+								} catch (e) {
+									toast((e as Error).message, true)
+								}
+							}}
+						>
+							Make a new token
+						</button>
+					</>
+				)}
+			</div>
+		</Sheet>
+	)
+}
+
+function AssistantPage({onBack}: {onBack: () => void}) {
+	const boot = useBootstrap()
+	const user = useUser()
+	const confirm = useConfirm()
+	const save = useSave()
+	const owner = user.data?.role !== 'member'
+	const self = user.data?.userId
+	const keys = useQ<AssistantKey[]>('assistant.keys')
+	const [add, setAdd] = useState(false)
+	const [share, setShare] = useState<AssistantKey | null>(null)
+	const [edit, setEdit] = useState<AssistantKey | null>(null)
+	const [signIn, setSignIn] = useState<{keyId?: string} | null>(null)
+	const [modelFor, setModelFor] = useState<AssistantKey | null>(null)
+	const [checking, setChecking] = useState<string | null>(null)
+	const qc = useQueryClient()
+	const toast = useToast()
+	const check = async (k: AssistantKey) => {
+		setChecking(k.id)
+		try {
+			const r = await mutate<AssistantVerify>('assistant.verifyKey', {id: k.id})
+			toast(r.message, !r.ok)
+		} catch (e) {
+			toast((e as Error).message, true)
+		} finally {
+			setChecking(null)
+			qc.invalidateQueries({queryKey: ['assistant.keys']})
+		}
+	}
+	const list = keys.data ?? []
+	const remove = async (k: AssistantKey) => {
+		const chat = k.provider === 'chatgpt'
+		const ok = await confirm({
+			title: chat ? 'Sign out of ChatGPT?' : `Delete ${k.name}?`,
+			body: chat ? 'The assistant stops using your ChatGPT plan, and access to it is revoked.' : 'The assistant won’t use this key. Anyone you shared it with loses access.',
+			confirm: chat ? 'Sign out' : 'Delete',
+			danger: true,
+			icon: 'trash',
+		})
+		if (ok) save.mutate({path: 'assistant.removeKey', input: {id: k.id}, done: `${k.name} deleted`, refresh: ['assistant.keys']})
+	}
+	return (
+		<div className="stagger">
+			<div className="page-head" style={{margin: '6px 0 14px'}}>
+				<button className="round-btn" aria-label="Back" onClick={onBack}>
+					<Icon name="back" size={20} />
+				</button>
+				<h1 className="title" style={{flex: 1}}>
+					Assistant
+				</h1>
+				<button className="btn small" onClick={() => (haptic(6), setAdd(true))}>
+					<Icon name="plus" size={16} stroke={2.4} />
+					Add
+				</button>
+			</div>
+
+			<AssistantEngine owner={owner} />
+
+			{keys.isLoading && (
+				<div className="glass group">
+					<div className="row static">
+						<span className="spinner" />
+					</div>
+				</div>
+			)}
+			{keys.error && (
+				<div className="error" role="alert">
+					<Icon name="alert" size={18} />
+					{(keys.error as Error).message}
+				</div>
+			)}
+			{keys.isSuccess && list.length === 0 && (
+				<div className="glass empty">
+					<span className="big">
+						<Icon name="sparkle" size={30} />
+					</span>
+					<b>Sign in with ChatGPT, or add an API key, to talk to the assistant.</b>
+					<button className="btn primary small" onClick={() => setAdd(true)}>
+						Add
+					</button>
+				</div>
+			)}
+			{keys.isSuccess && !list.some((k) => k.provider === 'chatgpt' && k.mine) && (
+				<div className="glass group" style={{'--inset': '62px', marginBottom: 14} as CSSProperties}>
+					<Row icon="sparkle" color="var(--green)" label="Sign in with ChatGPT" sub="Use your ChatGPT Plus or Pro plan. No API key." onClick={() => (haptic(6), setSignIn({}))} />
+				</div>
+			)}
+			{list.map((k) => (
+				<Group
+					key={k.id}
+					title={k.name}
+					footer={k.provider === 'chatgpt' ? (k.signedIn === false ? 'Signed out' : 'Only for you') : k.systemDefault ? 'System default' : k.mine ? undefined : 'Shared with you'}
+				>
+					<div className="row static" style={{minHeight: 62}}>
+						<span className="row-ico" style={{'--c': 'var(--accent)'} as CSSProperties}>
+							<Icon name="sparkle" size={19} />
+						</span>
+						<span className="main">
+							<b style={{fontWeight: 550}}>{PROVIDER_LABEL[k.provider] ?? k.provider}</b>
+							<span>
+								{k.provider === 'chatgpt' ? [k.account, k.model].filter(Boolean).join(' · ') || 'ChatGPT plan' : k.model}
+								{k.provider !== 'chatgpt' && k.api === 'responses' ? ' · Responses' : ''}
+								{k.provider !== 'chatgpt' && k.effort ? ` · ${k.effort} reasoning` : ''}
+								{k.last4 ? ` · …${k.last4}` : ''}
+							</span>
+						</span>
+					</div>
+					{k.provider !== 'chatgpt' && <CheckLine check={k.check ?? null} />}
+					{k.provider !== 'chatgpt' && (
+						<Row
+							icon="check"
+							color="var(--green)"
+							label={checking === k.id ? 'Checking…' : 'Check connection'}
+							trailing={checking === k.id ? <span className="spinner" /> : undefined}
+							onClick={() => checking || check(k)}
+						/>
+					)}
+					{k.provider === 'chatgpt' && k.mine && k.signedIn === false && (
+						<Row icon="alert" color="var(--red)" label="Signed out of ChatGPT" sub="Sign in again to keep using your plan" onClick={() => setSignIn({keyId: k.id})} />
+					)}
+					{k.provider === 'chatgpt' && k.mine && k.signedIn !== false && <Row icon="sparkle" color="var(--accent)" label="Model" value={k.model || 'Choose'} onClick={() => setModelFor(k)} />}
+					{k.mine && k.provider !== 'chatgpt' && <Row icon="pencil" color="var(--accent)" label="Edit" value="Name, key, model" onClick={() => setEdit(k)} />}
+					{k.mine && k.provider !== 'chatgpt' && (
+						<Row
+							icon="share"
+							color="var(--blue)"
+							label="Share"
+							value={k.sharedWith.length ? String(k.sharedWith.length) : undefined}
+							onClick={() => setShare(k)}
+						/>
+					)}
+					{owner && k.mine && k.provider !== 'chatgpt' && (
+						<Row
+							icon="star"
+							color="var(--peach)"
+							label="Use as system default"
+							trailing={
+								<Switch
+									on={k.systemDefault}
+									label="Use as system default"
+									disabled={save.isPending}
+									onChange={(v) =>
+										save.mutate({
+											path: 'assistant.updateKey',
+											input: {id: k.id, systemDefault: v},
+											done: v ? 'This key is the system default' : 'No longer the system default',
+											refresh: ['assistant.keys'],
+										})
+									}
+								/>
+							}
+						/>
+					)}
+					{k.mine && <Row icon="trash" color="var(--red)" label={k.provider === 'chatgpt' ? 'Sign out of ChatGPT' : 'Delete'} onClick={() => remove(k)} />}
+				</Group>
+			))}
+			{!owner && list.length === 0 && keys.isSuccess && (
+				<p className="footer-note" style={{textAlign: 'left', margin: '10px 6px 0'}}>
+					Sign in with your own ChatGPT, add your own key, or ask the owner to share one.
+				</p>
+			)}
+
+			<AssistantAppearanceSettings />
+
+			<AddKeySheet open={add} owner={user.data?.role === 'owner'} onClose={() => setAdd(false)} />
+			<EditKeySheet open={!!edit} keyRow={edit} owner={user.data?.role === 'owner'} onClose={() => setEdit(null)} />
+			{signIn && <ChatGptSignInSheet keyId={signIn.keyId} onClose={() => setSignIn(null)} />}
+			{modelFor && <ChatGptModelSheet keyRow={modelFor} onClose={() => setModelFor(null)} />}
+			<ShareKeySheet open={!!share} keyRow={share} accounts={boot.accounts} self={self} onClose={() => setShare(null)} />
 		</div>
+	)
+}
+
+function AddKeySheet({open, owner, onClose}: {open: boolean; owner: boolean; onClose: () => void}) {
+	const save = useSave()
+	const [provider, setProvider] = useState<AssistantProvider>('spacexai')
+	const [name, setName] = useState('')
+	const [model, setModel] = useState('')
+	const [apiKey, setApiKey] = useState('')
+	const [baseUrl, setBaseUrl] = useState('')
+	useEffect(() => {
+		setProvider('spacexai')
+		setName('')
+		setModel('')
+		setApiKey('')
+		setBaseUrl('')
+	}, [open])
+	const qc = useQueryClient()
+	const [api, setApi] = useState<AssistantApi>('chat')
+	useEffect(() => setApi(defaultApi(provider)), [provider, open])
+	const custom = provider === 'openai-compatible'
+	const keyOk = custom || apiKey.trim().length >= 4
+	const urlOk = !custom || /^https?:\/\/[^\s]+/i.test(baseUrl.trim())
+	const ready = keyOk && !!model.trim() && urlOk
+	// The key goes to the chosen provider only once it's been entered (the field is left), never while
+	// it's being pasted under another provider. A keyless local endpoint is checked straight away.
+	const [keyEntered, setKeyEntered] = useState(false)
+	useEffect(() => setKeyEntered(false), [open, provider])
+	const checkable = open && keyOk && urlOk && (keyEntered || (custom && !apiKey.trim()))
+	const live = useEndpointCheck(checkable ? {provider, apiKey: apiKey.trim(), ...(custom ? {baseUrl: baseUrl.trim()} : {})} : null, model)
+	// Once the list arrives, fill in a model unless one was typed.
+	useEffect(() => {
+		if (!model.trim() && live.models.length) setModel((live.models.find((m) => m.id === MODEL_PLACEHOLDER[provider]) ?? live.models[0]).id)
+	}, [live.models]) // eslint-disable-line react-hooks/exhaustive-deps
+	return (
+		<FormSheet
+			open={open}
+			title="Add provider"
+			onClose={onClose}
+			submit="Add"
+			busy={save.isPending}
+			disabled={!ready}
+			onSubmit={() =>
+				save.mutate(
+					{
+						path: 'assistant.addKey',
+						input: {
+							provider,
+							name: name.trim(),
+							model: model.trim(),
+							apiKey: apiKey.trim(),
+							...(provider === 'openai-compatible' ? {baseUrl: baseUrl.trim()} : {}),
+							...(pickApi(provider) ? {api} : {}),
+						},
+						done: 'Provider added',
+						refresh: ['assistant.keys'],
+					},
+					{
+						// Record a first check on the saved key, so its row shows whether it works.
+						onSuccess: (row) => {
+							onClose()
+							const id = (row as AssistantKey | undefined)?.id
+							if (id) mutate('assistant.verifyKey', {id}).catch(() => {}).finally(() => qc.invalidateQueries({queryKey: ['assistant.keys']}))
+						},
+					},
+				)
+			}
+		>
+			<Segmented
+				label="Provider"
+				value={provider}
+				onChange={(v) => {
+					setProvider(v)
+					setModel('')
+					// A key belongs to one provider; don't carry it over to another.
+					setApiKey('')
+					if (v === 'openai-compatible' && !baseUrl.trim()) setBaseUrl('http://127.0.0.1:11434/v1')
+				}}
+				options={[
+					{id: 'spacexai', label: 'Grok'},
+					{id: 'openai', label: 'OpenAI'},
+					{id: 'anthropic', label: 'Anthropic'},
+					// A custom address makes the server send requests anywhere it can reach: owner only.
+					...(owner ? [{id: 'openai-compatible' as const, label: 'Custom'}] : []),
+				]}
+			/>
+			<Field id="ask-name" label="Name" value={name} onChange={(e) => setName(e.target.value)} autoFocus />
+			{custom && (
+				<Field
+					id="ask-url"
+					label="Base URL"
+					value={baseUrl}
+					onChange={(e) => setBaseUrl(e.target.value)}
+					placeholder="http://127.0.0.1:11434/v1"
+					hint="Include /v1. Local Ollama is http://127.0.0.1:11434/v1."
+					autoCapitalize="off"
+					autoCorrect="off"
+					spellCheck={false}
+				/>
+			)}
+			<Field
+				id="ask-key"
+				label="API key"
+				type="password"
+				autoComplete="off"
+				value={apiKey}
+				onChange={(e) => setApiKey(e.target.value)}
+				onBlur={() => setKeyEntered(true)}
+				hint={custom ? 'Leave blank for local Ollama.' : 'Checked with the provider when you move on from this field.'}
+			/>
+			<CheckLine check={live.check} busy={live.busy} />
+			<ModelField id="ask-model" value={model} onChange={setModel} models={live.models} provider={provider} />
+			{pickApi(provider) && <Segmented label="API" value={api} onChange={setApi} options={API_OPTIONS} />}
+		</FormSheet>
+	)
+}
+
+// Change a saved provider: its name, key, address (custom endpoints), model, API and reasoning.
+function EditKeySheet({open, keyRow, owner, onClose}: {open: boolean; keyRow: AssistantKey | null; owner: boolean; onClose: () => void}) {
+	const save = useSave()
+	const qc = useQueryClient()
+	const [name, setName] = useState('')
+	const [apiKey, setApiKey] = useState('')
+	const [baseUrl, setBaseUrl] = useState('')
+	const [model, setModel] = useState('')
+	const [api, setApi] = useState<AssistantApi>('chat')
+	const [effort, setEffort] = useState<AssistantEffort>('')
+	const [keyEntered, setKeyEntered] = useState(false)
+	useEffect(() => {
+		setName(keyRow?.name ?? '')
+		setApiKey('')
+		setBaseUrl(keyRow?.baseUrl ?? '')
+		setModel(keyRow?.model ?? '')
+		setApi(keyRow?.api ?? 'chat')
+		setEffort(keyRow?.effort ?? '')
+		setKeyEntered(false)
+	}, [keyRow, open])
+	const custom = keyRow?.provider === 'openai-compatible'
+	const canPick = !!keyRow && pickApi(keyRow.provider)
+	// Blank keeps the saved key. A new one must look like a key, except on a custom endpoint.
+	const newKey = apiKey.trim()
+	const keyOk = !newKey || custom || newKey.length >= 4
+	const urlChanged = custom && owner && baseUrl.trim() !== keyRow?.baseUrl
+	const urlOk = !urlChanged || /^https?:\/\/[^\s]+/i.test(baseUrl.trim())
+	// A new key is checked once its field is left, as when adding one; otherwise the saved key is.
+	const target = open && keyRow && keyOk && urlOk ? {id: keyRow.id, ...(newKey && keyEntered ? {apiKey: newKey} : {}), ...(urlChanged ? {baseUrl: baseUrl.trim()} : {})} : null
+	const live = useEndpointCheck(target, model)
+	const changes: Record<string, unknown> = {}
+	if (keyRow) {
+		if (name.trim() && name.trim() !== keyRow.name) changes.name = name.trim()
+		if (newKey) changes.apiKey = newKey
+		if (urlChanged) changes.baseUrl = baseUrl.trim()
+		if (model.trim() && model.trim() !== keyRow.model) changes.model = model.trim()
+		if (canPick && api !== keyRow.api) changes.api = api
+		if (effort !== keyRow.effort) changes.effort = effort
+	}
+	return (
+		<FormSheet
+			open={open}
+			title="Edit provider"
+			subtitle={keyRow ? PROVIDER_LABEL[keyRow.provider] : undefined}
+			onClose={onClose}
+			submit="Save"
+			busy={save.isPending}
+			disabled={!keyRow || !model.trim() || !keyOk || !urlOk || !Object.keys(changes).length}
+			onSubmit={() =>
+				keyRow &&
+				save.mutate(
+					{path: 'assistant.updateKey', input: {id: keyRow.id, ...changes}, done: 'Saved', refresh: ['assistant.keys']},
+					{
+						onSuccess: () => {
+							onClose()
+							// A new key or address clears the old check; record a fresh one for the row.
+							if (changes.apiKey || changes.baseUrl || changes.model) mutate('assistant.verifyKey', {id: keyRow.id}).catch(() => {}).finally(() => qc.invalidateQueries({queryKey: ['assistant.keys']}))
+						},
+					},
+				)
+			}
+		>
+			<Field id="edit-name" label="Name" value={name} onChange={(e) => setName(e.target.value)} />
+			{custom && owner && (
+				<Field
+					id="edit-url"
+					label="Base URL"
+					value={baseUrl}
+					onChange={(e) => setBaseUrl(e.target.value)}
+					placeholder="http://127.0.0.1:11434/v1"
+					hint="Include /v1."
+					autoCapitalize="off"
+					autoCorrect="off"
+					spellCheck={false}
+				/>
+			)}
+			<Field
+				id="edit-key"
+				label="API key"
+				type="password"
+				autoComplete="off"
+				value={apiKey}
+				onChange={(e) => {
+					setApiKey(e.target.value)
+					setKeyEntered(false)
+				}}
+				onBlur={() => setKeyEntered(true)}
+				placeholder={keyRow?.last4 ? `Saved key …${keyRow.last4}` : 'No key saved'}
+				hint="Leave blank to keep the saved key."
+			/>
+			<CheckLine check={live.check} busy={live.busy} />
+			{keyRow && <ModelField id="edit-model" value={model} onChange={setModel} models={live.models} provider={keyRow.provider} />}
+			{canPick && <Segmented label="API" value={api} onChange={setApi} options={API_OPTIONS} />}
+			<Segmented label="Reasoning" value={effort} onChange={setEffort} options={EFFORT_OPTIONS} />
+			<p className="footer-note" style={{textAlign: 'left', margin: '2px 6px 0'}}>
+				How hard a reasoning model thinks before answering. Default leaves it to the model; models that don’t reason may refuse a level.
+			</p>
+		</FormSheet>
+	)
+}
+
+function ShareKeySheet({
+	open,
+	keyRow,
+	accounts,
+	self,
+	onClose,
+}: {
+	open: boolean
+	keyRow: AssistantKey | null
+	accounts: {userId: string; name: string}[]
+	self?: string
+	onClose: () => void
+}) {
+	const save = useSave()
+	const others = accounts.filter((a) => a.userId !== self)
+	const [picked, setPicked] = useState<string[]>([])
+	useEffect(() => setPicked(keyRow ? [...keyRow.sharedWith] : []), [keyRow, open])
+	const toggle = (id: string) => setPicked((cur) => (cur.includes(id) ? cur.filter((x) => x !== id) : [...cur, id]))
+	return (
+		<FormSheet
+			open={open}
+			title="Share"
+			subtitle={keyRow?.name}
+			onClose={onClose}
+			submit="Save"
+			busy={save.isPending}
+			onSubmit={() =>
+				save.mutate(
+					{path: 'assistant.updateKey', input: {id: keyRow?.id, sharedWith: picked}, done: 'Sharing updated', refresh: ['assistant.keys']},
+					{onSuccess: onClose},
+				)
+			}
+		>
+			{others.length === 0 ? (
+				<p className="prose" style={{margin: '0 0 8px'}}>
+					No other accounts on this server.
+				</p>
+			) : (
+				<div className="glass group" style={{borderRadius: 18, marginBottom: 12, '--inset': '62px'} as CSSProperties}>
+					{others.map((a) => (
+						<button type="button" key={a.userId} className="row" style={{minHeight: 56}} role="checkbox" aria-checked={picked.includes(a.userId)} onClick={() => toggle(a.userId)}>
+							<span className="row-ico" style={{'--c': 'var(--blue)'} as CSSProperties}>
+								<Icon name="user" size={19} />
+							</span>
+							<span className="main">
+								<b style={{fontWeight: 550}}>{a.name}</b>
+							</span>
+							<Icon name={picked.includes(a.userId) ? 'checked' : 'unchecked'} size={22} />
+						</button>
+					))}
+				</div>
+			)}
+		</FormSheet>
+	)
+}
+
+// Sign in with ChatGPT. OpenAI sends the browser back to http://127.0.0.1:<port>/auth/callback.
+// On this server's own browser, omarchyd catches that by itself; anywhere else that page won't load,
+// and its address is pasted here. Access and refresh tokens stay on the server.
+function ChatGptSignInSheet({keyId, onClose}: {keyId?: string; onClose: () => void}) {
+	const qc = useQueryClient()
+	const toast = useToast()
+	const [url, setUrl] = useState<string | null>(null)
+	const [pasted, setPasted] = useState('')
+	const [error, setError] = useState<string | null>(null)
+	const [busy, setBusy] = useState(false)
+	const done = (k: AssistantKey) => {
+		void qc.invalidateQueries({queryKey: ['assistant.keys']})
+		toast(k.account ? `Signed in as ${k.account}` : 'Signed in to ChatGPT')
+		onClose()
+	}
+	const status = useQuery({
+		queryKey: ['assistant.chatgptStatus'],
+		queryFn: () => query<{pending: boolean; key?: AssistantKey}>('assistant.chatgptStatus'),
+		enabled: !!url,
+		refetchInterval: 2000,
+		gcTime: 0,
+	})
+	useEffect(() => {
+		if (status.data?.key) done(status.data.key)
+		// eslint-disable-next-line react-hooks/exhaustive-deps
+	}, [status.data?.key])
+	const open = async () => {
+		haptic(6)
+		setError(null)
+		// Opened in the tap, so it isn't blocked as a pop-up; pointed at ChatGPT once the address is ready.
+		const tab = window.open('about:blank', '_blank')
+		try {
+			const r = await mutate<{url: string}>('assistant.chatgptStart', keyId ? {keyId} : {})
+			if (!r.url.startsWith('https://auth.openai.com/')) throw new Error('ChatGPT didn’t finish the sign-in')
+			setUrl(r.url)
+			if (tab) {
+				// The sign-in page must not be able to reach back to this one through window.opener.
+				tab.opener = null
+				tab.location.href = r.url
+			}
+		} catch (e) {
+			tab?.close()
+			setError((e as Error).message)
+		}
+	}
+	const finish = async (e: FormEvent) => {
+		e.preventDefault()
+		setBusy(true)
+		setError(null)
+		try {
+			done(await mutate<AssistantKey>('assistant.chatgptFinish', {url: pasted.trim()}))
+		} catch (err) {
+			setError((err as Error).message)
+		} finally {
+			setBusy(false)
+		}
+	}
+	return (
+		<Sheet open onClose={onClose} label="Sign in with ChatGPT">
+			<SheetHeader
+				icon={
+					<span className="sheet-icon" style={{background: 'linear-gradient(135deg, var(--green), var(--accent))'}}>
+						<Icon name="sparkle" size={28} />
+					</span>
+				}
+				title="Sign in with ChatGPT"
+				subtitle="The assistant uses your ChatGPT Plus or Pro plan"
+				onClose={onClose}
+			/>
+			<form className="screen chatgpt-signin" onSubmit={finish}>
+				<ol className="chatgpt-steps">
+					<li>Open ChatGPT, sign in, and allow My Own Data Center to use your plan.</li>
+					<li>On this server’s own browser, that’s it: this finishes by itself.</li>
+					<li>Anywhere else, you’ll land on a page that won’t load. Copy its whole address and paste it below.</li>
+				</ol>
+				<button type="button" className="btn primary block" onClick={open}>
+					<Icon name="sparkle" size={18} /> {url ? 'Open ChatGPT again' : 'Open ChatGPT'}
+				</button>
+				{url && (
+					<p className="muted" style={{fontSize: '0.85em', margin: 0}}>
+						Didn’t open?{' '}
+						<a href={url} target="_blank" rel="noreferrer">
+							Open the sign-in page
+						</a>
+						.
+					</p>
+				)}
+				{url && (
+					<>
+						<Field
+							id="chatgpt-callback"
+							label="Address of the page that didn’t load"
+							value={pasted}
+							onChange={(e) => setPasted(e.target.value)}
+							placeholder="http://127.0.0.1:1455/auth/callback?code=…"
+							autoCapitalize="off"
+							autoCorrect="off"
+							spellCheck={false}
+							inputMode="url"
+						/>
+						<button className="btn block" type="submit" disabled={busy || !/^http:\/\/127\.0\.0\.1:\d+\/auth\/callback\?/.test(pasted.trim())}>
+							{busy ? <><span className="spinner" /><span className="sr-only">Finish signing in</span></> : 'Finish signing in'}
+						</button>
+					</>
+				)}
+				{error && (
+					<div className="error" role="alert">
+						<Icon name="alert" size={18} />
+						{error}
+					</div>
+				)}
+				<p className="footer-note" style={{textAlign: 'left', margin: 0}}>
+					Your ChatGPT sign-in stays on this server, only for you. My Own Data Center can use your plan for the assistant; it can’t see your ChatGPT chats.
+				</p>
+			</form>
+		</Sheet>
+	)
+}
+
+function ChatGptModelSheet({keyRow, onClose}: {keyRow: AssistantKey; onClose: () => void}) {
+	const save = useSave()
+	const models = useQuery({queryKey: ['assistant.models', keyRow.id], queryFn: () => query<{id: string; name: string}[]>('assistant.models', {id: keyRow.id}), retry: false})
+	return (
+		<Sheet open onClose={onClose} label="Model">
+			<SheetHeader title="Model" subtitle="Models your ChatGPT plan can use" onClose={onClose} />
+			<div className="screen">
+				{models.isLoading && <span className="spinner" />}
+				{models.error && (
+					<div className="error" role="alert">
+						<Icon name="alert" size={18} />
+						{(models.error as Error).message}
+					</div>
+				)}
+				{models.data && (
+					<div className="glass group">
+						{models.data.map((m) => (
+							<Row
+								key={m.id}
+								icon={m.id === keyRow.model ? 'check' : 'sparkle'}
+								color={m.id === keyRow.model ? 'var(--green)' : 'var(--accent)'}
+								label={m.name}
+								value={m.id === keyRow.model ? 'In use' : undefined}
+								onClick={() => save.mutate({path: 'assistant.updateKey', input: {id: keyRow.id, model: m.id}, done: `Using ${m.name}`, refresh: ['assistant.keys']}, {onSuccess: onClose})}
+							/>
+						))}
+					</div>
+				)}
+			</div>
+		</Sheet>
 	)
 }
 
@@ -501,7 +1370,7 @@ function NameSheet({open, current, onClose}: {open: boolean; current: string; on
 	)
 }
 
-function PasswordSheet({open, onClose, onSignedOut}: {open: boolean; onClose: () => void; onSignedOut: () => void}) {
+function PasswordSheet({open, onClose}: {open: boolean; onClose: () => void}) {
 	const save = useSave()
 	const [oldPassword, setOld] = useState('')
 	const [newPassword, setNew] = useState('')
@@ -516,28 +1385,29 @@ function PasswordSheet({open, onClose, onSignedOut}: {open: boolean; onClose: ()
 		<FormSheet
 			open={open}
 			title="Change password"
-			subtitle="Used for Omarchy Server and Omarchy Server"
+			subtitle={PASSWORD_SHEET_SUBTITLE}
 			onClose={onClose}
 			submit="Change password"
 			busy={save.isPending}
-			disabled={!oldPassword || newPassword.length < 6 || newPassword !== repeat}
+			disabled={!oldPassword || newPassword.length < MIN_PASSWORD_LENGTH || newPassword !== repeat}
 			onSubmit={() =>
 				save.mutate(
 					{path: 'user.changePassword', input: {oldPassword, newPassword}, done: 'Password changed'},
 					{
 						onSuccess: async () => {
 							onClose()
-							// Omarchy Server may sign every session out after a password change.
+							// My Own Data Center may sign every session out after a password change.
+							// This fetch does not go through the client that fires touch:signed-out.
 							const still = await fetch('/api/rpc/user.get', {credentials: 'same-origin'}).catch(() => null)
-							if (still?.status === 401) onSignedOut()
+							if (still?.status === 401) window.dispatchEvent(new Event('touch:signed-out'))
 						},
 					},
 				)
 			}
 		>
 			<Field id="old" label="Current password" type="password" autoComplete="current-password" value={oldPassword} onChange={(e) => setOld(e.target.value)} autoFocus />
-			<Field id="new" label="New password" type="password" autoComplete="new-password" value={newPassword} onChange={(e) => setNew(e.target.value)} hint="At least 6 characters." />
-			<Field id="repeat" label="Repeat new password" type="password" autoComplete="new-password" value={repeat} onChange={(e) => setRepeat(e.target.value)} hint={mismatch ? 'Passwords don’t match.' : undefined} />
+			<Field id="new" label="New password" type="password" autoComplete="new-password" value={newPassword} onChange={(e) => setNew(e.target.value)} hint={`At least ${MIN_PASSWORD_LENGTH} characters.`} />
+			<Field id="repeat" label="Repeat new password" type="password" autoComplete="new-password" value={repeat} onChange={(e) => setRepeat(e.target.value)} error={mismatch ? 'Passwords don’t match.' : undefined} />
 		</FormSheet>
 	)
 }
@@ -545,8 +1415,9 @@ function PasswordSheet({open, onClose, onSignedOut}: {open: boolean; onClose: ()
 function TwoFactorSheet({open, enabled, onClose}: {open: boolean; enabled: boolean; onClose: () => void}) {
 	const save = useSave()
 	const toast = useToast()
-	// One setup key for the whole setup: fetching again (e.g. after switching to the authenticator
-	// app and back) would make a new key, and the code from the app would never match.
+	const qc = useQueryClient()
+	// One setup key while this sheet is open. Closing it, or turning two-factor on or off,
+	// drops that key so the next open asks for a new one.
 	const uri = useQ<string>('user.generateTotpUri', undefined, {enabled: open && !enabled, staleTime: Infinity, refetchOnWindowFocus: false, refetchOnReconnect: false})
 	const [code, setCode] = useState('')
 	useEffect(() => setCode(''), [open])
@@ -557,7 +1428,10 @@ function TwoFactorSheet({open, enabled, onClose}: {open: boolean; enabled: boole
 			open={open}
 			title="Two-factor authentication"
 			subtitle={enabled ? 'On' : 'Off'}
-			onClose={onClose}
+			onClose={() => {
+				clearTotpSetupQuery(qc, 'close')
+				onClose()
+			}}
 			submit={enabled ? 'Turn off' : 'Turn on'}
 			danger={enabled}
 			busy={save.isPending}
@@ -567,12 +1441,15 @@ function TwoFactorSheet({open, enabled, onClose}: {open: boolean; enabled: boole
 					enabled
 						? {path: 'user.disable2fa', input: {totpToken: code.replace(/\s/g, '')}, done: 'Two-factor is off', ...done}
 						: {path: 'user.enable2fa', input: {totpUri: uri.data, totpToken: code.replace(/\s/g, '')}, done: 'Two-factor is on', ...done},
-					{onSuccess: onClose},
+					{onSuccess: () => {
+						clearTotpSetupQuery(qc, 'success')
+						onClose()
+					}},
 				)
 			}
 		>
 			{!enabled && (
-				<div className="glass card" style={{borderRadius: 18, marginBottom: 16}}>
+				<Card style={{borderRadius: 18, marginBottom: 16}}>
 					<p className="prose" style={{margin: '0 0 12px'}}>
 						1. Add your server to an authenticator app (Google Authenticator, 1Password, Authy…).
 					</p>
@@ -601,7 +1478,7 @@ function TwoFactorSheet({open, enabled, onClose}: {open: boolean; enabled: boole
 					<p className="prose" style={{margin: '14px 0 0'}}>
 						2. Enter the 6-digit code it shows.
 					</p>
-				</div>
+				</Card>
 			)}
 			<Field
 				id="code"
@@ -613,163 +1490,6 @@ function TwoFactorSheet({open, enabled, onClose}: {open: boolean; enabled: boole
 				onChange={(e) => setCode(e.target.value)}
 				style={{textAlign: 'center', letterSpacing: '0.3em', fontSize: 20}}
 			/>
-		</FormSheet>
-	)
-}
-
-function HostnameSheet({open, current, onClose}: {open: boolean; current: string; onClose: () => void}) {
-	const save = useSave()
-	const [name, setName] = useState(current)
-	useEffect(() => setName(current), [current, open])
-	const valid = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(name.trim().toLowerCase())
-	return (
-		<FormSheet
-			open={open}
-			title="Device name"
-			subtitle="How your server appears on your network"
-			onClose={onClose}
-			submit="Save"
-			busy={save.isPending}
-			disabled={!valid || name.trim().toLowerCase() === current}
-			onSubmit={() => save.mutate({path: 'system.setHostname', input: {hostname: name.trim().toLowerCase()}, done: 'Device name changed', refresh: ['system.getHostname']}, {onSuccess: onClose})}
-		>
-			<Field
-				id="host"
-				label="Name"
-				autoCapitalize="off"
-				autoCorrect="off"
-				spellCheck={false}
-				value={name}
-				onChange={(e) => setName(e.target.value)}
-				hint={valid ? `Reachable at http://${name.trim().toLowerCase()}.local` : 'Letters, numbers and dashes only.'}
-				autoFocus
-			/>
-		</FormSheet>
-	)
-}
-
-function WifiSheet({onClose, connected}: {onClose: () => void; connected?: string}) {
-	const save = useSave()
-	const confirm = useConfirm()
-	const networks = useQ<{ssid: string; signal: number; authenticated: boolean; active: boolean}[]>('wifi.networks', undefined, {refetchInterval: 10_000})
-	const [target, setTarget] = useState<{ssid: string; authenticated: boolean} | null>(null)
-	const [password, setPassword] = useState('')
-	const connect = (ssid: string, pw?: string) =>
-		save.mutate({path: 'wifi.connect', input: {ssid, ...(pw ? {password: pw} : {})}, done: `Connected to ${ssid}`, refresh: ['wifi.connected', 'wifi.networks']}, {onSuccess: () => setTarget(null)})
-	return (
-		<Sheet open onClose={onClose} label="Wi-Fi">
-			<SheetHeader title="Wi-Fi" subtitle={connected ? `Connected to ${connected}` : 'Not connected'} onClose={onClose} />
-			{target ? (
-				<form
-					onSubmit={(e) => {
-						e.preventDefault()
-						connect(target.ssid, password)
-					}}
-				>
-					<Field id="wifi-pw" label={`Password for ${target.ssid}`} type="password" value={password} onChange={(e) => setPassword(e.target.value)} autoFocus />
-					<div className="stack">
-						<button className="btn primary block" disabled={save.isPending || !password}>
-							{save.isPending && <span className="spinner" />}
-							Join
-						</button>
-						<button type="button" className="btn block ghost" onClick={() => setTarget(null)}>
-							Back
-						</button>
-					</div>
-				</form>
-			) : (
-				<>
-					<div className="glass group" style={{borderRadius: 18, '--inset': '62px'} as CSSProperties}>
-						{networks.isLoading && <div className="row static"><span className="spinner" /> Looking for networks…</div>}
-						{(networks.data ?? []).map((n) => (
-							<button
-								key={n.ssid}
-								className="row"
-								style={{minHeight: 56}}
-								disabled={n.active || save.isPending}
-								onClick={() => (n.authenticated ? (setPassword(''), setTarget(n)) : connect(n.ssid))}
-							>
-								<span className="row-ico" style={{'--c': n.active ? 'var(--green)' : 'var(--blue)'} as CSSProperties}>
-									<Icon name="wifi" size={18} />
-								</span>
-								<span className="main">
-									<b style={{fontWeight: 550}}>{n.ssid}</b>
-									<span>{n.active ? 'Connected' : `${n.signal}% signal${n.authenticated ? ' · secured' : ''}`}</span>
-								</span>
-							</button>
-						))}
-						{networks.data?.length === 0 && <div className="row static muted">No networks found.</div>}
-					</div>
-					{connected && (
-						<button
-							className="btn danger block"
-							style={{marginTop: 14}}
-							onClick={async () => {
-								if (await confirm({title: 'Turn off Wi-Fi?', body: 'If Wi-Fi is how your server connects, you’ll lose access until it’s wired in.', confirm: 'Disconnect', danger: true}))
-									save.mutate({path: 'wifi.disconnect', done: 'Wi-Fi disconnected', refresh: ['wifi.connected']})
-							}}
-						>
-							Disconnect
-						</button>
-					)}
-				</>
-			)}
-		</Sheet>
-	)
-}
-
-function LogsSheet({onClose}: {onClose: () => void}) {
-	const [type, setType] = useState<'server' | 'system'>('server')
-	const logs = useQ<string>('system.logs', {type, lines: 1500, maxOutputBytes: 400_000})
-	const [el, setEl] = useState<HTMLPreElement | null>(null)
-	useEffect(() => {
-		if (el) el.scrollTop = el.scrollHeight
-	}, [el, logs.data])
-	return (
-		<Sheet open onClose={onClose} label="System logs" tall>
-			<SheetHeader title="System logs" subtitle="Latest 1,500 lines" onClose={onClose} />
-			<Segmented
-				label="Log"
-				value={type}
-				onChange={setType}
-				options={[
-					{id: 'server', label: 'Omarchy Server'},
-					{id: 'system', label: 'System'},
-				]}
-			/>
-			<pre className="logs" ref={setEl}>
-				{logs.isLoading ? 'Loading…' : logs.error ? (logs.error as Error).message : logs.data?.trim() || 'No log output.'}
-			</pre>
-		</Sheet>
-	)
-}
-
-function ResetSheet({open, onClose, onDone}: {open: boolean; onClose: () => void; onDone: () => void}) {
-	const save = useSave()
-	const [password, setPassword] = useState('')
-	const [typed, setTyped] = useState('')
-	useEffect(() => {
-		setPassword('')
-		setTyped('')
-	}, [open])
-	return (
-		<FormSheet
-			open={open}
-			title="Factory reset"
-			subtitle="Erases Omarchy Server’s apps, machines and accounts"
-			onClose={onClose}
-			submit="Reset Omarchy Server"
-			danger
-			busy={save.isPending}
-			disabled={!password || typed !== 'RESET'}
-			onSubmit={() => save.mutate({path: 'system.factoryReset', input: {password}, done: 'Your server is resetting'}, {onSuccess: onDone})}
-		>
-			<div className="error" style={{marginBottom: 16}}>
-				<Icon name="alert" size={18} />
-				Every app and its data, every machine and its disks, and all Omarchy Server accounts and settings are permanently deleted, and Omarchy Server goes back to its first-time setup. This can’t be undone. Your own files, storage pools and the Omarchy desktop are left as they are.
-			</div>
-			<Field id="reset-pw" label="Your password" type="password" autoComplete="current-password" value={password} onChange={(e) => setPassword(e.target.value)} />
-			<Field id="reset-type" label="Type RESET to confirm" autoCapitalize="characters" autoCorrect="off" value={typed} onChange={(e) => setTyped(e.target.value)} />
 		</FormSheet>
 	)
 }
@@ -817,7 +1537,7 @@ function SecurityGroup() {
 	const replace = async () => {
 		const ok = await confirm({
 			title: 'Replace the certificate?',
-			body: 'Omarchy Server makes a new certificate that browsers only accept for your home network (local names and private addresses), never for a real website. Every device that trusted the old one needs the new one: download it again from “Trust this server on this device” and trust it as before. Until then those devices show a warning on https:// pages.',
+			body: 'A new certificate is made that browsers only accept for your home network (local names and private addresses), never for a real website. Every device that trusted the old one needs the new one: download it again from “Trust this server on this device” and trust it as before. Until then those devices show a warning on https:// pages.',
 			confirm: 'Replace',
 		})
 		if (ok) save.mutate({path: 'system.replaceCertificate', done: 'New certificate made. Trust it again on your devices.', refresh: ['system.security']})

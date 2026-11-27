@@ -1,18 +1,20 @@
 // omarchyd apps: a real git store (file://), compose preparation, install/uninstall through a
 // simulated docker-compose, and the sign-in gateway in front of the app (HTTP and WebSocket).
 import assert from 'node:assert/strict'
+import {gitArgv} from './git-nosign.mjs'
 import {execFileSync} from 'node:child_process'
-import {mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile} from 'node:fs/promises'
+import {lstat, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile} from 'node:fs/promises'
 import http from 'node:http'
 import https from 'node:https'
+import net from 'node:net'
 import os from 'node:os'
-import {join} from 'node:path'
+import {join, relative} from 'node:path'
 import {after, before, describe, test} from 'node:test'
 import WebSocket, {WebSocketServer} from 'ws'
 import YAML from 'yaml'
 
 import {openAccounts} from '../omarchyd/accounts.mjs'
-import {prepareCompose} from '../omarchyd/apps.mjs'
+import {createApps, prepareCompose} from '../omarchyd/apps.mjs'
 import {startOmarchyd} from '../omarchyd/server.mjs'
 
 test('prepareCompose swaps app_proxy for a 127.0.0.1-only port on the named service', () => {
@@ -37,7 +39,7 @@ describe('omarchyd apps', () => {
 	const calls = []
 	const up = new Set()
 	const networks = new Set()
-	const git = (args, cwd) => execFileSync('git', args, {cwd, stdio: 'pipe'}).toString()
+	const git = (args, cwd) => execFileSync('git', gitArgv(args), {cwd, stdio: 'pipe'}).toString()
 	const run = async (cmd, args, opts = {}) => {
 		if (cmd === 'git') return git(args, opts.cwd)
 		if (cmd === 'docker-compose') {
@@ -78,7 +80,7 @@ describe('omarchyd apps', () => {
 		await writeFile(sock, '')
 		process.env.DOCKER_HOST = `unix://${sock}`
 		// Below Linux's ephemeral range (32768+), so an outgoing connection elsewhere can never take
-		// it mid-test; above the internal ports apps get (20000-28999). Tests use up to appPort + 15.
+		// it mid-test; above the internal ports apps get (20000-28999). Tests use up to appPort + 22.
 		appPort = 30000 + Math.floor(Math.random() * 2700)
 		// A store: one good app, one folder with a mismatched id (ignored).
 		const store = join(root, 'store')
@@ -140,6 +142,7 @@ describe('omarchyd apps', () => {
 		assert.equal(app.port, appPort)
 		const upCall = calls.find((c) => c.args?.[4] === 'up')
 		assert.match(upCall.env.APP_DATA_DIR, /apps\/installed\/demo-app$/)
+		assert.equal(upCall.env.HOME, join(root, 'home'))
 		assert.equal(upCall.env.GATEWAY_IP, '127.0.0.1')
 		const composed = YAML.parse(await readFile(join(data, 'apps/installed/demo-app/compose.omarchy.yml'), 'utf8'))
 		assert.equal(composed.services.app_proxy, undefined)
@@ -186,6 +189,8 @@ describe('omarchyd apps', () => {
 		// The web app can ask whether a session is valid.
 		assert.equal((await fetch(`${d.url}/app-auth/v1/account/session?app=demo-app`, {headers: {cookie}})).status, 200)
 		assert.equal((await fetch(`${d.url}/app-auth/v1/account/session?app=demo-app`)).status, 401)
+		// #324: a cookie with a broken percent escape is just not a session.
+		assert.equal((await fetch(`${d.url}/app-auth/v1/account/session?app=demo-app`, {headers: {cookie: 'OMARCHY_APP_SESSION=%E0%A4%A'}})).status, 401)
 		// WebSockets: refused without a session, echoed with one.
 		const anonWs = new WebSocket(`ws://127.0.0.1:${appPort}/ws`)
 		await new Promise((r) => anonWs.on('error', r))
@@ -450,6 +455,9 @@ describe('omarchyd apps', () => {
 		await listing('peek', appPort + 13, `services:\n  web:\n    image: x\n    volumes:\n      - \${APP_DATA_DIR}/data:/data\n      - \${VIDEOS_DIR}:/videos\n      - /etc/localtime:/etc/localtime:ro\n      - /srv/media:/media\n      - /run/dbus:/run/dbus:ro\n    pid: host\n    cap_add: [SYS_PTRACE, CHOWN]\n`)
 		await listing('thief', appPort + 14, `services:\n  web:\n    image: x\n    volumes:\n      - ${root}/home/.ssh:/keys\n`)
 		await listing('wholehome', appPort + 15, `services:\n  web:\n    image: x\n    volumes:\n      - ~:/home\n      - /etc:/host-etc\n`)
+		await listing('sneak', appPort + 16, `services:\n  web:\n    image: x\n    volumes:\n      - \${DOWNLOADS_DIR}/../.ssh:/keys\n`)
+		await listing('homevar', appPort + 17, `services:\n  web:\n    image: x\n    volumes:\n      - \${HOME}:/host\n      - \${HOME}/.ssh:/keys\n`)
+		await listing('relpath', appPort + 18, `services:\n  web:\n    image: x\n    volumes:\n      - ${relative(join(data, 'apps', 'installed', 'relpath'), join(root, 'home', '.ssh'))}:/keys\n`)
 		git(['init', '-q', '-b', 'main'], store)
 		git(['-c', 'user.name=t', '-c', 'user.email=t@t', 'add', '.'], store)
 		git(['-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'apps'], store)
@@ -459,11 +467,117 @@ describe('omarchyd apps', () => {
 		assert.deepEqual(peek.find((p) => p.id === 'host-files').what, ['/srv/media'], 'its own data, your Videos and the time zone are fine')
 		assert.deepEqual(peek.find((p) => p.id === 'system').what.sort(), ['/run/dbus', 'SYS_PTRACE', 'pid: host'])
 		await assert.rejects(call('apps.install', {appId: 'peek', grant: ['system']}), /needs your permission: read and change folders on the server/)
-		for (const id of ['thief', 'wholehome']) {
+		for (const id of ['thief', 'wholehome', 'sneak', 'homevar', 'relpath']) {
 			const r = (await q('apps.installReview', {appId: id})).permissions
 			assert.ok(r.some((p) => p.id === 'refused'), `${id} refused`)
 			await assert.rejects(call('apps.install', {appId: id, grant: ['refused', 'host-files', 'system']}), /never gives an app/)
 		}
+		await call('appStore.removeRepository', {url: `file://${store}`})
+	})
+
+	test('a listing-dir symlink cannot pull ~/.ssh into the app folder or hand it to the container user', async () => {
+		const store = join(root, 'link-apps')
+		const home = join(root, 'home')
+		const ssh = join(home, '.ssh')
+		await mkdir(ssh, {recursive: true})
+		await writeFile(join(ssh, 'id_test'), 'secret-key', {mode: 0o600})
+		await mkdir(join(store, 'linker'), {recursive: true})
+		await writeFile(join(store, 'linker', 'omarchy-app.yml'), `manifestVersion: 1\nid: linker\nname: Linker\nport: ${appPort + 12}\nweb:\n  service: web\n  port: 9000\n`)
+		await writeFile(join(store, 'linker', 'docker-compose.yml'), 'services:\n  web:\n    image: x\n    volumes:\n      - ${APP_DATA_DIR}/keys:/keys\n')
+		await symlink(ssh, join(store, 'linker', 'keys'))
+		git(['init', '-q', '-b', 'main'], store)
+		git(['-c', 'user.name=t', '-c', 'user.email=t@t', 'add', '.'], store)
+		git(['-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'apps'], store)
+		await call('appStore.addRepository', {url: `file://${store}`})
+		calls.length = 0
+		await call('apps.install', {appId: 'linker'})
+		await until(async () => (await q('apps.list')).find((a) => a.id === 'linker' && a.state === 'running'))
+		const installed = join(data, 'apps', 'installed', 'linker', 'keys')
+		assert.equal((await lstat(installed)).isSymbolicLink(), false, 'the listing’s symlink is not copied into the app folder')
+		assert.ok((await stat(installed)).isDirectory(), 'a real folder is created for the bind instead')
+		assert.equal(await readFile(join(ssh, 'id_test'), 'utf8'), 'secret-key')
+		assert.ok(!calls.some((c) => c.podman?.includes(ssh) || c.podman?.some((a) => String(a).includes(ssh))), 'podman never chowns ~/.ssh')
+		await call('apps.uninstall', {appId: 'linker'})
+		await call('appStore.removeRepository', {url: `file://${store}`})
+	})
+
+	test('a listing .env cannot name a hidden folder for Compose to bind', async () => {
+		const store = join(root, 'dotenv-apps')
+		await mkdir(join(store, 'dotenv'), {recursive: true})
+		await writeFile(join(store, 'dotenv', 'omarchy-app.yml'), `manifestVersion: 1\nid: dotenv\nname: Dotenv\nport: ${appPort + 12}\nweb:\n  service: web\n  port: 9000\n`)
+		await writeFile(join(store, 'dotenv', 'docker-compose.yml'), 'services:\n  web:\n    image: x\n    volumes:\n      - ${SECRET_DIR}:/keys\n')
+		await writeFile(join(store, 'dotenv', '.env'), `SECRET_DIR=${join(root, 'home', '.ssh')} # not for the app\n`)
+		git(['init', '-q', '-b', 'main'], store)
+		git(['-c', 'user.name=t', '-c', 'user.email=t@t', 'add', '-f', '.'], store)
+		git(['-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'apps'], store)
+		await call('appStore.addRepository', {url: `file://${store}`})
+		const r = (await q('apps.installReview', {appId: 'dotenv'})).permissions
+		assert.ok(r.some((p) => p.id === 'refused'), 'listing .env is expanded the way Compose will')
+		await assert.rejects(call('apps.install', {appId: 'dotenv', grant: ['refused', 'host-files']}), /never gives an app/)
+		await call('appStore.removeRepository', {url: `file://${store}`})
+	})
+
+	test('a listing .env interpolates ${VAR} the way Compose does, so a climb is refused', async () => {
+		const store = join(root, 'dotenv-interp-apps')
+		await mkdir(join(store, 'dotenv-interp'), {recursive: true})
+		await writeFile(join(store, 'dotenv-interp', 'omarchy-app.yml'), `manifestVersion: 1\nid: dotenv-interp\nname: DotenvInterp\nport: ${appPort + 12}\nweb:\n  service: web\n  port: 9000\n`)
+		await writeFile(join(store, 'dotenv-interp', 'docker-compose.yml'), 'services:\n  web:\n    image: x\n    volumes:\n      - ${SECRET_DIR}:/keys\n')
+		await writeFile(join(store, 'dotenv-interp', '.env'), 'SECRET_DIR=${DOWNLOADS_DIR}/../.ssh\n')
+		git(['init', '-q', '-b', 'main'], store)
+		git(['-c', 'user.name=t', '-c', 'user.email=t@t', 'add', '-f', '.'], store)
+		git(['-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'apps'], store)
+		await call('appStore.addRepository', {url: `file://${store}`})
+		const r = (await q('apps.installReview', {appId: 'dotenv-interp'})).permissions
+		const ssh = join(root, 'home', '.ssh')
+		assert.ok(r.some((p) => p.id === 'refused'), 'Compose interpolates .env values before the bind')
+		assert.ok((r.find((p) => p.id === 'refused')?.what ?? []).includes(ssh), 'the climb is ~/.ssh, not a leftover ${VAR}')
+		assert.ok(!r.some((p) => p.id === 'host-files'), 'a leftover ${DOWNLOADS_DIR} must not look like a grantable folder')
+		await assert.rejects(call('apps.install', {appId: 'dotenv-interp', grant: ['refused', 'host-files']}), /never gives an app/)
+		await call('appStore.removeRepository', {url: `file://${store}`})
+	})
+
+	test('an update that would bind a hidden folder is refused, and the old app keeps running', async () => {
+		const store = join(root, 'upd-apps')
+		const dir = join(store, 'keeper')
+		await mkdir(dir, {recursive: true})
+		await writeFile(join(dir, 'omarchy-app.yml'), `manifestVersion: 1\nid: keeper\nname: Keeper\nversion: "1.0"\nport: ${appPort + 12}\nweb:\n  service: web\n  port: 9000\n`)
+		await writeFile(join(dir, 'docker-compose.yml'), 'services:\n  web:\n    image: x\n    volumes:\n      - ${APP_DATA_DIR}/data:/data\n')
+		git(['init', '-q', '-b', 'main'], store)
+		git(['-c', 'user.name=t', '-c', 'user.email=t@t', 'add', '.'], store)
+		git(['-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'v1'], store)
+		await call('appStore.addRepository', {url: `file://${store}`})
+		await call('apps.install', {appId: 'keeper'})
+		await until(async () => (await q('apps.list')).find((a) => a.id === 'keeper' && a.state === 'running'))
+		await writeFile(join(dir, 'omarchy-app.yml'), `manifestVersion: 1\nid: keeper\nname: Keeper\nversion: "2.0"\nport: ${appPort + 12}\nweb:\n  service: web\n  port: 9000\n`)
+		await writeFile(join(dir, 'docker-compose.yml'), `services:\n  web:\n    image: x\n    volumes:\n      - ${join(root, 'home', '.ssh')}:/keys\n`)
+		git(['-c', 'user.name=t', '-c', 'user.email=t@t', 'add', '.'], store)
+		git(['-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'v2'], store)
+		await call('appStore.removeRepository', {url: `file://${store}`})
+		await call('appStore.addRepository', {url: `file://${store}`})
+		await assert.rejects(call('apps.update', {appId: 'keeper'}), /never gives an app/)
+		const app = (await q('apps.list')).find((a) => a.id === 'keeper')
+		assert.equal(app.version, '1.0')
+		assert.equal(app.state, 'running')
+		await call('apps.uninstall', {appId: 'keeper'})
+		await call('appStore.removeRepository', {url: `file://${store}`})
+	})
+
+	test('a time-zone bind is allowed and does not change /etc/localtime on the server', async () => {
+		const before = await lstat('/etc/localtime').catch(() => null)
+		const store = join(root, 'tz-apps')
+		await mkdir(join(store, 'clock'), {recursive: true})
+		await writeFile(join(store, 'clock', 'omarchy-app.yml'), `manifestVersion: 1\nid: clock\nname: Clock\nport: ${appPort + 12}\nweb:\n  service: web\n  port: 9000\n`)
+		await writeFile(join(store, 'clock', 'docker-compose.yml'), 'services:\n  web:\n    image: x\n    volumes:\n      - ${APP_DATA_DIR}/data:/data\n      - /etc/localtime:/etc/localtime:ro\n')
+		git(['init', '-q', '-b', 'main'], store)
+		git(['-c', 'user.name=t', '-c', 'user.email=t@t', 'add', '.'], store)
+		git(['-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'apps'], store)
+		await call('appStore.addRepository', {url: `file://${store}`})
+		await call('apps.install', {appId: 'clock'})
+		await until(async () => (await q('apps.list')).find((a) => a.id === 'clock' && a.state === 'running'))
+		const after = await lstat('/etc/localtime').catch(() => null)
+		assert.equal(after?.ino, before?.ino)
+		assert.equal(after?.isSymbolicLink(), before?.isSymbolicLink())
+		await call('apps.uninstall', {appId: 'clock'})
 		await call('appStore.removeRepository', {url: `file://${store}`})
 	})
 
@@ -530,4 +644,150 @@ describe('omarchyd apps', () => {
 		await call('appStore.removeRepository', {url: storeUrl})
 		assert.deepEqual(await q('appStore.registry'), [])
 	})
+
+	test('uninstall fails when compose down fails, and the app stays installed', async () => {
+		const store = join(root, 'sticky-apps')
+		await mkdir(join(store, 'sticky'), {recursive: true})
+		await writeFile(join(store, 'sticky', 'umbrel-app.yml'), `manifestVersion: 1\nid: sticky\nname: Sticky\nport: ${appPort + 20}\n`)
+		await writeFile(join(store, 'sticky', 'docker-compose.yml'), 'services:\n  web:\n    image: x\n')
+		git(['init', '-q', '-b', 'main'], store)
+		git(['-c', 'user.name=t', '-c', 'user.email=t@t', 'add', '.'], store)
+		git(['-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'apps'], store)
+		await call('appStore.addRepository', {url: `file://${store}`})
+		await call('apps.install', {appId: 'sticky'})
+		await until(async () => (await q('apps.list')).find((a) => a.id === 'sticky' && a.state === 'running'))
+		const original = run
+		runImpl.current = async (cmd, args, opts) => {
+			if (cmd === 'docker-compose' && args[1] === 'omarchy-sticky' && args[4] === 'down') throw new Error('Cannot connect to the Docker daemon')
+			return original(cmd, args, opts)
+		}
+		try {
+			await assert.rejects(call('apps.uninstall', {appId: 'sticky'}), /Couldn’t uninstall Sticky: Cannot connect to the Docker daemon/)
+			assert.ok((await q('apps.list')).some((a) => a.id === 'sticky'), 'the app is gone from the list')
+			assert.equal(up.has('omarchy-sticky'), true)
+			assert.equal(await stat(join(data, 'apps', 'installed', 'sticky', 'compose.omarchy.yml')).then(() => true, () => false), true)
+		} finally {
+			runImpl.current = original
+		}
+		await call('apps.uninstall', {appId: 'sticky'})
+		await call('appStore.removeRepository', {url: `file://${store}`})
+	})
+
+	test('the shared Tor proxy stops when the last app that uses it is uninstalled', async () => {
+		const store = join(root, 'tor-apps')
+		const compose = 'services:\n  web:\n    image: x\n    environment:\n      TOR_PROXY: ${TOR_PROXY_IP}:${TOR_PROXY_PORT}\n'
+		for (const id of ['tor-a', 'tor-b']) {
+			await mkdir(join(store, id), {recursive: true})
+			await writeFile(join(store, id, 'umbrel-app.yml'), `manifestVersion: 1\nid: ${id}\nname: ${id}\nport: ${appPort + (id === 'tor-a' ? 21 : 22)}\n`)
+			await writeFile(join(store, id, 'docker-compose.yml'), compose)
+		}
+		git(['init', '-q', '-b', 'main'], store)
+		git(['-c', 'user.name=t', '-c', 'user.email=t@t', 'add', '.'], store)
+		git(['-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'apps'], store)
+		const torDir = join(data, 'apps', 'system', 'tor')
+		await call('appStore.addRepository', {url: `file://${store}`})
+		await call('apps.install', {appId: 'tor-a'})
+		await call('apps.install', {appId: 'tor-b'})
+		await until(async () => (await q('apps.list')).filter((a) => a.id === 'tor-a' || a.id === 'tor-b').every((a) => a.state === 'running') && (await q('apps.list')).some((a) => a.id === 'tor-b'))
+		assert.equal(up.has('omarchy-tor'), true)
+		assert.equal(await stat(torDir).then(() => true, () => false), true)
+		await call('apps.uninstall', {appId: 'tor-a'})
+		assert.equal(up.has('omarchy-tor'), true, 'another app still uses Tor')
+		assert.equal(await stat(torDir).then(() => true, () => false), true)
+		await call('apps.uninstall', {appId: 'tor-b'})
+		assert.equal(up.has('omarchy-tor'), false)
+		assert.equal(await stat(torDir).then(() => true, () => false), false)
+		assert.equal((await q('apps.list')).some((a) => a.id === 'tor-a' || a.id === 'tor-b'), false)
+		await call('appStore.removeRepository', {url: `file://${store}`})
+	})
+})
+
+test('retry after a failed dependency ignores error-state ports and keeps both records', async () => {
+	const git = (args, cwd) => execFileSync('git', gitArgv(args), {cwd, stdio: 'pipe'}).toString()
+	const root = await mkdtemp(join(os.tmpdir(), 'retry-dep-'))
+	const prev = process.env.DOCKER_HOST
+	const sock = join(root, 'podman.sock')
+	await writeFile(sock, '')
+	process.env.DOCKER_HOST = `unix://${sock}`
+	const takePort = async () => {
+		for (let i = 0; i < 40; i++) {
+			const p = 25000 + Math.floor(Math.random() * 7000)
+			const ok = await new Promise((resolve) => {
+				const s = net.createServer()
+				s.once('error', () => resolve(false))
+				s.listen(p, '0.0.0.0', () => s.close(() => resolve(true)))
+			})
+			if (ok) return p
+		}
+		throw new Error('no free port')
+	}
+	const nodePort = await takePort()
+	const walletPort = await takePort()
+	const store = join(root, 'store')
+	const app = async (id, port, manifest, compose) => {
+		await mkdir(join(store, id), {recursive: true})
+		await writeFile(join(store, id, 'umbrel-app.yml'), `manifestVersion: 1\nid: ${id}\nname: ${id}\nport: ${port}\n${manifest}`)
+		await writeFile(join(store, id, 'docker-compose.yml'), compose)
+	}
+	await app('node', nodePort, '', 'services:\n  web:\n    image: x\n')
+	await app('wallet', walletPort, 'dependencies:\n  - node\n', 'services:\n  web:\n    image: z\n')
+	git(['init', '-q', '-b', 'main'], store)
+	git(['-c', 'user.name=t', '-c', 'user.email=t@t', 'add', '.'], store)
+	git(['-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'store'], store)
+	const networks = new Set()
+	const run = async (cmd, args, opts = {}) => {
+		if (cmd === 'git') return git(args, opts.cwd)
+		if (cmd === 'systemctl' || cmd === 'setfacl' || cmd === 'bwrap') return ''
+		if (cmd === 'podman') {
+			if (args[0] === 'info') return '{}'
+			if (args[0] === 'network' && args[1] === 'exists' && !networks.has(args[2])) throw new Error('no such network')
+			if (args[0] === 'network' && args[1] === 'create') networks.add(args.at(-1))
+			if (args[1] === 'rm') return ''
+			return ''
+		}
+		if (cmd === 'docker-compose') {
+			if (args[0] === 'version') return 'Docker Compose version v2.30.0'
+			if (args.includes('pull') && args[1] === 'omarchy-node') throw new Error('registry down')
+			if (args.includes('ps')) return '[]'
+			return ''
+		}
+		throw new Error(`${cmd} not simulated`)
+	}
+	const apps = createApps({dataDir: join(root, 'data'), home: join(root, 'home'), allowFileStores: true, gatewayHost: '127.0.0.1', defaultStores: [{url: `file://${store}`}], run, systemApps: null})
+	const until = async (fn) => {
+		const end = Date.now() + 5000
+		for (;;) {
+			const v = await fn()
+			if (v) return v
+			if (Date.now() > end) throw new Error('timed out')
+			await new Promise((r) => setTimeout(r, 20))
+		}
+	}
+	try {
+		assert.equal(await apps.procedures['apps.install'].run({appId: 'wallet'}), true)
+		await until(async () => {
+			const list = await apps.procedures['apps.list'].run()
+			const node = list.find((a) => a.id === 'node')
+			const wallet = list.find((a) => a.id === 'wallet')
+			return node?.error && wallet?.error ? list : null
+		})
+		await writeFile(join(store, 'wallet/docker-compose.yml'), 'services:\n  web:\n    image: z\n    volumes:\n      - /etc/passwd:/host-passwd:ro\n')
+		git(['-c', 'user.name=t', '-c', 'user.email=t@t', 'add', '.'], store)
+		git(['-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'refuse'], store)
+		await apps.procedures['appStore.refresh'].run()
+		await assert.rejects(apps.procedures['apps.install'].run({appId: 'wallet'}), (e) => {
+			assert.equal(/already in use/.test(e.message), false, e.message)
+			assert.match(e.message, /never gives an app/)
+			return true
+		})
+		const saved = JSON.parse(await readFile(join(root, 'data/apps/apps.json'), 'utf8'))
+		const ids = saved.apps.map((a) => a.id).sort()
+		assert.deepEqual(ids, ['node', 'wallet'])
+		assert.equal(saved.apps.every((a) => a.state === 'error'), true)
+	} finally {
+		apps.close()
+		if (prev === undefined) delete process.env.DOCKER_HOST
+		else process.env.DOCKER_HOST = prev
+		await rm(root, {recursive: true, force: true})
+	}
 })

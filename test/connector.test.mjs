@@ -3,17 +3,19 @@
 // terminal, and leaving again when removed.
 import assert from 'node:assert/strict'
 import {execFile, execFileSync, spawn} from 'node:child_process'
+import {createHash, randomBytes} from 'node:crypto'
 import {promisify} from 'node:util'
-import {mkdir, mkdtemp, readFile, rm, stat, writeFile} from 'node:fs/promises'
+import {mkdir, mkdtemp, readFile, rm, stat, writeFile, readdir} from 'node:fs/promises'
 import http from 'node:http'
 import os from 'node:os'
 import {join} from 'node:path'
 import {after, before, describe, test} from 'node:test'
 import {fileURLToPath} from 'node:url'
 
-import WebSocket from 'ws'
+import WebSocket, {WebSocketServer} from 'ws'
 
 import {openAccounts} from '../omarchyd/accounts.mjs'
+import {closeReason, createConnector} from '../omarchyd/connector.mjs'
 import {startOmarchyd} from '../omarchyd/server.mjs'
 import {dualProtocolServer, ensureTls, tlsContext} from '../omarchyd/tls.mjs'
 import {createApp} from '../server/app.mjs'
@@ -50,7 +52,10 @@ describe('local swarm', {skip: !hasPython && 'python3 is needed'}, () => {
 			await new Promise((r) => setTimeout(r, 100))
 		}
 	}
-	const agentEnv = () => ({...process.env, HOME: agentHome, XDG_CONFIG_HOME: join(agentHome, '.config'), XDG_DATA_HOME: join(agentHome, '.local/share'), XDG_RUNTIME_DIR: join(agentHome, 'run')})
+	// The backup test (opt in, like test/backups.test.mjs): a real restic and an SMB share.
+	const backupIt = process.env.OMARCHY_BACKUP_IT === '1' && process.env.OMARCHY_BACKUP_RESTIC
+	const resticDir = backupIt ? join(os.tmpdir(), `restic-bin-${process.pid}`) : null
+	const agentEnv = () => ({...process.env, ...(resticDir ? {PATH: `${resticDir}:${process.env.PATH}`} : {}), HOME: agentHome, XDG_CONFIG_HOME: join(agentHome, '.config'), XDG_DATA_HOME: join(agentHome, '.local/share'), XDG_RUNTIME_DIR: join(agentHome, 'run'), OMARCHY_CONNECTOR_TMUX_SOCKET: `omarchy-ctest-${process.pid}`})
 	// Async: the servers under test run in this process, so a blocking call would stall them.
 	const runAgent = async (args) => {
 		try {
@@ -104,12 +109,22 @@ describe('local swarm', {skip: !hasPython && 'python3 is needed'}, () => {
 		await mkdir(data, {recursive: true})
 		const accounts = await openAccounts(data)
 		await accounts.createOwner({name: 'Chris', password: 'correct horse'})
-		d = await startOmarchyd({port: 0, dataDir: data, tlsDir, home: root, webPort, appOptions: {run: async () => '', allowFileStores: true, defaultStores: [], systemApps: null}, updaterOptions: {autoCheck: false, raw: 'https://raw.githubusercontent.com/TouchWorkStation/omarchy-server-dev'}})
+		if (resticDir) {
+			await mkdir(resticDir, {recursive: true})
+			await import('node:fs/promises').then((f) => f.symlink(process.env.OMARCHY_BACKUP_RESTIC, join(resticDir, 'restic')).catch(() => {}))
+		}
+		d = await startOmarchyd({port: 0, dataDir: data, tlsDir, home: root, webPort, backupOptions: {unshare: false, ...(backupIt ? {resticPath: process.env.OMARCHY_BACKUP_RESTIC} : {})}, appOptions: {run: async () => '', allowFileStores: true, defaultStores: [], systemApps: null}, updaterOptions: {autoCheck: false, raw: 'https://raw.githubusercontent.com/MyOwnDataCenter/server'}})
 		await store.setConfig({backendUrl: d.url})
 		const login = await (await fetch(`${d.url}/trpc/user.loginNative`, {method: 'POST', headers: {'content-type': 'application/json'}, body: JSON.stringify({userId: 'owner', password: 'correct horse', client: {id: 't'}})})).json()
 		auth = {authorization: `Bearer ${login.result.data.accessToken}`}
 	})
 	after(async () => {
+		try {
+			execFileSync('tmux', ['-L', `omarchy-ctest-${process.pid}`, 'kill-server'], {stdio: 'ignore'})
+		} catch {
+			// no tmux, or nothing running
+		}
+		if (resticDir) await rm(resticDir, {recursive: true, force: true})
 		agentProc?.kill()
 		await d?.close()
 		web?.close()
@@ -121,10 +136,22 @@ describe('local swarm', {skip: !hasPython && 'python3 is needed'}, () => {
 		const p = await pair({terminal: true, desktop: true, manage: true})
 		assert.match(p.token, /^[A-Za-z0-9_-]{32}$/)
 		assert.match(p.ca, /^[0-9a-f]{64}$/)
-		assert.equal(p.source, 'https://raw.githubusercontent.com/TouchWorkStation/omarchy-server-dev')
+		assert.equal(p.source, 'https://raw.githubusercontent.com/MyOwnDataCenter/server')
 		assert.equal(p.port, webPort)
 		assert.ok(Array.isArray(p.addresses))
 		assert.ok(p.expiresAt > Date.now() + 14 * 60_000)
+	})
+
+	test('pairing can allow storage', async () => {
+		const p = await pair({terminal: false, desktop: false, manage: false, storage: true})
+		assert.equal(p.abilities.storage, true)
+	})
+
+	test('pairing can allow virtual machines', async () => {
+		const on = await pair({terminal: false, desktop: false, manage: false, vms: true})
+		assert.equal(on.abilities.vms, true)
+		const off = await pair({terminal: true})
+		assert.equal(off.abilities.vms, false)
 	})
 
 	test('a computer joins with the code (once), with what both sides allow', async () => {
@@ -135,12 +162,22 @@ describe('local swarm', {skip: !hasPython && 'python3 is needed'}, () => {
 		assert.equal(name, os.hostname())
 		const cfg = JSON.parse(await readFile(join(agentHome, '.config/omarchy-connector/config.json'), 'utf8'))
 		assert.equal((await stat(join(agentHome, '.config/omarchy-connector/config.json'))).mode & 0o777, 0o600)
-		assert.deepEqual(cfg.abilities, {terminal: true, desktop: false, manage: true})
+		assert.deepEqual(cfg.abilities, {terminal: true, desktop: false, manage: true, storage: false, backup: false, services: false, files: false, vms: false})
 		// The same code again: refused.
 		await assert.rejects(runAgent(['enroll', server(), p.token, 'terminal']), /isn’t valid any more|already used|expired/)
 		const [a] = await q('swarm.list')
-		assert.deepEqual(a.allowed, {terminal: true, desktop: false, manage: true})
+		assert.deepEqual(a.allowed, {terminal: true, desktop: false, manage: true, storage: false, backup: false, services: false, files: false, vms: false})
 		assert.equal(a.online, false)
+	})
+
+	test('setAbilities cannot grant vms that was not allowed at join', async () => {
+		const [a] = await q('swarm.list')
+		assert.equal(a.allowed.vms, false)
+		await assert.rejects(call('swarm.setAbilities', {id: a.id, vms: true}), /wasn’t allowed vms/)
+	})
+
+	test('swarm.vms.status refuses an unknown computer', async () => {
+		await assert.rejects(q('swarm.vms.status', {id: 'abcdefabcdef'}), /isn’t in your swarm/)
 	})
 
 	test('it connects, says what it is, and reports every few seconds', async () => {
@@ -152,6 +189,8 @@ describe('local swarm', {skip: !hasPython && 'python3 is needed'}, () => {
 		assert.equal(a.info.hostname, os.hostname())
 		assert.ok(a.metrics.disks.length >= 1)
 		assert.ok(a.metrics.cores >= 1)
+		assert.ok(Array.isArray(a.metrics.gpus))
+		assert.ok(Array.isArray(a.metrics.batteries))
 	})
 
 	test('a terminal on that computer, through the server', async () => {
@@ -162,7 +201,34 @@ describe('local swarm', {skip: !hasPython && 'python3 is needed'}, () => {
 		await new Promise((r, j) => (ws.once('open', r), ws.once('error', j)))
 		ws.send('echo swarm-$((40+2)); stty size\n')
 		await until(async () => out.includes('swarm-42') && /30 100/.test(out))
+		// The window changes size: the connector resizes its shell too.
+		ws.send(Buffer.from(JSON.stringify({type: 'resize', cols: 140, rows: 44})), {binary: true})
+		await new Promise((r) => setTimeout(r, 300))
+		ws.send('stty size\n')
+		await until(async () => /44 140/.test(out))
 		ws.close()
+	})
+
+	test('a computer’s terminal is still there after you leave and come back', async () => {
+		const [a] = await q('swarm.list')
+		const first = await browserWs('terminal', {agentId: a.id, cols: '100', rows: '30'})
+		let out1 = ''
+		first.on('message', (d) => (out1 += String(d)))
+		await new Promise((r, j) => (first.once('open', r), first.once('error', j)))
+		first.send('export KEPT=still-$((20+3)); echo set-$KEPT\n')
+		await until(async () => out1.includes('set-still-23'))
+		first.close()
+		await new Promise((r) => setTimeout(r, 500))
+		// Back again: the same shell, with what was on screen.
+		const again = await browserWs('terminal', {agentId: a.id, cols: '100', rows: '30'})
+		let out2 = ''
+		again.on('message', (d) => (out2 += String(d)))
+		await new Promise((r, j) => (again.once('open', r), again.once('error', j)))
+		await until(async () => out2.includes('set-still-23'))
+		again.send('echo got-$KEPT\n')
+		await until(async () => out2.includes('got-still-23'))
+		assert.match(out2, /"resumed":true/)
+		again.close()
 	})
 
 	test('what wasn’t allowed stays off: the desktop here, and the server can’t switch it on', async () => {
@@ -171,8 +237,12 @@ describe('local swarm', {skip: !hasPython && 'python3 is needed'}, () => {
 		const closed = await new Promise((r) => ws.once('close', (code, reason) => r({code, reason: String(reason)})))
 		assert.match(closed.reason, /isn’t switched on/)
 		await assert.rejects(call('swarm.setAbilities', {id: a.id, desktop: true}), /wasn’t allowed desktop when it joined/)
-		// Switching the terminal off here closes it off too.
+		// Switching the terminal off here closes it off too, including one that's already open (#289).
+		const open = await browserWs('terminal', {agentId: a.id, cols: '80', rows: '24'})
+		await new Promise((r, j) => (open.once('open', r), open.once('error', j)))
+		const ended = new Promise((r) => open.once('close', (code, reason) => r(String(reason))))
 		await call('swarm.setAbilities', {id: a.id, terminal: false})
+		assert.match(await ended, /isn’t switched on/)
 		const t = await browserWs('terminal', {agentId: a.id, cols: '80', rows: '24'})
 		const tc = await new Promise((r) => t.once('close', (code, reason) => r(String(reason))))
 		assert.match(tc, /isn’t switched on/)
@@ -182,7 +252,8 @@ describe('local swarm', {skip: !hasPython && 'python3 is needed'}, () => {
 	test('manage: only the fixed actions; unverified plugins refused before it’s asked', async () => {
 		const [a] = await q('swarm.list')
 		await assert.rejects(call('swarm.action', {id: a.id, name: 'run', args: 'rm -rf /'}), /Unknown action/)
-		await assert.rejects(call('swarm.action', {id: a.id, name: 'theme-set', theme: 'Tokyo Night'}), /can’t be set here/)
+		// A name no machine accepts, so this never switches a real desktop's theme (and holds on Omarchy too).
+		await assert.rejects(call('swarm.action', {id: a.id, name: 'theme-set', theme: '../Tokyo Night'}), /can’t be set here|Bad theme|theme/i)
 		await call('swarm.rename', {id: a.id, name: 'Study PC'})
 		assert.equal((await q('swarm.list'))[0].name, 'Study PC')
 	})
@@ -195,6 +266,23 @@ describe('local swarm', {skip: !hasPython && 'python3 is needed'}, () => {
 		// (fetch refuses the private CA; plain http reaches the same route)
 		const r = none ?? (await fetch(`http://127.0.0.1:${webPort}/connector/enroll`, {method: 'POST', headers: {'content-type': 'application/json'}, body: JSON.stringify({token: 'guess'})}))
 		assert.equal(r.status, 401)
+	})
+
+	test('#108 a frame for a channel that is already closed is ignored, not a crash', async () => {
+		const cfg = JSON.parse(await readFile(join(agentHome, '.config/omarchy-connector/config.json'), 'utf8'))
+		// #288: a terminal on the old connection ends when the computer connects again.
+		const [a0] = await q('swarm.list')
+		const term = await browserWs('terminal', {agentId: a0.id, cols: '80', rows: '24'})
+		await new Promise((r, j) => (term.once('open', r), term.once('error', j)))
+		const termEnded = new Promise((r) => term.once('close', (code, reason) => r(String(reason))))
+		const ws = new WebSocket(`wss://127.0.0.1:${webPort}/connector/ws`, {rejectUnauthorized: false, headers: {authorization: `Bearer ${cfg.id}:${cfg.key}`, 'user-agent': 'omarchy-connector/test'}})
+		await new Promise((r, j) => (ws.once('open', r), ws.once('error', j)))
+		assert.match(await termEnded, /reconnected/)
+		ws.send(Buffer.from([0, 0, 0, 9, 65, 66]), {binary: true})
+		await new Promise((r) => setTimeout(r, 300))
+		ws.close()
+		// The server is still up and the real connector reconnects.
+		await until(async () => (await q('swarm.list'))[0]?.online)
 	})
 
 	test('removed from the swarm: it’s cut off, forgets the server and stops', async () => {
@@ -237,5 +325,395 @@ describe('local swarm', {skip: !hasPython && 'python3 is needed'}, () => {
 		// The VNC server listens only on a socket in the connector's private runtime folder, no port.
 		const sockDir = join(agentHome, 'run/omarchy-connector')
 		assert.equal((await stat(sockDir)).mode & 0o777, 0o700)
+	})
+	// A Wayland desktop (sway, headless) shared through wayvnc, the way Omarchy's Hyprland is.
+	const hasWayland = (() => {
+		try {
+			execFileSync('sh', ['-c', 'command -v sway && command -v wayvnc'])
+			return true
+		} catch {
+			return false
+		}
+	})()
+	test('desktop: a Wayland desktop (wayvnc on a private socket) reaches the browser, even with another wayvnc running', {skip: !hasWayland && 'sway and wayvnc are needed'}, async (t) => {
+		agentProc?.kill()
+		await rm(join(agentHome, '.config/omarchy-connector/config.json'), {force: true})
+		const runtime = join(agentHome, 'run')
+		await mkdir(runtime, {recursive: true, mode: 0o700})
+		const sway = spawn('sway', ['-c', '/dev/null'], {env: {...agentEnv(), WLR_BACKENDS: 'headless', WLR_LIBINPUT_NO_DEVICES: '1', WLR_RENDERER: 'pixman', WAYLAND_DISPLAY: ''}, stdio: 'ignore'})
+		t.after(() => sway.kill())
+		const display = await until(async () => (await readdir(runtime)).find((n) => /^wayland-\d+$/.test(n)))
+		// Someone's own wayvnc already holds the default control socket (MODC's desktop sharing does).
+		const other = spawn('wayvnc', ['--unix-socket', join(runtime, 'other-vnc.sock')], {env: {...agentEnv(), WAYLAND_DISPLAY: display}, stdio: 'ignore'})
+		t.after(() => other.kill())
+		await until(async () => stat(join(runtime, 'other-vnc.sock')).then(() => true))
+		const p = await pair({terminal: false, desktop: true, manage: false})
+		await trust(p.ca)
+		await runAgent(['enroll', server(), p.token, 'desktop'])
+		startAgent()
+		t.after(() => agentProc.kill())
+		const a = await until(async () => {
+			const x = (await q('swarm.list')).find((y) => y.online && y.allowed.desktop)
+			return x?.info?.desktop?.kind === 'wlroots' && x
+		})
+		assert.equal(a.info.desktop.ok, true)
+		assert.equal(await q('swarm.desktopCheck', {id: a.id}), true)
+		for (let i = 0; i < 2; i++) {
+			// Twice: leaving and opening it again works too.
+			const ws = await browserWs('machines', {machineId: `agent-${a.id}`})
+			const first = await new Promise((r, j) => (ws.once('message', (d) => r(Buffer.from(d))), ws.once('close', (c, why) => j(new Error(`closed ${c} ${why}`)))))
+			assert.match(first.toString('latin1'), /^RFB 003\.00\d\n/)
+			ws.close()
+			await new Promise((r) => setTimeout(r, 300))
+		}
+	})
+	test('backups: a computer backs up chosen folders to the server, can’t delete them, and restores into ~/Restored', {skip: !backupIt && 'set OMARCHY_BACKUP_IT=1, OMARCHY_BACKUP_RESTIC and OMARCHY_BACKUP_SMB', timeout: 300_000}, async () => {
+		const [hostport, share, username, password] = String(process.env.OMARCHY_BACKUP_SMB).split(' ')
+		const folder = `Omarchy Swarm IT ${Date.now()}`
+		agentProc?.kill()
+		await rm(join(agentHome, '.config/omarchy-connector/config.json'), {force: true})
+		await mkdir(join(agentHome, 'Documents', 'Taxes'), {recursive: true})
+		await mkdir(join(agentHome, 'Music'), {recursive: true})
+		await writeFile(join(agentHome, 'Documents', 'Taxes', '2026.txt'), 'refund: yes\n')
+		await writeFile(join(agentHome, 'Music', 'song.txt'), 'not chosen\n')
+		const p = await pair({backup: true})
+		await trust(p.ca)
+		await runAgent(['enroll', server(), p.token, 'backup'])
+		startAgent()
+		const a = await until(async () => (await q('swarm.list')).find((x) => x.online && x.allowed.backup))
+		try {
+			// No NAS yet: the server's own backups come first.
+			await assert.rejects(call('backups.setComputer', {id: a.id, folders: ['Documents'], enabled: true}), /this server first/)
+			await call('backups.configure', {nas: {host: hostport, share, folder, username, password}})
+			const list = await call('backups.computerFolders', {id: a.id})
+			assert.ok(list.folders.some((f) => f.name === 'Documents'))
+			await assert.rejects(call('backups.setComputer', {id: a.id, folders: ['../etc'], enabled: true}), /isn’t a folder/)
+			await call('backups.setComputer', {id: a.id, folders: ['Documents'], enabled: true})
+			await call('backups.runComputer', {id: a.id})
+			const done = await until(async () => {
+				const c = (await q('backups.computers')).find((x) => x.id === a.id)
+				return c && !c.running && c.last ? c : null
+			}, 240_000)
+			assert.equal(done.last.ok, true, done.last.error)
+			const snaps = await q('backups.computerSnapshots', {id: a.id})
+			assert.equal(snaps.length, 1)
+			assert.ok(snaps[0].paths.some((x) => x.endsWith('/Documents')))
+			assert.ok(!snaps[0].paths.some((x) => x.endsWith('/Music')))
+
+			// Add-only: with its own key, the computer can read and add, but not delete or replace.
+			const cfg = JSON.parse(await readFile(join(agentHome, '.config/omarchy-connector/config.json'), 'utf8'))
+			const asAgent = (method, path, body) => fetch(`http://127.0.0.1:${webPort}/connector/backup/${path}`, {method, body, headers: {authorization: `Bearer ${cfg.id}:${cfg.key}`}})
+			const snapsList = await (await asAgent('GET', 'snapshots/')).json()
+			assert.equal(snapsList.length, 1)
+			assert.equal((await asAgent('DELETE', `snapshots/${snapsList[0]}`)).status, 403)
+			assert.equal((await asAgent('POST', `snapshots/${snapsList[0]}`, 'x')).status, 403)
+			assert.equal((await asAgent('POST', '')).status, 403)
+			assert.equal((await fetch(`http://127.0.0.1:${webPort}/connector/backup/keys/`)).status, 401)
+
+			// Restore: into a new folder, never over the files that are there.
+			await writeFile(join(agentHome, 'Documents', 'Taxes', '2026.txt'), 'changed since\n')
+			await call('backups.restoreComputer', {id: a.id, snapshotId: snaps[0].id})
+			const restored = await until(async () => (await q('backups.computers')).find((x) => x.id === a.id && x.lastRestore)?.lastRestore, 120_000)
+			assert.equal(restored.ok, true, restored.error)
+			assert.equal(await readFile(join(restored.folder, 'Documents', 'Taxes', '2026.txt'), 'utf8'), 'refund: yes\n')
+			assert.equal(await readFile(join(agentHome, 'Documents', 'Taxes', '2026.txt'), 'utf8'), 'changed since\n')
+
+			// Backups switched off for it here: the server refuses, and so would the computer.
+			await call('swarm.setAbilities', {id: a.id, backup: false})
+			await assert.rejects(call('backups.runComputer', {id: a.id}), /aren’t switched on/)
+		} finally {
+			try {
+				execFileSync('smbclient', [`//${hostport.split(':')[0]}/${share}`, '-U', `${username}%${password}`, ...(hostport.includes(':') ? ['-p', hostport.split(':')[1]] : []), '-c', `deltree "${folder}"`], {stdio: 'ignore'})
+			} catch {
+				/* best effort */
+			}
+		}
+	})
+})
+
+describe('swarm close reasons', () => {
+	test('closeReason: 50 ideographs stay within 123 bytes and round-trip', () => {
+		const reason = closeReason('あ'.repeat(50))
+		const buf = Buffer.from(reason)
+		assert.ok(buf.length <= 123)
+		assert.equal(buf.toString('utf8'), reason)
+		assert.equal(reason.includes('\uFFFD'), false)
+		assert.equal(reason, 'あ'.repeat(41))
+		// A cut that lands inside a character walks back to the start of it.
+		const skewed = closeReason(`x${'あ'.repeat(50)}`)
+		assert.equal(Buffer.byteLength(skewed) <= 123, true)
+		assert.equal(Buffer.from(skewed).toString('utf8'), skewed)
+		assert.equal(skewed.includes('\uFFFD'), false)
+		assert.equal(skewed, `x${'あ'.repeat(40)}`)
+		const emoji = closeReason('😀'.repeat(40))
+		assert.equal(Buffer.byteLength(emoji) <= 123, true)
+		assert.equal(Buffer.from(emoji).toString('utf8'), emoji)
+		assert.equal(emoji.includes('\uFFFD'), false)
+		// What already fits is kept, including the real short close text. Controls become spaces.
+		const short = 'The desktop isn’t switched on for Study PC'
+		assert.equal(closeReason(short), short)
+		assert.equal(closeReason('a'.repeat(123)), 'a'.repeat(123))
+		assert.equal(closeReason('a'.repeat(124)), 'a'.repeat(123))
+		assert.equal(closeReason('a\u0000b\u001fc\u007fd'), 'a b c d')
+		assert.equal(closeReason(null), '')
+		assert.equal(closeReason(undefined), '')
+	})
+
+	const abilities = {terminal: false, desktop: false, manage: false, storage: false, backup: false}
+	async function withAgent(agent, run) {
+		const dataDir = await mkdtemp(join(os.tmpdir(), 'swarm-close-'))
+		const id = 'aabbccddeeff'
+		const key = randomBytes(32).toString('base64url')
+		await writeFile(
+			join(dataDir, 'swarm.json'),
+			JSON.stringify({
+				agents: [{id, name: agent.name, keyHash: createHash('sha256').update(key).digest('hex'), allowed: agent.allowed, on: agent.on ?? agent.allowed, enrolledAt: 1, lastSeen: null, info: {hostname: 'pc'}}],
+			}),
+		)
+		const c = createConnector({dataDir, tlsDir: dataDir})
+		const server = http.createServer()
+		server.on('upgrade', (req, socket, head) => {
+			c.upgradeAgent(req, socket, head).catch(() => socket.destroy())
+		})
+		await new Promise((r) => server.listen(0, '127.0.0.1', r))
+		const agentWs = new WebSocket(`ws://127.0.0.1:${server.address().port}/`, {headers: {authorization: `Bearer ${id}:${key}`}})
+		try {
+			await new Promise((resolve, reject) => (agentWs.once('open', resolve), agentWs.once('error', reject)))
+			await run({c, id, agentWs})
+		} finally {
+			agentWs.terminate()
+			c.close()
+			await new Promise((r) => server.close(r))
+			await rm(dataDir, {recursive: true, force: true, maxRetries: 5, retryDelay: 20})
+		}
+	}
+	async function browserSocket() {
+		const wss = new WebSocketServer({port: 0, host: '127.0.0.1'})
+		await new Promise((r) => (wss.address() ? r() : wss.once('listening', r)))
+		const client = new WebSocket(`ws://127.0.0.1:${wss.address().port}`)
+		const serverSide = await new Promise((r) => wss.once('connection', r))
+		serverSide.on('error', () => {})
+		client.on('error', () => {})
+		await new Promise((resolve, reject) => (client.once('open', resolve), client.once('error', reject)))
+		return {client, serverSide, close: () => new Promise((r) => wss.close(r))}
+	}
+	const closedAs = (client) => new Promise((r) => client.once('close', (code, reason) => r({code, reason: Buffer.from(reason)})))
+
+	test('a long unicode computer name closes the socket instead of throwing', async () => {
+		const name = 'あ'.repeat(48)
+		await withAgent({name, allowed: abilities}, async ({c, id}) => {
+			const browser = await browserSocket()
+			try {
+				const closed = closedAs(browser.client)
+				c.openChannel(id, 'vnc', browser.serverSide)
+				const got = await closed
+				const text = got.reason.toString('utf8')
+				assert.equal(got.code, 1011)
+				assert.ok(got.reason.length <= 123)
+				assert.equal(Buffer.from(text).toString('utf8'), text)
+				assert.equal(text.includes('\uFFFD'), false)
+				assert.match(text, /^The desktop isn’t switched on for あ/)
+				// A name that already fits is the whole sentence, not a shortened one.
+				await c.procedures['swarm.rename'].run({id, name: 'Study PC'})
+				const again = await browserSocket()
+				try {
+					const full = closedAs(again.client)
+					c.openChannel(id, 'vnc', again.serverSide)
+					const kept = await full
+					assert.equal(kept.code, 1011)
+					assert.equal(kept.reason.toString('utf8'), 'The desktop isn’t switched on for Study PC')
+				} finally {
+					await again.close()
+				}
+			} finally {
+				await browser.close()
+			}
+		})
+	})
+
+	test('a long connector close reason is forwarded without throwing', async () => {
+		await withAgent({name: 'pc', allowed: {...abilities, terminal: true}, on: {...abilities, terminal: true}}, async ({c, id, agentWs}) => {
+			const browser = await browserSocket()
+			try {
+				const opened = new Promise((r) => agentWs.on('message', function onOpen(d) {
+					const m = JSON.parse(String(d))
+					if (m.op === 'open') (agentWs.off('message', onOpen), r(m))
+				}))
+				c.openChannel(id, 'pty', browser.serverSide, {cols: 80, rows: 24})
+				const open = await opened
+				assert.equal(open.op, 'open')
+				const closed = closedAs(browser.client)
+				agentWs.send(JSON.stringify({op: 'closed', ch: open.ch, code: 1011, reason: `\u0000${'あ'.repeat(50)}`}))
+				const got = await closed
+				const text = got.reason.toString('utf8')
+				assert.equal(got.code, 1011)
+				assert.ok(got.reason.length <= 123)
+				assert.equal(Buffer.from(text).toString('utf8'), text)
+				assert.equal(text.includes('\uFFFD'), false)
+				assert.equal(text.includes('\u0000'), false)
+				assert.match(text, /^ あ/)
+			} finally {
+				await browser.close()
+			}
+		})
+	})
+
+	test('turning Terminal or Desktop off ends sessions that are already open', async () => {
+		const allowed = {...abilities, terminal: true, desktop: true}
+		await withAgent({name: 'Study PC', allowed, on: {...allowed}}, async ({c, id, agentWs}) => {
+			const pty = await browserSocket()
+			const vnc = await browserSocket()
+			const closedOrStillOpen = (pending, label) => new Promise((resolve, reject) => {
+				const timer = setTimeout(() => reject(new Error(`${label} channel stayed open`)), 1000)
+				pending.then((v) => (clearTimeout(timer), resolve(v)), (e) => (clearTimeout(timer), reject(e)))
+			})
+			try {
+				const opens = []
+				const opened = new Promise((resolve) => {
+					const onMsg = (d, isBinary) => {
+						if (isBinary) return
+						const msg = JSON.parse(String(d))
+						if (msg.op !== 'open') return
+						opens.push(msg)
+						if (opens.length < 2) return
+						agentWs.off('message', onMsg)
+						resolve(opens)
+					}
+					agentWs.on('message', onMsg)
+				})
+				c.openChannel(id, 'pty', pty.serverSide, {cols: 80, rows: 24})
+				c.openChannel(id, 'vnc', vnc.serverSide)
+				const openMsgs = await opened
+				assert.equal(openMsgs.filter((m) => m.kind === 'pty').length, 1)
+				assert.equal(openMsgs.filter((m) => m.kind === 'vnc').length, 1)
+
+				const ptyClosed = closedAs(pty.client)
+				await c.procedures['swarm.setAbilities'].run({id, terminal: false})
+				const got = await closedOrStillOpen(ptyClosed, 'pty')
+				assert.equal(got.code, 1011)
+				assert.equal(got.reason.toString('utf8'), 'The terminal isn’t switched on for Study PC')
+
+				const binaries = []
+				const onBin = (d, isBinary) => {
+					if (isBinary) binaries.push(d)
+				}
+				agentWs.on('message', onBin)
+				try {
+					pty.serverSide.send(Buffer.from([1, 2, 3, 4]))
+				} catch {}
+				await new Promise((r) => setTimeout(r, 50))
+				assert.equal(binaries.length, 0)
+				agentWs.off('message', onBin)
+
+				assert.equal(vnc.client.readyState, WebSocket.OPEN)
+
+				const vncClosed = closedAs(vnc.client)
+				await c.procedures['swarm.setAbilities'].run({id, desktop: false})
+				const gotVnc = await closedOrStillOpen(vncClosed, 'vnc')
+				assert.equal(gotVnc.code, 1011)
+				assert.equal(gotVnc.reason.toString('utf8'), 'The desktop isn’t switched on for Study PC')
+			} finally {
+				// An open socket keeps the browser's server from finishing close, so the failure never reports.
+				pty.client.terminate()
+				pty.serverSide.terminate()
+				vnc.client.terminate()
+				vnc.serverSide.terminate()
+				await pty.close()
+				await vnc.close()
+			}
+		})
+	})
+
+	test('removing a computer ends its open terminal at once and says it was removed (#738)', async () => {
+		const allowed = {...abilities, terminal: true}
+		await withAgent({name: 'Study PC', allowed, on: {...allowed}}, async ({c, id, agentWs}) => {
+			const pty = await browserSocket()
+			try {
+				const opened = new Promise((resolve) => {
+					const onMsg = (d, isBinary) => {
+						if (isBinary) return
+						if (JSON.parse(String(d)).op !== 'open') return
+						agentWs.off('message', onMsg)
+						resolve()
+					}
+					agentWs.on('message', onMsg)
+				})
+				c.openChannel(id, 'pty', pty.serverSide, {cols: 80, rows: 24})
+				await opened
+				const closed = closedAs(pty.client)
+				const started = Date.now()
+				await c.procedures['swarm.remove'].run({id})
+				const got = await Promise.race([closed, new Promise((resolve) => setTimeout(() => resolve(null), 300))])
+				assert.ok(got, `the terminal was still open ${Date.now() - started} ms after the computer was removed`)
+				assert.equal(got.reason.toString('utf8'), 'This computer was removed from the swarm')
+				const binaries = []
+				agentWs.on('message', (d, isBinary) => isBinary && binaries.push(d))
+				try {
+					pty.serverSide.send(Buffer.from([1, 2, 3, 4]))
+				} catch {}
+				await new Promise((r) => setTimeout(r, 50))
+				assert.equal(binaries.length, 0)
+			} finally {
+				pty.client.terminate()
+				pty.serverSide.terminate()
+				await pty.close()
+			}
+		})
+	})
+
+	test('vms allowed at join can be switched off and back on', async () => {
+		const allowed = {terminal: false, desktop: false, manage: false, storage: false, backup: false, services: false, files: false, vms: true}
+		await withAgent({name: 'pc', allowed, on: {...allowed}}, async ({c, id}) => {
+			await c.procedures['swarm.setAbilities'].run({id, vms: false})
+			let row = (await c.procedures['swarm.list'].run()).find((a) => a.id === id)
+			assert.equal(row.on.vms, false)
+			await c.procedures['swarm.setAbilities'].run({id, vms: true})
+			row = (await c.procedures['swarm.list'].run()).find((a) => a.id === id)
+			assert.equal(row.on.vms, true)
+		})
+	})
+
+	test('a guest console channel asks for vms and passes the guest id', async () => {
+		const allowed = {...abilities, vms: true, desktop: false}
+		await withAgent({name: 'pc', allowed, on: {...allowed}}, async ({c, id, agentWs}) => {
+			const bad = await browserSocket()
+			try {
+				const badClosed = closedAs(bad.client)
+				c.openChannel(id, 'vnc', bad.serverSide, {guest: '../etc'})
+				const badGot = await badClosed
+				assert.equal(badGot.code, 1011)
+			} finally {
+				await bad.close()
+			}
+			const browser = await browserSocket()
+			try {
+				const opened = new Promise((r) => agentWs.on('message', function onOpen(d) {
+					const m = JSON.parse(String(d))
+					if (m.op === 'open') (agentWs.off('message', onOpen), r(m))
+				}))
+				c.openChannel(id, 'vnc', browser.serverSide, {guest: 'abcd1234'})
+				const open = await opened
+				assert.equal(open.kind, 'vnc')
+				assert.equal(open.guest, 'abcd1234')
+			} finally {
+				// An open socket keeps the browser's server from finishing close, so the failure never reports.
+				browser.client.terminate()
+				browser.serverSide.terminate()
+				await browser.close()
+			}
+		})
+		const desktopOnly = {...abilities, desktop: true, vms: false}
+		await withAgent({name: 'pc', allowed: desktopOnly, on: {...desktopOnly}}, async ({c, id}) => {
+			const browser = await browserSocket()
+			try {
+				const closed = closedAs(browser.client)
+				c.openChannel(id, 'vnc', browser.serverSide, {guest: 'abcd1234'})
+				const got = await closed
+				assert.equal(got.code, 1011)
+				assert.equal(got.reason.toString('utf8'), 'Virtual machines isn’t switched on for pc')
+			} finally {
+				await browser.close()
+			}
+		})
 	})
 })

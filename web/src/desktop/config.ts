@@ -2,27 +2,11 @@
 // icons on the desktop. Saved on the server for your account, so every browser shows the same desktop.
 import {useCallback, useEffect, useState} from 'react'
 
-export const WALLPAPERS = [
-	{id: 'valley', name: "Yosemite Valley", by: "Aniket Doele", hsl: '197 45% 55%'},
-	{id: 'halfdome', name: "Half Dome at Night", by: "Pexels", hsl: '205 45% 55%'},
-	{id: 'dolomites', name: "Dolomites", by: "Unsplash", hsl: '23 45% 55%'},
-	{id: 'meadow', name: "Alpine Meadow", by: "Peter Thomas", hsl: '198 68% 55%'},
-	{id: 'canyon', name: "Slot Canyon", by: "Ashim D'Silva", hsl: '19 71% 55%'},
-	{id: 'surf', name: "Surf", by: "Nattu Adnan", hsl: '197 85% 55%'},
-	{id: 'pier', name: "Pier at Dusk", by: "Unsplash", hsl: '10 62% 55%'},
-	{id: 'fern', name: "Fern", by: "Unsplash", hsl: '139 45% 55%'},
-	{id: 'dunes', name: "Dunes", by: "David Emrich", hsl: '32 45% 55%'},
-	{id: 'orbit', name: "Orbit", by: "SpaceX", hsl: '200 85% 55%'},
-	{id: 'dahlia', name: "Dahlia", by: "Tj Holowaychuk", hsl: '337 72% 55%'},
-	{id: 'tower', name: "Tower", by: "Viktor Forgacs", hsl: '189 45% 55%'},
-] as const
-export type BuiltinWallpaper = (typeof WALLPAPERS)[number]['id']
-// 'server' = your Omarchy Server wallpaper (what the phone shows); 'photo' = the photo you uploaded;
+// 'server' = your My Own Data Center wallpaper (what the phone shows); 'photo' = the photo you uploaded;
 // 'omarchy' = an Omarchy desktop background (which one: prefs.omarchyBackground, or the desktop's own).
 // 'color:#rrggbb' = a plain colour instead of a picture.
-export type WallpaperId = BuiltinWallpaper | 'server' | 'photo' | 'omarchy' | `color:#${string}`
+export type WallpaperId = 'server' | 'photo' | 'omarchy' | `color:#${string}`
 export const solidOf = (w: string) => (/^color:#[0-9a-f]{6}$/i.test(w) ? w.slice(6).toLowerCase() : null)
-export const wallpaperSrc = (id: string, thumb = false) => `/wallpapers/${id}${thumb ? '-thumb' : ''}.jpg`
 
 export type DeskStyle = 'yaru' | 'glass' | 'graphite' | 'daylight'
 export const STYLES: {id: DeskStyle; name: string; note: string}[] = [
@@ -39,43 +23,45 @@ export const DOCK_ICON_MAX = 80
 const LEGACY_SIZE: Record<string, number> = {small: 38, medium: 46, large: 56}
 export type DeskIcon = {key: string; col: number; row: number}
 
+export type DeskShell = 'gnome' | 'hyprland'
 export type DeskConfig = {
 	v: 1
 	preset: string | null
 	wallpaper: WallpaperId
 	style: DeskStyle
 	accent: DeskAccent
-	dock: {position: DockPos; iconSize: number; hover: DockHover; magnify: number; bounce: boolean; floating: boolean; autohide: boolean; showRunning: boolean; items: string[]}
+	shell: DeskShell
+	// Omarchy Super shortcuts, key capture, and the snippet. Square tiles without this.
+	omarchySuperKeys: boolean
+	dock: {position: DockPos; iconSize: number; hover: DockHover; magnify: number; bounce: boolean; floating: boolean; autohide: boolean; showRunning: boolean; items: string[]; homeAdded?: boolean}
 	icons: DeskIcon[]
 	showIcons: boolean
 	// 'auto': a window when the app allows being shown inside one, otherwise a browser tab
 	appsOpenIn: 'auto' | 'tab'
 }
 
-export const SYSTEM_DOCK = ['files', 'apps', 'store', 'terminal', 'machines', 'system', 'settings'] as const
+/** The dock before Home was a window. A saved dock that still matches this, item for item, gains Home once. */
+const PREVIOUS_SYSTEM_DOCK = ['files', 'apps', 'store', 'terminal', 'machines', 'system', 'settings'] as const
+export const SYSTEM_DOCK = ['home', ...PREVIOUS_SYSTEM_DOCK] as const
 
-export const PRESETS: {id: string; name: string; wallpaper: BuiltinWallpaper; style: DeskStyle; accent: DeskAccent}[] = [
-	{id: 'ubuntu', name: 'Ubuntu', wallpaper: 'canyon', style: 'yaru', accent: 'peach'},
-	{id: 'yosemite', name: 'Yosemite', wallpaper: 'valley', style: 'glass', accent: 'wallpaper'},
-	{id: 'midnight', name: 'Midnight', wallpaper: 'halfdome', style: 'graphite', accent: 'blue'},
-	{id: 'coast', name: 'Coast', wallpaper: 'surf', style: 'glass', accent: 'teal'},
-	{id: 'dusk', name: 'Dusk', wallpaper: 'pier', style: 'glass', accent: 'mauve'},
-	{id: 'forest', name: 'Forest', wallpaper: 'fern', style: 'graphite', accent: 'green'},
-	{id: 'dolomites', name: 'Dolomites', wallpaper: 'dolomites', style: 'yaru', accent: 'wallpaper'},
-	{id: 'alpine', name: 'Alpine', wallpaper: 'meadow', style: 'daylight', accent: 'blue'},
-	{id: 'dunes', name: 'Dunes', wallpaper: 'dunes', style: 'daylight', accent: 'peach'},
-	{id: 'orbit', name: 'Orbit', wallpaper: 'orbit', style: 'graphite', accent: 'blue'},
-	{id: 'bloom', name: 'Bloom', wallpaper: 'dahlia', style: 'glass', accent: 'pink'},
-	{id: 'skyline', name: 'Skyline', wallpaper: 'tower', style: 'daylight', accent: 'teal'},
-]
+/** Terminals sits after Machines on the phone dock and in a desktop window. It is not part of the saved default dock. */
+export function withTerminals(keys: readonly string[], show: boolean): string[] {
+	if (!show || keys.includes('terminals')) return [...keys]
+	const next = [...keys]
+	const at = next.indexOf('machines')
+	next.splice(at < 0 ? next.length : at + 1, 0, 'terminals')
+	return next
+}
 
 const KEY = 'omarchy-server:desktop-config'
 export const DEFAULT_CONFIG: DeskConfig = {
 	v: 1,
-	preset: 'yosemite',
+	preset: null,
 	wallpaper: 'omarchy',
 	style: 'glass',
 	accent: 'wallpaper',
+	shell: 'gnome',
+	omarchySuperKeys: false,
 	dock: {position: 'left', iconSize: 46, hover: 'lift', magnify: 1.6, bounce: true, floating: false, autohide: false, showRunning: true, items: [...SYSTEM_DOCK]},
 	icons: [
 		{key: 'folder:/Home', col: 0, row: 0},
@@ -89,7 +75,7 @@ function clean(raw: unknown): DeskConfig {
 	const c = (raw && typeof raw === 'object' ? raw : {}) as Partial<DeskConfig>
 	const d = DEFAULT_CONFIG
 	const dock = {...d.dock, ...(c.dock ?? {})} as DeskConfig['dock'] & {size?: string}
-	const okWall = (w: unknown): w is WallpaperId => w === 'server' || w === 'photo' || w === 'omarchy' || WALLPAPERS.some((x) => x.id === w) || (typeof w === 'string' && !!solidOf(w))
+	const okWall = (w: unknown): w is WallpaperId => w === 'server' || w === 'photo' || w === 'omarchy' || (typeof w === 'string' && !!solidOf(w))
 	// Pins from the first desktop release move into the dock.
 	let legacyPins: string[] = []
 	try {
@@ -98,11 +84,17 @@ function clean(raw: unknown): DeskConfig {
 		/* none */
 	}
 	const items = Array.isArray(dock.items) ? dock.items.filter((k) => typeof k === 'string') : d.dock.items
+	// Only a dock saved before Home existed gets it, and only once: clean() runs on every change, so without
+	// the homeAdded mark a dock the owner trimmed back to these seven would get Home again each time.
+	const previousDefault = c.dock?.homeAdded !== true && items.length === PREVIOUS_SYSTEM_DOCK.length && PREVIOUS_SYSTEM_DOCK.every((key, index) => items[index] === key)
+	const dockItems = previousDefault ? ['home', ...items] : items
 	return {
 		v: 1,
 		preset: typeof c.preset === 'string' ? c.preset : null,
 		wallpaper: okWall(c.wallpaper) ? c.wallpaper : d.wallpaper,
 		style: STYLES.some((s) => s.id === c.style) ? (c.style as DeskStyle) : d.style,
+		shell: c.shell === 'hyprland' ? 'hyprland' : 'gnome',
+		omarchySuperKeys: c.omarchySuperKeys === true,
 		accent: (['app', 'wallpaper', 'blue', 'mauve', 'teal', 'peach', 'green', 'pink'] as const).includes(c.accent as DeskAccent) ? (c.accent as DeskAccent) : d.accent,
 		dock: {
 			position: (['left', 'bottom', 'right', 'top'] as const).includes(dock.position) ? dock.position : 'left',
@@ -114,7 +106,8 @@ function clean(raw: unknown): DeskConfig {
 			floating: !!dock.floating,
 			autohide: !!dock.autohide,
 			showRunning: dock.showRunning !== false,
-			items: [...new Set([...items, ...(c.dock ? [] : legacyPins)])],
+			items: [...new Set([...dockItems, ...(c.dock ? [] : legacyPins)])],
+			homeAdded: true,
 		},
 		icons: Array.isArray(c.icons) ? c.icons.filter((i) => i && typeof i.key === 'string' && Number.isInteger(i.col) && Number.isInteger(i.row)) : d.icons,
 		showIcons: c.showIcons !== false,
@@ -157,25 +150,36 @@ const store = (k: string, v: string | null) => {
 }
 const knownRev = () => Number(stored(REV_KEY)) || 0
 const keepLocal = (c: DeskConfig) => store(KEY, JSON.stringify(c))
+// The revision this tab itself last loaded or saved; shared localStorage rev moves when another tab writes.
+let appliedRev = stored(KEY) !== null ? knownRev() : 0
 // Changes made here that the server doesn't have yet (counted, so a save that was already on its way
 // doesn't clear a change made after it left).
 let edits = stored(DIRTY_KEY) ? 1 : 0
 let pushTimer: number | undefined
+// Sign-out bumps this. A save or load already in flight captured the old value and must not
+// write this browser once the next account is in the same tab.
+let epoch = 0
 function push() {
 	window.clearTimeout(pushTimer)
 	pushTimer = window.setTimeout(async () => {
-		if (!current) return
+		const mine = epoch
+		if (!current || mine !== epoch) return
 		const sent = edits
+		const config = current
 		try {
 			const r = await fetch('/api/desktop', {
 				method: 'POST',
 				credentials: 'same-origin',
 				headers: {'content-type': 'application/json', 'x-omarchy-server': '1'},
-				body: JSON.stringify({config: current}),
+				body: JSON.stringify({config}),
 			})
-			if (!r.ok) return
+			if (mine !== epoch || !r.ok) return
 			const saved = (await r.json())?.desktop as {rev?: number} | null
-			if (saved?.rev) store(REV_KEY, String(saved.rev))
+			if (mine !== epoch) return
+			if (saved?.rev) {
+				appliedRev = Number(saved.rev) || appliedRev
+				store(REV_KEY, String(saved.rev))
+			}
 			if (edits === sent) (edits = 0), store(DIRTY_KEY, null)
 		} catch {
 			/* offline: saved next time */
@@ -184,21 +188,33 @@ function push() {
 }
 let lastPull = 0
 let syncing = false
+// A pull asked for while one is already running. Sign-out must not start a pull of its
+// own: that request is signed out, and stamping lastPull there blocks the next account.
+let pullAgain = false
 async function pull() {
-	if (syncing || Date.now() - lastPull < 3000) return
+	if (syncing) {
+		pullAgain = true
+		return
+	}
+	if (Date.now() - lastPull < 3000) return
+	const mine = epoch
 	syncing = true
-	lastPull = Date.now()
 	try {
 		const r = await fetch('/api/desktop', {credentials: 'same-origin'})
-		if (!r.ok) return
+		// A 401, or a pull sign-out invalidated, must leave lastPull unset. resetDeskConfig
+		// already zeroes it; setting it here makes the next account's sync wait 3 seconds.
+		if (mine !== epoch || !r.ok) return
 		const saved = (await r.json())?.desktop as {config: unknown; rev?: number; updatedAt?: number} | null
+		if (mine !== epoch) return
+		lastPull = Date.now()
 		const rev = saved ? Number(saved.rev) || 1 : 0
 		if (edits) {
 			// This browser has the newest changes: save them for the others.
 			current ??= loadConfig()
 			push()
-		} else if (saved && rev !== knownRev()) {
+		} else if (saved && rev !== appliedRev) {
 			current = clean(saved.config)
+			appliedRev = rev
 			keepLocal(current)
 			store(REV_KEY, String(rev))
 			listeners.forEach((l) => l(current!))
@@ -211,33 +227,85 @@ async function pull() {
 		/* offline: this browser's copy stays */
 	} finally {
 		syncing = false
+		// One follow-up for a pull that arrived while this one was running. Not because
+		// the epoch changed: that started a signed-out pull which stamped lastPull.
+		if (pullAgain) {
+			pullAgain = false
+			void pull()
+		}
 	}
 }
-let started = false
-function startSync() {
-	if (started) return
-	started = true
-	// Saved by an earlier version, which went by each browser's clock: take the server's copy.
-	store(`${KEY}:at`, null)
-	pull()
-	window.addEventListener('focus', () => pull())
-	document.addEventListener('visibilitychange', () => document.visibilityState === 'visible' && pull())
-	window.setInterval(() => document.visibilityState === 'visible' && pull(), 20_000)
+function clearTabState() {
+	epoch++
+	window.clearTimeout(pushTimer)
+	pushTimer = undefined
+	current = null
+	appliedRev = 0
+	edits = 0
+	lastPull = 0
+	pullAgain = false
+	listeners.forEach((l) => l(DEFAULT_CONFIG))
 }
+function onStorage(e: StorageEvent) {
+	try {
+		if (e.storageArea && e.storageArea !== localStorage) return
+	} catch {
+		return
+	}
+	if (e.key !== KEY && e.key !== REV_KEY && e.key !== null) return
+	if (e.key === null || (e.key === KEY && e.newValue === null)) {
+		clearTabState()
+		return
+	}
+	if (edits) return
+	const raw = stored(KEY)
+	if (raw === null) return
+	try {
+		current = clean(JSON.parse(raw))
+	} catch {
+		return
+	}
+	appliedRev = knownRev()
+	listeners.forEach((l) => l(current!))
+}
+let started = false
+export function syncDeskConfig() {
+	if (!started) {
+		started = true
+		// Saved by an earlier version, which went by each browser's clock: take the server's copy.
+		store(`${KEY}:at`, null)
+		window.addEventListener('focus', () => pull())
+		window.addEventListener('storage', onStorage)
+		document.addEventListener('visibilitychange', () => document.visibilityState === 'visible' && pull())
+		window.setInterval(() => document.visibilityState === 'visible' && pull(), 20_000)
+	}
+	pull()
+}
+export function resetDeskConfig() {
+	store(KEY, null)
+	store(REV_KEY, null)
+	store(DIRTY_KEY, null)
+	clearTabState()
+}
+export function patchDeskConfig(patch: Partial<DeskConfig>) {
+	current = clean({...(current ?? loadConfig()), ...patch})
+	keepLocal(current)
+	edits++
+	store(DIRTY_KEY, '1')
+	listeners.forEach((l) => l(current!))
+	push()
+}
+
 export function useDeskConfig() {
 	const [cfg, setCfg] = useState<DeskConfig>(() => (current ??= loadConfig()))
+	if (typeof document !== 'undefined') document.documentElement.dataset.shape = cfg.shell === 'hyprland' ? 'square' : 'round'
 	useEffect(() => {
 		listeners.add(setCfg)
-		startSync()
+		syncDeskConfig()
 		return () => void listeners.delete(setCfg)
 	}, [])
 	const update = useCallback((fn: (c: DeskConfig) => DeskConfig) => {
-		current = fn(current ?? loadConfig())
-		keepLocal(current)
-		edits++
-		store(DIRTY_KEY, '1')
-		listeners.forEach((l) => l(current!))
-		push()
+		patchDeskConfig(fn(current ?? loadConfig()))
 	}, [])
 	return [cfg, update] as const
 }

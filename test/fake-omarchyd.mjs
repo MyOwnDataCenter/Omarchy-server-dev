@@ -17,12 +17,12 @@ export async function startFakeserverd({
 } = {}) {
 	const wallpaper = {id: process.env.FAKE_WALLPAPER_ID ?? '23', brandColorHsl: process.env.FAKE_BRAND ?? '24 90% 50%'}
 	let baseUrl = ''
-	const tokens = new Map() // access token -> {expiresAt, sessionId}
-	const devices = new Map() // device token -> sessionId
+	const tokens = new Map() // access token -> {expiresAt, sessionId, userId}
+	const devices = new Map() // device token -> {sessionId, userId}
 	const calls = []
 	const browser = new Map() // dashboard token -> browser-session cookie value
 	const urlTokens = new Map() // file URL token -> browser-session cookie value
-	const tickets = new Set()
+	const tickets = new Map() // ticket -> {role}
 	// In-memory file tree for the Files tab: path -> {type, size, modified, data?}
 	const now = Date.now()
 	const fsTree = new Map([
@@ -108,6 +108,8 @@ export async function startFakeserverd({
 	const settings = {twoFactor: false, channel: 'stable', hostname: 'omarchy', externalDns: true, tor: false}
 	let lastCreate = null
 	const keys = [] // keysyms typed into the fake VM console
+	const assistantKeys = [] // Settings → Assistant; public rows never include apiKey
+	const assistantChats = [] // Assistant threads. Another user's chat looks missing.
 	const terminals = []
 	const gb = 1024 ** 3
 	const apps = [
@@ -196,6 +198,10 @@ export async function startFakeserverd({
 							res.writeHead(302, {location: `http://${req.headers.host?.split(':')[0]}:2000/app-auth?origin=host&app=${a.id}&path=${encodeURIComponent(req.url)}`})
 							return res.end()
 						}
+						if (a.id === 'immich' && req.url === '/absolute') {
+							res.writeHead(302, {location: `http://127.0.0.1:${a.port}/photos?x=1`})
+							return res.end()
+						}
 						if (a.id === 'immich' && req.url === '/') {
 							res.writeHead(302, {location: '/photos'})
 							return res.end()
@@ -213,17 +219,65 @@ export async function startFakeserverd({
 	)
 
 	const newToken = () => randomBytes(24).toString('base64url')
-	const issueAccess = (sessionId) => {
+	const issueAccess = (sessionId, userId = 'owner') => {
 		const accessToken = newToken()
 		const accessExpiresAt = Date.now() + accessTtlMs
-		tokens.set(accessToken, {expiresAt: accessExpiresAt, sessionId})
+		tokens.set(accessToken, {expiresAt: accessExpiresAt, sessionId, userId})
 		return {accessToken, accessExpiresAt}
+	}
+	const accountOf = (userId) => (userId === 'sam' ? {userId: 'sam', name: 'Sam', role: 'member'} : {userId: 'owner', name: 'Chris', role: 'owner'})
+	const SPACEXAI = 'https://api.x.ai/v1'
+	const FAKE_MODELS = ['grok-4.7', 'grok-4.7-mini', 'gpt-5.5', 'claude-sonnet-5-5', 'llama3.2']
+	const OPENAI = 'https://api.openai.com/v1'
+	const normalizeBaseUrl = (raw) => {
+		const s = String(raw ?? '').trim().replace(/\/+$/, '')
+		try {
+			const u = new URL(s)
+			if (!u.pathname || u.pathname === '/') return `${u.origin}/v1`
+		} catch {}
+		return s
+	}
+	const assistantPublic = (k, userId) => ({
+		id: k.id,
+		name: k.name,
+		provider: k.provider,
+		baseUrl: k.baseUrl,
+		model: k.model,
+		api: k.api ?? (k.provider === 'openai' ? 'responses' : 'chat'),
+		effort: k.effort ?? '',
+		check: k.check ?? null,
+		last4: k.last4,
+		ownerUserId: k.ownerUserId,
+		sharedWith: k.sharedWith,
+		systemDefault: !!k.systemDefault,
+		mine: k.ownerUserId === userId,
+	})
+	const assistantCanUse = (k, userId) => k.ownerUserId === userId || k.sharedWith.includes(userId) || k.systemDefault
+	const assistantOwned = (id, userId) => assistantChats.find((c) => c.id === String(id ?? '') && c.userId === userId)
+	const assistantStep = (actionId, userId) => {
+		const id = String(actionId ?? '').trim()
+		if (!id) return {error: ['BAD_REQUEST', 'Missing action']}
+		for (const chat of assistantChats) {
+			if (chat.userId !== userId) continue
+			const action = chat.actions?.find((a) => a.id === id)
+			if (action) return {action}
+		}
+		return {error: ['NOT_FOUND', 'That step isn’t here']}
+	}
+	const assistantDecide = (input, auth, status) => {
+		const found = assistantStep(input?.actionId, auth.userId)
+		if (found.error) return found
+		if (found.action.status !== 'pending') return {error: ['CONFLICT', 'That step was already handled']}
+		found.action.status = status
+		found.action.resolvedAt = Date.now()
+		if (status === 'done') delete found.action.error
+		return {...found.action}
 	}
 
 	const procedures = {
-		'system.version': {kind: 'query', public: true, run: () => ({version: '2.0.0', name: 'Omarchy Server 2.0'})},
+		'system.version': {kind: 'query', public: true, run: () => ({version: '2.0.0', name: 'MODC 2.0', startedAt: 1_700_000_000_000, revision: 'abc1234'})},
 		'system.discoveryInfo': {kind: 'query', public: true, run: () => ({id: 'abc', device: 'Linux VM', version: '2.0.0', onboarded: true})},
-		'user.listAccounts': {kind: 'query', public: true, run: () => [{userId: 'owner', name: 'Chris', language: 'en', wallpaper}]},
+		'user.listAccounts': {kind: 'query', public: true, run: () => [accountOf('owner'), accountOf('sam')].map((a) => ({...a, language: 'en', wallpaper}))},
 		'user.loginNative': {
 			kind: 'mutation',
 			public: true,
@@ -231,19 +285,20 @@ export async function startFakeserverd({
 				if (legacy) return {notFound: true}
 				if (input?.password !== password) return {error: ['UNAUTHORIZED', 'Incorrect password']}
 				if (!input?.client?.id) return {error: ['BAD_REQUEST', 'Missing client']}
+				const userId = input?.userId === 'sam' ? 'sam' : 'owner'
 				const sessionId = newToken()
 				const deviceToken = newToken()
-				devices.set(deviceToken, sessionId)
-				return {accountId: 'owner', ...issueAccess(sessionId), deviceToken}
+				devices.set(deviceToken, {sessionId, userId})
+				return {accountId: userId, ...issueAccess(sessionId, userId), deviceToken}
 			},
 		},
 		'user.refreshNativeAccess': {
 			kind: 'mutation',
 			public: true,
 			run: (input) => {
-				const sessionId = devices.get(input?.deviceToken)
-				if (!sessionId) return {error: ['UNAUTHORIZED', 'Invalid native session']}
-				return issueAccess(sessionId)
+				const rec = devices.get(input?.deviceToken)
+				if (!rec) return {error: ['UNAUTHORIZED', 'Invalid native session']}
+				return issueAccess(rec.sessionId, rec.userId)
 			},
 		},
 		'user.login': {
@@ -251,7 +306,8 @@ export async function startFakeserverd({
 			public: true,
 			run: (input, _auth, res) => {
 				if (input?.password !== password) return {error: ['UNAUTHORIZED', 'Incorrect password']}
-				const {accessToken} = issueAccess(legacy ? 'legacy' : newToken())
+				const userId = input?.userId === 'sam' ? 'sam' : 'owner'
+				const {accessToken} = issueAccess(legacy ? 'legacy' : newToken(), userId)
 				tokens.get(accessToken).expiresAt = Infinity
 				const cookie = newToken()
 				browser.set(accessToken, cookie)
@@ -270,11 +326,19 @@ export async function startFakeserverd({
 				if (!cookie || legacy) return {error: ['FORBIDDEN', 'Browser session required']}
 				if (!String(req.headers.cookie ?? '').includes(`OMARCHY_BROWSER_SESSION=${cookie}`)) return {error: ['UNAUTHORIZED', 'Invalid token']}
 				const ticket = `${input.target}:${newToken()}`
-				tickets.add(ticket)
+				tickets.set(ticket, {role: accountOf(auth.userId).role})
 				return ticket
 			},
 		},
 		'user.renewToken': {kind: 'mutation', run: () => 'renewed'},
+		'user.appPass': {
+			kind: 'mutation',
+			run: () => {
+				const t = newToken()
+				appSessionTokens.add(t)
+				return `OMARCHY_APP_SESSION=${t}; Path=/; HttpOnly; SameSite=Lax`
+			},
+		},
 		'user.revokeAppPasses': {
 			kind: 'mutation',
 			run: () => {
@@ -287,11 +351,11 @@ export async function startFakeserverd({
 			kind: 'mutation',
 			run: (_, auth) => {
 				for (const [t, v] of tokens) if (v.sessionId === auth.sessionId) tokens.delete(t)
-				for (const [d, s] of devices) if (s === auth.sessionId) devices.delete(d)
+				for (const [d, rec] of devices) if (rec.sessionId === auth.sessionId) devices.delete(d)
 				return true
 			},
 		},
-		'user.get': {kind: 'query', run: () => ({userId: 'owner', name: 'Chris', role: 'owner', wallpaper, sambaUsername: 'chris'})},
+		'user.get': {kind: 'query', run: (_i, auth) => ({...accountOf(auth.userId), wallpaper, sambaUsername: 'chris'})},
 		'apps.recentlyOpened': {kind: 'query', run: () => ['immich', 'home-assistant']},
 		'system.uptime': {kind: 'query', run: () => 1_234_567},
 		'system.cpuTemperature': {kind: 'query', run: () => ({warning: 'normal', temperature: 52})},
@@ -307,6 +371,34 @@ export async function startFakeserverd({
 			kind: 'query',
 			run: () => ({size: 1000 * gb, totalUsed: 720 * gb, available: 280 * gb, system: 40 * gb, files: 300 * gb, apps: [{id: 'immich', used: 210 * gb}], machines: []}),
 		},
+		'system.gpuUsage': {
+			kind: 'query',
+			run: () => ({
+				gpus: [
+					{id: 'GPU-aaa', index: 0, name: 'NVIDIA GeForce RTX 3060', used: 32, memoryUsed: 1.4 * gb, memoryTotal: 12 * gb, temperature: 39},
+					{id: 'GPU-bbb', index: 1, name: 'NVIDIA GeForce RTX 3060', used: 4, memoryUsed: 0.2 * gb, memoryTotal: 12 * gb, temperature: 36},
+				],
+			}),
+		},
+		'system.batteryUsage': {kind: 'query', run: () => ({batteries: []})},
+		'system.stats': {
+			kind: 'query',
+			run: () => ({
+				cpu: {threads: 16, totalUsed: 18.4, system: 9.1, apps: [{id: 'immich', used: 6.2}, {id: 'nextcloud', used: 3.1}], machines: []},
+				memory: {size: 16 * gb, totalUsed: 6.2 * gb, system: 2 * gb, apps: [{id: 'immich', used: 2.1 * gb}], machines: []},
+				disk: {size: 1000 * gb, totalUsed: 720 * gb, available: 280 * gb, system: 40 * gb, files: 300 * gb, apps: [{id: 'immich', used: 210 * gb}], machines: []},
+				temp: {warning: 'normal', temperature: 52},
+				gpu: {
+					gpus: [
+						{id: 'GPU-aaa', index: 0, name: 'NVIDIA GeForce RTX 3060', used: 32, memoryUsed: 1.4 * gb, memoryTotal: 12 * gb, temperature: 39},
+						{id: 'GPU-bbb', index: 1, name: 'NVIDIA GeForce RTX 3060', used: 4, memoryUsed: 0.2 * gb, memoryTotal: 12 * gb, temperature: 36},
+					],
+				},
+				battery: {batteries: []},
+				uptime: 1_234_567,
+			}),
+		},
+		'system.installerStatus': {kind: 'query', run: () => ({needed: false, reasons: []})},
 		'apps.list': {kind: 'query', run: () => apps},
 		'apps.state': {kind: 'query', run: ({appId}) => apps.find((a) => a.id === appId) ?? {state: 'not-installed', progress: 0}},
 		'apps.updates': {kind: 'query', run: () => [{id: 'nextcloud', version: '30.0.4'}]},
@@ -344,7 +436,7 @@ export async function startFakeserverd({
 			run: fsOp(({url}) => {
 				if (url === OFFICIAL_STORE || communityStores.some((r) => r.url === url)) throw ['BAD_REQUEST', `Repository ${url} already exists`]
 				if (!/^https:\/\/github\.com\/[\w.-]+\/[\w.-]+(\.git)?$/.test(url)) throw ['INTERNAL_SERVER_ERROR', `Failed to clone ${url}`]
-				const tws = /touchworkstation\/app-store/i.test(url)
+				const tws = /(?:myowndatacenter|touchworkstation)\/app-store/i.test(url)
 				communityStores.push({
 					url,
 					meta: tws ? {id: 'touchworkstation', name: 'TouchWorkStation'} : {id: 'community', name: 'Community'},
@@ -378,20 +470,34 @@ export async function startFakeserverd({
 			},
 		},
 		'machines.list': {kind: 'query', run: () => machines},
+		'usb.list': {kind: 'query', run: () => ({devices: []})},
+		'usb.attach': {kind: 'mutation', run: () => ({needsRestart: false})},
+		'usb.detach': {kind: 'mutation', run: () => ({needsRestart: false})},
 		'machines.details': {kind: 'query', run: ({id}) => machineDetails(machines.find((m) => m.id === id))},
-		'machines.stats': {kind: 'query', run: ({id}) => ({memoryMb: 2048, vcpus: 2, points: machines.find((m) => m.id === id)?.state === 'running' ? statPoints() : []})},
+		'machines.stats': {
+			kind: 'query',
+			run: (input) => {
+				const one = (m) => {
+					const points = m?.state === 'running' ? statPoints() : []
+					return {memoryMb: 2048, vcpus: 2, points, last: points.at(-1) ?? null}
+				}
+				if (!input?.id) return Object.fromEntries(machines.map((m) => [m.id, one(m)]))
+				return one(machines.find((m) => m.id === input.id))
+			},
+		},
 		'machines.node': {
 			kind: 'query',
 			run: () => ({hostname: 'omarchy', cpuModel: 'Intel(R) Xeon(R) CPU E5-2470 v2 @ 2.40GHz', threads: 8, loadAverage: [0.42, 0.51, 0.47], memoryTotalMb: 32768, memoryFreeMb: 21000, uptimeSeconds: 400_000, storage: {totalGb: 930, freeGb: 610}, libvirtVersion: '11.2.0', qemuVersion: '10.0.2', hostArchitecture: 'amd64', libvirtAvailable: true, kvmAvailable: true, videoModels: ['vga', 'bochs', 'none'], cpuTypes: ['host', 'host-model', 'max', 'qemu64'], nicModels: ['virtio', 'e1000e', 'e1000', 'rtl8139'], diskBuses: ['virtio', 'sata', 'scsi', 'ide'], diskCaches: ['default', 'none', 'writeback', 'writethrough', 'directsync', 'unsafe'], counts: {total: machines.length, running: machines.filter((m) => m.state === 'running').length}}),
 		},
 		'machines.tasks': {kind: 'query', run: () => machines.flatMap((m) => machineDetails(m).tasks.map((t) => ({...t, machineId: m.id, machineName: m.name, vmid: m.vmid}))).sort((a, b) => b.startedAt - a.startedAt)},
 		'machines.backups': {kind: 'query', run: () => [{id: '101-debian-server-20261112-030000', name: 'Debian Server', vmid: 101, sourceId: 'debian-1', createdAt: now - 70_000_000, notes: 'nightly', live: true, sizeBytes: 1_830_000_000, path: '/Home/Backups/Machines/101-debian-server-20261112-030000'}]},
-		'system.checkUpdate': {kind: 'query', run: () => (process.env.FAKE_UPDATE_FAIL ? {available: true, version: '2.1.0', name: 'Omarchy Server 2.1'} : {available: false, version: '2.0.0', name: 'Omarchy Server 2.0'})},
+		'system.checkUpdate': {kind: 'query', run: () => (process.env.FAKE_UPDATE_FAIL ? {available: true, version: '2.1.0', name: 'MODC 2.1'} : {available: false, version: '2.0.0', name: 'MODC 2.0'})},
 		'apps.uninstall': {kind: 'mutation', run: ({appId}) => (apps.splice(apps.findIndex((a) => a.id === appId), 1), true)},
 		'machines.start': {kind: 'mutation', run: ({id}) => ((machines.find((m) => m.id === id).state = 'running'), true)},
 		'notifications.get': {kind: 'query', run: () => notifications},
 		'notifications.clear': {kind: 'mutation', run: (id) => ((notifications = notifications.filter((n) => n !== id)), true)},
 		'system.factoryReset': {kind: 'mutation', run: (input) => (input?.password === password ? true : {error: ['UNAUTHORIZED', 'Invalid password']})},
+		'system.desktopSignIn': {kind: 'mutation', run: (input) => (input?.password === password ? {result: 'ok'} : {error: ['UNAUTHORIZED', 'Incorrect password']})},
 		'machines.capabilities': {kind: 'query', run: () => ({hostArchitecture: 'amd64', libvirtAvailable: true, kvmAvailable: true})},
 		'machines.osImages': {
 			kind: 'query',
@@ -435,7 +541,7 @@ export async function startFakeserverd({
 			run: () => {
 				// FAKE_UPDATE_FAIL: fail the way omarchyd reports it, through the status.
 				updateStatus = process.env.FAKE_UPDATE_FAIL
-					? {running: false, progress: 0, description: '', error: "Omarchy Server 2.1.0 doesn't include an update for this device"}
+					? {running: false, progress: 0, description: '', error: "MODC 2.1.0 doesn't include an update for this device"}
 					: {running: true, progress: 40, description: 'Downloading update', error: false}
 				return !process.env.FAKE_UPDATE_FAIL
 			},
@@ -568,6 +674,131 @@ export async function startFakeserverd({
 		'hardware.raid.addMirror': {kind: 'mutation', run: () => true},
 		'hardware.raid.addAccelerator': {kind: 'mutation', run: () => true},
 		'system.logs': {kind: 'query', run: ({type}) => `${type} log line 1\n${type} log line 2\n`},
+		'assistant.keys': {
+			kind: 'query',
+			run: (_i, auth) => assistantKeys.filter((k) => assistantCanUse(k, auth.userId)).map((k) => assistantPublic(k, auth.userId)),
+		},
+		'assistant.addKey': {
+			kind: 'mutation',
+			run: (input, auth) => {
+				const provider = ['openai-compatible', 'spacexai', 'openai', 'anthropic'].includes(input?.provider) ? input.provider : null
+				if (!provider) return {error: ['BAD_REQUEST', 'Choose Grok, OpenAI, Anthropic or an OpenAI-compatible endpoint']}
+				const role = accountOf(auth.userId).role
+				if (provider === 'openai-compatible' && role !== 'owner') return {error: ['FORBIDDEN', 'Only the server’s owner can add a custom endpoint']}
+				const apiKey = String(input?.apiKey ?? '').trim()
+				if (apiKey.length > 512) return {error: ['BAD_REQUEST', 'Enter an API key']}
+				if (provider !== 'openai-compatible' && apiKey.length < 4) return {error: ['BAD_REQUEST', 'Enter an API key']}
+				const model = String(input?.model ?? '').trim()
+				if (!model || model.length > 80) return {error: ['BAD_REQUEST', 'Enter a model id']}
+				const name = String(input?.name ?? '').trim().slice(0, 48) || ({spacexai: 'Grok', openai: 'OpenAI', anthropic: 'Anthropic'}[provider] ?? 'API')
+				let baseUrl = provider === 'spacexai' ? SPACEXAI : provider === 'openai' ? OPENAI : provider === 'anthropic' ? 'https://api.anthropic.com/v1' : normalizeBaseUrl(input?.baseUrl)
+				if (provider === 'openai-compatible') {
+					if (!/^https?:\/\/[^\s]+/i.test(baseUrl) || baseUrl.length > 200) return {error: ['BAD_REQUEST', 'Enter the API base URL']}
+				}
+				const row = {
+					id: 'k_' + randomBytes(6).toString('hex'),
+					ownerUserId: auth.userId,
+					name,
+					provider,
+					baseUrl,
+					...(input?.api === 'chat' || input?.api === 'responses' ? {api: input.api} : {}),
+					model,
+					apiKey,
+					last4: apiKey.slice(-4),
+					sharedWith: [],
+					systemDefault: false,
+				}
+				assistantKeys.push(row)
+				return assistantPublic(row, auth.userId)
+			},
+		},
+		'assistant.updateKey': {
+			kind: 'mutation',
+			run: (input, auth) => {
+				const k = assistantKeys.find((x) => x.id === String(input?.id ?? ''))
+				if (!k) return {error: ['NOT_FOUND', 'That key isn’t here']}
+				const role = accountOf(auth.userId).role
+				if (input?.systemDefault === true) {
+					if (role === 'member') return {error: ['FORBIDDEN', 'Only the server’s owner can set the default key']}
+					if (k.ownerUserId !== auth.userId) return {error: ['FORBIDDEN', 'You can only make a key you own the default']}
+					for (const x of assistantKeys) x.systemDefault = x.id === k.id
+				} else if (input?.systemDefault === false && k.ownerUserId === auth.userId && role !== 'member') {
+					k.systemDefault = false
+				}
+				if (k.ownerUserId !== auth.userId && (input?.sharedWith || input?.name || input?.model || input?.apiKey || input?.baseUrl)) {
+					return {error: ['FORBIDDEN', 'Only the person who added this key can change it']}
+				}
+				if (k.ownerUserId === auth.userId) {
+					if (typeof input?.name === 'string') k.name = input.name.trim().slice(0, 48) || k.name
+					if (typeof input?.model === 'string' && input.model.trim()) k.model = input.model.trim().slice(0, 80)
+					if (input?.api === 'chat' || input?.api === 'responses') k.api = input.api
+					if (['', 'low', 'medium', 'high'].includes(input?.effort)) k.effort = input.effort
+					if (typeof input?.apiKey === 'string') {
+						const next = input.apiKey.trim()
+						if (next.length > 512) return {error: ['BAD_REQUEST', 'Enter an API key']}
+						if (k.provider !== 'openai-compatible' && next.length < 4) return {error: ['BAD_REQUEST', 'Enter an API key']}
+						if (k.provider === 'openai-compatible' || next.length >= 4) {
+							k.apiKey = next
+							k.last4 = k.apiKey.slice(-4)
+						}
+					}
+					if (k.provider === 'openai-compatible' && typeof input?.baseUrl === 'string') {
+						if (role !== 'owner') return {error: ['FORBIDDEN', 'Only the server’s owner can change a custom endpoint']}
+						k.baseUrl = normalizeBaseUrl(input.baseUrl)
+					}
+					if (Array.isArray(input?.sharedWith)) k.sharedWith = [...new Set(input.sharedWith.map((id) => String(id)).filter((id) => id && id !== k.ownerUserId))].slice(0, 32)
+				}
+				return assistantPublic(k, auth.userId)
+			},
+		},
+		'assistant.verifyKey': {
+			kind: 'mutation',
+			run: (input, auth) => {
+				const k = input?.id ? assistantKeys.find((x) => x.id === String(input.id) && assistantCanUse(x, auth.userId)) : null
+				if (input?.id && !k) return {error: ['NOT_FOUND', 'That key isn’t available']}
+				const provider = k ? k.provider : String(input?.provider ?? '')
+				if (!k && provider === 'openai-compatible' && accountOf(auth.userId).role !== 'owner') return {error: ['FORBIDDEN', 'Only the server’s owner can add a custom endpoint']}
+				const apiKey = k ? k.apiKey : String(input?.apiKey ?? '')
+				const model = k ? k.model : ''
+				let check
+				if (provider !== 'openai-compatible' && apiKey.length < 4) check = {ok: false, status: 'rejected', message: 'The endpoint needs an API key', modelFound: null}
+				else if (model && !FAKE_MODELS.includes(model)) check = {ok: false, status: 'no-model', message: `Key works, but ${model} isn’t one of the ${FAKE_MODELS.length} models this endpoint serves`, modelFound: false}
+				else check = {ok: true, status: 'ok', message: `Connected · ${FAKE_MODELS.length} models available`, modelFound: model ? true : null}
+				if (k) k.check = {ok: check.ok, status: check.status, message: check.message, at: Date.now()}
+				return {...check, models: FAKE_MODELS.map((id) => ({id})), at: Date.now()}
+			},
+		},
+		'assistant.removeKey': {
+			kind: 'mutation',
+			run: (input, auth) => {
+				const id = String(input?.id ?? '')
+				const i = assistantKeys.findIndex((x) => x.id === id)
+				if (i < 0) return {error: ['NOT_FOUND', 'That key isn’t here']}
+				if (assistantKeys[i].ownerUserId !== auth.userId) return {error: ['FORBIDDEN', 'Only the person who added this key can delete it']}
+				assistantKeys.splice(i, 1)
+				return true
+			},
+		},
+		'assistant.conversations': {
+			kind: 'query',
+			run: (_i, auth) => assistantChats.filter((c) => c.userId === auth.userId).map(({id, title, updatedAt}) => ({id, title, updatedAt})).sort((a, b) => b.updatedAt - a.updatedAt),
+		},
+		'assistant.getConversation': {
+			kind: 'query',
+			run: (input, auth) => assistantOwned(input?.id, auth.userId) ?? {error: ['NOT_FOUND', 'That chat isn’t here']},
+		},
+		'assistant.deleteConversation': {
+			kind: 'mutation',
+			run: (input, auth) => {
+				const i = assistantChats.findIndex((c) => c.id === String(input?.id ?? '') && c.userId === auth.userId)
+				if (i < 0) return {error: ['NOT_FOUND', 'That chat isn’t here']}
+				assistantChats.splice(i, 1)
+				return true
+			},
+		},
+		'assistant.stop': {kind: 'mutation', run: () => ({stopped: false})},
+		'assistant.approve': {kind: 'mutation', run: (input, auth) => assistantDecide(input, auth, 'done')},
+		'assistant.reject': {kind: 'mutation', run: (input, auth) => assistantDecide(input, auth, 'rejected')},
 	}
 
 	// Storage hardware. Default: a single-drive server (no pool) with two spare disks attached.
@@ -607,6 +838,7 @@ export async function startFakeserverd({
 	const usbDrives = [{id: 'sde', name: 'SanDisk Extreme', transport: 'usb', size: 1e12, partitions: [{id: 'sde1', label: 'BACKUP', size: 1e12, mountpoints: ['/External/BACKUP'], supportsAppDataRoot: false}]}]
 
 	const appAuthChecks = []
+	let streamAborted = false
 	const server = http.createServer(async (req, res) => {
 		const send = (status, body) => {
 			res.writeHead(status, {'content-type': 'application/json'})
@@ -637,6 +869,29 @@ export async function startFakeserverd({
 				res.writeHead(404)
 				return res.end()
 			}
+		}
+		if (url.pathname === '/assistant/stream' && req.method === 'POST') {
+			let raw = ''
+			for await (const chunk of req) raw += chunk
+			let input
+			try {
+				input = raw ? JSON.parse(raw) : undefined
+			} catch {
+				return fail('BAD_REQUEST', 'Invalid JSON')
+			}
+			const [scheme, token] = req.headers.authorization?.split(' ') ?? []
+			const record = scheme === 'Bearer' && tokens.get(token)
+			calls.push({path: 'assistant.stream', input, authorization: req.headers.authorization ?? ''})
+			if (!record || record.expiresAt <= Date.now()) return fail('UNAUTHORIZED', 'Invalid token')
+			req.socket?.setNoDelay(true)
+			res.writeHead(200, {'content-type': 'text/event-stream', 'cache-control': 'no-store'})
+			res.on('close', () => {
+				if (!res.writableEnded) streamAborted = true
+			})
+			res.write('event: text\ndata: {"text":"Hi"}\n\n')
+			await new Promise((r) => setTimeout(r, 150))
+			if (!res.writableEnded) res.end('event: done\ndata: {"conversationId":"c_test"}\n\n')
+			return
 		}
 		const path = url.pathname.replace(/^\/trpc\//, '')
 		const proc = procedures[path]
@@ -710,12 +965,21 @@ export async function startFakeserverd({
 	server.on('upgrade', (req, socket, head) => {
 		const url = new URL(req.url, 'http://x')
 		const ticket = url.searchParams.get('ticket')
+		const held = tickets.get(ticket)
 		if (url.pathname === '/terminal') {
-			if (!ticket?.startsWith('terminal:') || !tickets.delete(ticket)) return socket.destroy()
-			terminals.push({appId: url.searchParams.get('appId'), cols: Number(url.searchParams.get('cols')), rows: Number(url.searchParams.get('rows')), ...(url.searchParams.get('fresh') ? {fresh: url.searchParams.get('fresh')} : {})})
+			if (!ticket?.startsWith('terminal:') || !tickets.delete(ticket) || !held) return socket.destroy()
+			if (held.role !== 'owner') {
+				socket.write('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n')
+				return socket.destroy()
+			}
+			terminals.push({appId: url.searchParams.get('appId'), cols: Number(url.searchParams.get('cols')), rows: Number(url.searchParams.get('rows')), ...(url.searchParams.get('fresh') ? {fresh: url.searchParams.get('fresh')} : {}), ...(url.searchParams.get('containerId') ? {containerId: url.searchParams.get('containerId'), containerMode: url.searchParams.get('containerMode')} : {})})
 			return wss.handleUpgrade(req, socket, head, (ws) => shellServer(ws, url.searchParams.get('appId'), keys))
 		}
-		if (url.pathname !== '/machines/console' || !ticket?.startsWith('machines:') || !tickets.delete(ticket) || !url.searchParams.get('machineId') || !url.searchParams.get('sessionId')) {
+		if (url.pathname !== '/machines/console' || !ticket?.startsWith('machines:') || !tickets.delete(ticket) || !held || !url.searchParams.get('machineId') || !url.searchParams.get('sessionId')) {
+			return socket.destroy()
+		}
+		if (held.role !== 'owner' && /^agent-[0-9a-f]{12}$/.test(url.searchParams.get('machineId') ?? '')) {
+			socket.write('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n')
 			return socket.destroy()
 		}
 		wss.handleUpgrade(req, socket, head, (ws) => rfbServer(ws, keys))
@@ -734,6 +998,7 @@ export async function startFakeserverd({
 				fsTree,
 				apps,
 				appAuthChecks,
+				streamWasAborted: () => streamAborted,
 				appRequests,
 				expireAllAccessTokens: () => {
 					for (const v of tokens.values()) v.expiresAt = 0

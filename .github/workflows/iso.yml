@@ -1,8 +1,8 @@
 name: Installer ISO
 
-# Builds the Omarchy Server installer ISO. When a release is published (or a v* tag is pushed), the
+# Builds the My Own Data Center installer ISO. When a release is published (or a v* tag is pushed), the
 # ISO is attached to that release, so
-# https://github.com/TouchWorkStation/omarchy-server/releases/latest/download/omarchy-server.iso
+# https://github.com/MyOwnDataCenter/server/releases/latest/download/omarchy-server.iso
 # always downloads the newest one. Run it by hand from the Actions tab to just test a build.
 on:
   workflow_dispatch:
@@ -25,7 +25,10 @@ jobs:
       - name: Install archiso
         run: pacman -Syu --noconfirm archiso git
       - name: Check the scripts
-        run: bash -n iso/build.sh iso/live/omarchy-server-setup iso/target/target-setup.sh
+        run: |
+          for f in iso/build.sh iso/live/omarchy-server-setup iso/target/target-setup.sh; do
+            bash -n "$f"
+          done
       - name: Build
         run: OUT="$GITHUB_WORKSPACE/release" iso/build.sh
       - name: Keep the build (manual runs)

@@ -24,3 +24,18 @@ test('typed a key at a time, with backspace and Ctrl+C', () => {
 	assert.deepEqual(takeLine('', 'pässwörd\r').value, 'pässwörd')
 	assert.equal(takeLine('', 'a\u001bb\r').value, 'ab', 'other control characters are ignored')
 })
+
+test('arrow and Delete keys are not written into the password', () => {
+	let r = {value: ''}
+	for (const k of ['a', 'b', 'c', '\x1b[D', '\x1b[3~', '\r']) r = takeLine(r.value, k)
+	assert.deepEqual(r, {done: true, value: 'abc', rest: ''})
+})
+
+test('Home is not written into the password', () => {
+	assert.equal(takeLine('', 'ab\x1b[Hc\r').value, 'abc')
+	assert.equal(takeLine('', 'ab\x1b[Hc\r').value.includes('[H'), false)
+})
+
+test('an application-cursor escape (ESC O) is not written into the password', () => {
+	assert.equal(takeLine('', 'a\x1bODb\r').value, 'ab')
+})

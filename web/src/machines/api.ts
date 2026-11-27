@@ -3,6 +3,7 @@ import {useMutation, useQuery, useQueryClient} from '@tanstack/react-query'
 
 import {mutate, query, type PortForward} from '../api'
 import {useToast} from '../ui'
+import {fetchStats, statsQueryKey} from './statsQuery'
 
 export type Drive = {
 	id: string
@@ -60,16 +61,20 @@ export type NodeInfo = {
 	counts: {total: number; running: number}
 }
 export type StatPoint = {t: number; cpu: number; memMb: number; netIn: number; netOut: number; diskRead: number; diskWrite: number}
-export type Stats = {memoryMb: number; vcpus: number; points: StatPoint[]}
+export type Stats = {memoryMb: number; vcpus: number; points: StatPoint[]; last?: StatPoint | null}
 export type Backup = {id: string; name: string; vmid: number; sourceId: string; createdAt: number; notes: string; live: boolean; sizeBytes: number; path: string}
 
 export const useMachineDetails = (id: string | null) =>
 	useQuery({queryKey: ['machines.details', id], queryFn: () => query<MachineDetails>('machines.details', {id}), enabled: !!id, refetchInterval: 5000})
-export const useNode = () => useQuery({queryKey: ['machines.node'], queryFn: () => query<NodeInfo>('machines.node'), refetchInterval: 15_000, staleTime: 10_000})
+export const useNode = (id?: string) => useQuery({queryKey: ['machines.node', id ?? 'server'], queryFn: () => query<NodeInfo>('machines.node', id ? {id} : undefined), refetchInterval: 15_000, staleTime: 10_000})
 export const useStats = (id: string | null, enabled = true) =>
-	useQuery({queryKey: ['machines.stats', id], queryFn: () => query<Stats>('machines.stats', {id}), enabled: !!id && enabled, refetchInterval: 10_000})
+	useQuery({
+		queryKey: statsQueryKey(id ?? ''),
+		queryFn: () => fetchStats(id as string),
+		enabled: !!id && enabled,
+		refetchInterval: 3000,
+	})
 export const useBackups = (id?: string | null) => useQuery({queryKey: ['machines.backups', id ?? 'all'], queryFn: () => query<Backup[]>('machines.backups', id ? {id} : {}), refetchInterval: 15_000})
-export const useAllTasks = () => useQuery({queryKey: ['machines.tasks'], queryFn: () => query<Task[]>('machines.tasks'), refetchInterval: 5000})
 
 // Run a machine action; refresh everything that could have changed; toast the outcome.
 export function useMachineAction() {
@@ -82,7 +87,7 @@ export function useMachineAction() {
 		},
 		onError: (error: Error) => toast(error.message, true),
 		onSettled: () => {
-			for (const k of ['machines.list', 'machines.details', 'machines.tasks', 'machines.backups', 'machines.node']) qc.invalidateQueries({queryKey: [k]})
+			for (const k of ['machines.list', 'machines.details', 'machines.backups', 'machines.node']) qc.invalidateQueries({queryKey: [k]})
 		},
 	})
 }
@@ -113,6 +118,7 @@ export const TASK_LABEL: Record<string, string> = {
 	backup: 'Backup',
 	clone: 'Clone',
 	restore: 'Restore',
+	connector: 'Install connector',
 }
 export const CPU_LABEL: Record<string, string> = {host: 'host (fastest; this server’s own CPU)', 'host-model': 'host-model (migratable copy of this CPU)', max: 'max (every feature QEMU can offer)', qemu64: 'qemu64 (most compatible)'}
 export const VIDEO_LABEL: Record<string, string> = {vga: 'Standard VGA', bochs: 'Bochs', virtio: 'VirtIO-GPU', qxl: 'SPICE (qxl)', cirrus: 'Cirrus', none: 'None'}

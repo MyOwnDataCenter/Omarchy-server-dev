@@ -1,9 +1,29 @@
 import {createPortal} from 'react-dom'
-import {createContext, useCallback, useContext, useEffect, useLayoutEffect, useRef, useState, type CSSProperties, type ReactNode} from 'react'
+import {createContext, useCallback, useContext, useEffect, useId, useLayoutEffect, useRef, useState, type CSSProperties, type InputHTMLAttributes, type ReactNode, type RefObject} from 'react'
 
 import {useQuery} from '@tanstack/react-query'
-import type {AppState, Machine, Wallpaper} from './api'
-import {Icon} from './icons'
+import type {AppState, Wallpaper} from './api'
+import {AssistantAvatar, cleanLook, type AssistantLook} from './character/AssistantCharacter'
+import {detectDesktop, LAYOUT_POINTER} from './layout'
+export {detectDesktop}
+import {fieldAria, liveRegionText, useDialogFocus} from './focus'
+import {RADIO_SELECTOR, rovingKeyDown, rovingTabIndex, TAB_SELECTOR} from './roving'
+import {Icon, type IconName} from './icons'
+import {versionTagProps, type VersionInfo} from './runningSince'
+import {solidOf, useDeskConfig} from './desktop/config'
+import {wallpaperBlocked} from './desktop/wallpaperGate'
+import {resolvePrefsUpdate} from './photoPrefs'
+import {createPrefsSync, SYNCED_PREF_KEYS} from './prefsSync'
+import {cleanTutorials, type TutorialId} from './tutorials'
+import {darkenForTextOn, darkenHslForWhite, hslToRgb, legibleMuted, parseRgbColor, pickOnAccent, resolveCssColor} from './theme/contrast'
+import {cleanThemeSlots, isLightTheme, type DarkThemeId, type LightThemeId, type PictureThemeId} from './theme/themeMode'
+import {reachLabel} from './fleet/machineManagerLogic'
+import {cleanStatPicks} from './fleet/statView'
+import {cleanTempPicks} from './fleet/temperatures'
+import {initials as nameInitials} from './initials'
+import {paddingBottomPlus} from './scrollPad'
+import {SPARK_HEIGHT, SPARK_WIDTH, sparkPath} from './spark'
+import {AccountToastProvider, AccountToastStack} from './toasts/account'
 
 // ---- portals --------------------------------------------------------------------------
 // Sheets, the terminal and the console portal out of their screen. On the phone that's <body>;
@@ -15,16 +35,7 @@ export const InWindow = createContext(false)
 
 // ---- formatting -------------------------------------------------------------
 // Storage in decimal units (as drives are sold); memory in binary (16 GB RAM reads as 16 GB).
-export function bytes(n: number | undefined, digits = 1, base: 1000 | 1024 = 1000) {
-	if (n === undefined || !Number.isFinite(n)) return '–'
-	const units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB']
-	let i = 0
-	while (n >= base && i < units.length - 1) {
-		n /= base
-		i++
-	}
-	return `${n.toFixed(n >= 100 || i === 0 ? 0 : digits)} ${units[i]}`
-}
+export {bytes} from './formatBytes'
 export function duration(seconds: number | undefined) {
 	if (!seconds) return '–'
 	const d = Math.floor(seconds / 86400)
@@ -35,8 +46,7 @@ export function duration(seconds: number | undefined) {
 export const pct = (used: number, total: number) => (total > 0 ? Math.min(100, Math.max(0, (used / total) * 100)) : 0)
 export const levelColor = (p: number) => (p >= 90 ? 'var(--red)' : p >= 75 ? 'var(--yellow)' : 'var(--green)')
 export function initials(name = '') {
-	const parts = name.trim().split(/\s+/)
-	return ((parts[0]?.[0] ?? '') + (parts[1]?.[0] ?? '')).toUpperCase() || '•'
+	return nameInitials(name)
 }
 export function greeting() {
 	const h = new Date().getHours()
@@ -64,11 +74,8 @@ export function appStatus(state: AppState | undefined, hasUpdate = false): {kind
 	return {kind: 'running', label: 'running'}
 }
 export const isAppBusy = (state?: AppState) => !!state && BUSY.includes(state)
-export function machineStatus(state: Machine['state']): {kind: StatusKind; label: string} {
-	if (state === 'running') return {kind: 'running', label: 'running'}
-	if (state === 'stopped' || state === 'suspended' || state === 'hibernated') return {kind: 'stopped', label: state === 'suspended' ? 'paused' : state}
-	if (state === 'error') return {kind: 'error', label: 'error'}
-	return {kind: 'busy', label: state}
+export function machineStatus(state: string): {kind: StatusKind; label: string} {
+	return reachLabel('guest', state === 'running', state)
 }
 const STATUS_COLOR: Record<StatusKind, string> = {
 	running: 'var(--green)',
@@ -149,7 +156,7 @@ export function AppIcon({
 }
 
 // ---- ring gauge -------------------------------------------------------------
-export function Ring({value, color, children, size = 84, label}: {value: number; color: string; children: ReactNode; size?: number; label: string}) {
+export function Ring({value, color, children, size = 84, label, empty = false, now, max = 100}: {value: number; color: string; children: ReactNode; size?: number; label: string; empty?: boolean; now?: number; max?: number}) {
 	const stroke = 8
 	const r = (size - stroke) / 2
 	const c = 2 * Math.PI * r
@@ -159,24 +166,148 @@ export function Ring({value, color, children, size = 84, label}: {value: number;
 		return () => cancelAnimationFrame(id)
 	}, [value])
 	return (
-		<div className="ring" style={{width: size, height: size, color}} role="meter" aria-label={label} aria-valuenow={Math.round(value)} aria-valuemin={0} aria-valuemax={100}>
+		<div
+			className={empty ? 'ring is-off' : 'ring'}
+			style={{width: size, height: size, color}}
+			role={empty ? 'img' : 'meter'}
+			aria-label={label}
+			aria-valuenow={empty ? undefined : Math.round(now ?? value)}
+			aria-valuemin={empty ? undefined : 0}
+			aria-valuemax={empty ? undefined : max}
+		>
 			<svg viewBox={`0 0 ${size} ${size}`} aria-hidden="true">
 				<circle className="track" cx={size / 2} cy={size / 2} r={r} fill="none" strokeWidth={stroke} />
-				<circle
-					className="value"
-					cx={size / 2}
-					cy={size / 2}
-					r={r}
-					fill="none"
-					stroke="currentColor"
-					strokeWidth={stroke}
-					strokeLinecap="round"
-					strokeDasharray={c}
-					strokeDashoffset={c * (1 - Math.max(0.005, shown / 100))}
-				/>
+				{!empty && (
+					<circle
+						className="value"
+						cx={size / 2}
+						cy={size / 2}
+						r={r}
+						fill="none"
+						stroke="currentColor"
+						strokeWidth={stroke}
+						strokeLinecap="round"
+						strokeDasharray={c}
+						strokeDashoffset={c * (1 - Math.max(0.005, shown / 100))}
+					/>
+				)}
 			</svg>
 			<div className="center">{children}</div>
 		</div>
+	)
+}
+
+// Last-N poll points for a sparkline. Keyed on fetch time so a flat value still plots.
+export function useHistory(value: number | undefined, stamp: number, size = 40) {
+	const [series, setSeries] = useState<number[]>([])
+	useEffect(() => {
+		if (value === undefined || !stamp) return
+		setSeries((s) => [...s.slice(-(size - 1)), value])
+		// eslint-disable-next-line react-hooks/exhaustive-deps
+	}, [stamp])
+	return series
+}
+
+export function Spark({series, max = 100, color, label}: {series: number[]; max?: number; color: string; label: string}) {
+	const id = `spark${useId().replace(/:/g, '')}`
+	const d = sparkPath(series, {max})
+	if (!d) return <svg className="spark" viewBox={`0 0 ${SPARK_WIDTH} ${SPARK_HEIGHT}`} aria-hidden="true" />
+	return (
+		<svg className="spark" viewBox={`0 0 ${SPARK_WIDTH} ${SPARK_HEIGHT}`} preserveAspectRatio="none" role="img" aria-label={label}>
+			<defs>
+				<linearGradient id={id} x1="0" x2="0" y1="0" y2="1">
+					<stop offset="0" stopColor={color} stopOpacity="0.35" />
+					<stop offset="1" stopColor={color} stopOpacity="0" />
+				</linearGradient>
+			</defs>
+			<path d={`${d} L${SPARK_WIDTH},${SPARK_HEIGHT} L0,${SPARK_HEIGHT} Z`} fill={`url(#${id})`} />
+			<path d={d} fill="none" stroke={color} strokeWidth="2.2" vectorEffect="non-scaling-stroke" strokeLinejoin="round" strokeLinecap="round" />
+		</svg>
+	)
+}
+
+export function StatCard({
+	icon,
+	label,
+	value,
+	unit,
+	sub,
+	subStyle,
+	spark,
+	ariaLabel,
+}: {
+	icon: IconName
+	label: string
+	value: ReactNode
+	unit?: ReactNode
+	sub?: ReactNode
+	subStyle?: CSSProperties
+	spark?: {series: number[]; color: string; label: string; max?: number}
+	ariaLabel?: string
+}) {
+	return (
+		<section className="glass stat" aria-label={ariaLabel ?? label}>
+			<div className="k">
+				<Icon name={icon} size={16} /> {label}
+			</div>
+			<div className="v">
+				{value}
+				{unit ? <small>{unit}</small> : null}
+			</div>
+			{sub !== undefined && (
+				<div className="sub" style={subStyle}>
+					{sub}
+				</div>
+			)}
+			{spark ? <Spark series={spark.series} color={spark.color} label={spark.label} max={spark.max} /> : null}
+		</section>
+	)
+}
+
+export function Card({
+	children,
+	className,
+	style,
+	label,
+}: {
+	children: ReactNode
+	className?: string
+	style?: CSSProperties
+	label?: string
+}) {
+	return (
+		<section className={['glass', 'card', className].filter(Boolean).join(' ')} style={style} aria-label={label}>
+			{children}
+		</section>
+	)
+}
+
+export function CardHead({title, extra, style}: {title: ReactNode; extra?: ReactNode; style?: CSSProperties}) {
+	return (
+		<div className="card-head" style={style}>
+			<strong>{title}</strong>
+			{extra ? <span>{extra}</span> : null}
+		</div>
+	)
+}
+
+export function StatChip({
+	icon,
+	label,
+	children,
+	className = 'spec',
+	size = 14,
+}: {
+	icon: IconName
+	label: string
+	children: ReactNode
+	className?: string
+	size?: number
+}) {
+	return (
+		<span className={className} title={label}>
+			<Icon name={icon} size={size} /> {children}
+		</span>
 	)
 }
 
@@ -194,13 +325,15 @@ export function Segmented<T extends string>({
 }) {
 	const index = Math.max(0, options.findIndex((o) => o.id === value))
 	return (
-		<div className="segmented glass" role="tablist" aria-label={label}>
+		<div className="segmented glass" role="tablist" aria-label={label} onKeyDown={(e) => rovingKeyDown(e, TAB_SELECTOR, 'horizontal')}>
 			<span className="thumb" style={{width: `calc((100% - 8px) / ${options.length})`, transform: `translateX(${index * 100}%)`}} />
 			{options.map((o) => (
 				<button
 					key={o.id}
+					type="button"
 					role="tab"
 					aria-selected={o.id === value}
+					tabIndex={rovingTabIndex(o.id === value, options.indexOf(o), options.some((x) => x.id === value))}
 					onClick={() => {
 						haptic(5)
 						onChange(o.id)
@@ -211,6 +344,22 @@ export function Segmented<T extends string>({
 				</button>
 			))}
 		</div>
+	)
+}
+
+export function Switch({on, onChange, label, disabled}: {on: boolean; onChange: (v: boolean) => void; label: string; disabled?: boolean}) {
+	return (
+		<button
+			className="switch"
+			role="switch"
+			aria-checked={on}
+			aria-label={label}
+			disabled={disabled}
+			onClick={() => {
+				haptic(6)
+				onChange(!on)
+			}}
+		/>
 	)
 }
 
@@ -236,29 +385,74 @@ export function lockPageScroll() {
 	}
 }
 
+// Make a full-screen overlay behave like its own window on iPhone: freeze the page underneath
+// (iOS ignores overflow:hidden on body and will scroll it to "reveal" a focused input), and
+// stop drags outside the real scroll areas from panning the page while the keyboard is up.
+export function useScreenLock(ref: RefObject<HTMLElement>, guardTouch = true, enabled = true) {
+	useEffect(() => {
+		if (!enabled) return
+		const html = document.documentElement
+		const b = document.body.style
+		const y = window.scrollY
+		Object.assign(b, {position: 'fixed', top: `-${y}px`, left: '0', right: '0', width: '100%'})
+		const release = lockPageScroll()
+		html.classList.add('screen-locked')
+		const el = ref.current
+		const scrollers = '.xterm-viewport, .console-keys, .term-paste textarea'
+		const onMove = (e: TouchEvent) => {
+			if (e.touches.length > 1) return void e.preventDefault() // no pinch-zoom of the page
+			const t = e.target as Element | null
+			if (t?.closest?.(scrollers)) return
+			e.preventDefault()
+		}
+		if (guardTouch) el?.addEventListener('touchmove', onMove, {passive: false})
+		// iOS can still pan the page after the keyboard opens; pull it back.
+		const onScroll = () => window.scrollY && window.scrollTo(0, 0)
+		window.addEventListener('scroll', onScroll)
+		return () => {
+			if (guardTouch) el?.removeEventListener('touchmove', onMove)
+			window.removeEventListener('scroll', onScroll)
+			// Back to the page's normal layout (not a saved copy, which another overlay may have changed).
+			Object.assign(b, {position: '', top: '', left: '', right: '', width: ''})
+			release()
+			html.classList.remove('screen-locked')
+			window.scrollTo(0, y)
+		}
+	}, [ref, guardTouch, enabled])
+}
+
 // ---- bottom sheet -----------------------------------------------------------
 export function Sheet({open, onClose, label, children, tall}: {open: boolean; onClose: () => void; label: string; children: ReactNode; tall?: boolean}) {
 	const ref = useRef<HTMLDivElement>(null)
+	const scrollRef = useRef<HTMLDivElement>(null)
 	const portalRoot = usePortalRoot()
 	const start = useRef<{y: number; t: number} | null>(null)
 	const [drag, setDrag] = useState(0)
+	useDialogFocus(open, ref, onClose)
 	useEffect(() => {
 		if (!open) return
-		const onKey = (e: KeyboardEvent) => e.key === 'Escape' && onClose()
-		document.addEventListener('keydown', onKey)
-		const release = lockPageScroll()
-		ref.current?.focus({preventScroll: true})
+		return lockPageScroll()
+	}, [open])
+	useEffect(() => {
+		if (!open) return
+		const root = document.documentElement
+		root.dataset.sheets = String(Number(root.dataset.sheets || 0) + 1)
 		return () => {
-			document.removeEventListener('keydown', onKey)
-			release()
+			const left = Number(root.dataset.sheets || 1) - 1
+			if (left <= 0) delete root.dataset.sheets
+			else root.dataset.sheets = String(left)
 		}
-	}, [open, onClose])
+	}, [open])
 	if (!open) return null
-	// Swipe down to dismiss when the sheet is scrolled to the top (the close button is the accessible path).
+	// Drag the handle or the header down to dismiss, and only when the page is already at the top.
+	// A drag that starts on the page itself scrolls that page. The close button is the accessible path.
+	// Disabled on centered desktop dialogs so a touch drag cannot drop the centering transform.
 	const onTouchStart = (e: React.TouchEvent) => {
-		if ((ref.current?.scrollTop ?? 0) > 0) return
+		if (document.documentElement.classList.contains('desk-mode')) return
+		if ((scrollRef.current?.scrollTop ?? 0) > 0) return
 		const target = e.target as HTMLElement
 		if (target.closest('.logs, .gallery, input, textarea')) return
+		if (!target.closest('.sheet-chrome, .sheet-head')) return
 		start.current = {y: e.touches[0].clientY, t: Date.now()}
 	}
 	const onTouchMove = (e: React.TouchEvent) => {
@@ -292,8 +486,12 @@ export function Sheet({open, onClose, label, children, tall}: {open: boolean; on
 				onTouchMove={onTouchMove}
 				onTouchEnd={onTouchEnd}
 			>
-				<span className="grabber" />
-				{children}
+				<div className="sheet-chrome">
+					<span className="grabber" />
+				</div>
+				<div className="sheet-scroll" ref={scrollRef}>
+					{children}
+				</div>
 			</div>
 		</>,
 		portalRoot,
@@ -328,6 +526,147 @@ export function KV({rows}: {rows: [string, ReactNode][]}) {
 	)
 }
 
+// Version, settings rows, and grouped lists. Copied screens used to drift (the version tooltip
+// only appeared where someone remembered to wire it).
+export function VersionTag({version, info, prefix}: {version?: string; info?: VersionInfo | null; prefix?: string}) {
+	const {text, title} = versionTagProps(version, info, {prefix})
+	return (
+		<span title={title}>
+			{text}
+			{title ? <span className="sr-only"> {title}</span> : null}
+		</span>
+	)
+}
+
+export function Row({
+	icon,
+	color = 'var(--accent)',
+	label,
+	value,
+	sub,
+	onClick,
+	href,
+	trailing,
+	title,
+	disabled,
+	expanded,
+}: {
+	icon: IconName
+	color?: string
+	label: string
+	value?: ReactNode
+	sub?: ReactNode
+	onClick?: () => void
+	href?: string
+	trailing?: ReactNode
+	title?: string
+	disabled?: boolean
+	/** For a row that opens or closes more rows under it: whether they are showing. */
+	expanded?: boolean
+}) {
+	const inner = (
+		<>
+			<span className="row-ico" style={{'--c': color} as CSSProperties}>
+				<Icon name={icon} size={19} />
+			</span>
+			<span className="main">
+				<b style={{fontWeight: 550}}>{label}</b>
+				{sub ? <span>{sub}</span> : null}
+			</span>
+			{value !== undefined && <span className="trail">{value}</span>}
+			{trailing ?? (onClick || href ? <Icon name="chevron" size={18} className="chev" /> : null)}
+		</>
+	)
+	if (href)
+		return (
+			<a className="row" href={href} target="_blank" rel="noopener noreferrer" title={title} style={{minHeight: 56}}>
+				{inner}
+			</a>
+		)
+	if (onClick)
+		return (
+			<button className="row" onClick={onClick} title={title} disabled={disabled} aria-expanded={expanded} style={{minHeight: 56}}>
+				{inner}
+			</button>
+		)
+	return (
+		<div className="row static" title={title} style={{minHeight: 56}}>
+			{inner}
+		</div>
+	)
+}
+
+export function Group({title, children, footer}: {title: string; children: ReactNode; footer?: ReactNode}) {
+	return (
+		<section>
+			<div className="section-head">
+				<h2>{title}</h2>
+			</div>
+			<div className="glass group" style={{'--inset': '62px'} as CSSProperties}>
+				{children}
+			</div>
+			{footer && (
+				<p className="footer-note" style={{textAlign: 'left', margin: '10px 6px 0'}}>
+					{footer}
+				</p>
+			)}
+		</section>
+	)
+}
+
+export type FieldProps = {
+	id?: string
+	label: string
+	labelHidden?: boolean
+	hint?: ReactNode
+	error?: ReactNode
+	invalid?: boolean
+	wrapperClassName?: string
+} & Omit<InputHTMLAttributes<HTMLInputElement>, 'id'>
+
+export function Field({
+	id,
+	label,
+	labelHidden,
+	hint,
+	error,
+	invalid,
+	wrapperClassName,
+	'aria-describedby': describedByProp,
+	'aria-invalid': ariaInvalidProp,
+	...input
+}: FieldProps) {
+	const autoId = useId()
+	const fieldId = id ?? autoId
+	const a11y = fieldAria(autoId, {
+		hasHint: Boolean(hint),
+		hasError: Boolean(error),
+		invalid,
+		describedBy: describedByProp,
+	})
+	return (
+		<div className={wrapperClassName ? `field ${wrapperClassName}` : 'field'}>
+			<label htmlFor={fieldId} className={labelHidden ? 'sr-only' : undefined}>
+				{label}
+			</label>
+			<input
+				id={fieldId}
+				aria-describedby={a11y.describedBy}
+				aria-invalid={ariaInvalidProp ?? a11y.invalid}
+				{...input}
+			/>
+			{hint && (
+				<span id={a11y.hintId} className="hint">
+					{hint}
+				</span>
+			)}
+			<span id={a11y.errorId} className={error ? 'hint field-error' : 'sr-only'} aria-live="polite" aria-atomic="true">
+				{error || ''}
+			</span>
+		</div>
+	)
+}
+
 // ---- confirmation & toasts ----------------------------------------------------
 type ConfirmOptions = {title: string; body: ReactNode; confirm: string; danger?: boolean; icon?: Parameters<typeof Icon>[0]['name']}
 const ConfirmContext = createContext<(o: ConfirmOptions) => Promise<boolean>>(async () => false)
@@ -339,12 +678,41 @@ export const useToast = () => useContext(ToastContext)
 
 export function Providers({children}: {children: ReactNode}) {
 	const [toast, setToast] = useState<Toast | null>(null)
+	const [announced, setAnnounced] = useState<Toast | null>(null)
+	const announcedRef = useRef<Toast | null>(null)
+	announcedRef.current = announced
 	const timer = useRef<number>()
+	const rafRef = useRef<number>()
+	useEffect(() => {
+		return () => {
+			window.clearTimeout(timer.current)
+			if (rafRef.current !== undefined) cancelAnimationFrame(rafRef.current)
+		}
+	}, [])
 	const show = useCallback((text: string, error = false) => {
 		haptic(error ? [20, 40, 20] : 10)
-		setToast({id: Date.now(), text, error})
+		const next: Toast = {id: Date.now(), text, error}
+		setToast(next)
+		if (rafRef.current !== undefined) {
+			cancelAnimationFrame(rafRef.current)
+			rafRef.current = undefined
+		}
+		const prev = announcedRef.current
+		if (prev && prev.text === text && !!prev.error === error) {
+			// Clear and restore on the next frame so repeating the same toast re-announces it.
+			setAnnounced(null)
+			rafRef.current = requestAnimationFrame(() => {
+				rafRef.current = undefined
+				setAnnounced(next)
+			})
+		} else {
+			setAnnounced(next)
+		}
 		window.clearTimeout(timer.current)
-		timer.current = window.setTimeout(() => setToast(null), error ? 4500 : 2600)
+		timer.current = window.setTimeout(() => {
+			setToast(null)
+			setAnnounced(null)
+		}, error ? 4500 : 2600)
 	}, [])
 
 	const [pending, setPending] = useState<(ConfirmOptions & {resolve: (v: boolean) => void}) | null>(null)
@@ -356,8 +724,10 @@ export function Providers({children}: {children: ReactNode}) {
 		pending?.resolve(v)
 		setPending(null)
 	}
+	const live = liveRegionText(announced)
 
 	return (
+		<AccountToastProvider>
 		<ToastContext.Provider value={show}>
 			<ConfirmContext.Provider value={confirm}>
 				{children}
@@ -374,27 +744,28 @@ export function Providers({children}: {children: ReactNode}) {
 							<div className="prose" style={{marginBottom: 24}}>
 								{pending.body}
 							</div>
-							<div className="stack">
+							<div className="stack confirm-actions">
 								<button className={`btn block ${pending.danger ? 'danger solid' : 'primary'}`} onClick={() => finish(true)}>
 									{pending.confirm}
 								</button>
-								<button className="btn block ghost" onClick={() => finish(false)}>
+								{/* Destructive confirms start on Cancel, so a stray Enter can't delete or uninstall. */}
+								<button className="btn block ghost" data-autofocus={pending.danger || undefined} onClick={() => finish(false)}>
 									Cancel
 								</button>
 							</div>
 						</div>
 					)}
 				</Sheet>
-				{toast && (
-					<div key={toast.id} className={`toast${toast.error ? ' error' : ''}`} role="status" aria-live="polite">
-						<span className="ico">
-							<Icon name={toast.error ? 'alert' : 'check'} size={15} stroke={2.6} />
-						</span>
-						{toast.text}
-					</div>
-				)}
+				<div className="sr-only" role="status" aria-live="polite" aria-atomic="true">
+					{live.status}
+				</div>
+				<div className="sr-only" role="alert" aria-live="assertive" aria-atomic="true">
+					{live.alert}
+				</div>
+				<AccountToastStack local={toast} />
 			</ConfirmContext.Provider>
 		</ToastContext.Provider>
+		</AccountToastProvider>
 	)
 }
 
@@ -403,16 +774,24 @@ export function Providers({children}: {children: ReactNode}) {
 export const THEMES = [
 	{id: 'horizon', name: 'Horizon', bg: '#111', fg: '#fff', dots: [] as string[]},
 	{id: 'custom', name: 'Your photo', bg: '#111', fg: '#fff', dots: [] as string[]},
-	{id: 'mocha', name: 'Midnight', bg: '#1e1e2e', fg: '#cdd6f4', dots: ['#89b4fa', '#a6e3a1', '#f9e2af', '#f38ba8']},
-	{id: 'tokyo', name: 'Neon', bg: '#1a1b26', fg: '#c0caf5', dots: ['#7aa2f7', '#9ece6a', '#e0af68', '#f7768e']},
+	{id: 'mocha', name: 'Midnight', bg: '#282238', fg: '#ddd4f6', dots: ['#89b4fa', '#a6e3a1', '#f9e2af', '#f38ba8']},
+	{id: 'tokyo', name: 'Neon', bg: '#101820', fg: '#c8e7f8', dots: ['#7aa2f7', '#9ece6a', '#e0af68', '#f7768e']},
 	{id: 'gruvbox', name: 'Ember', bg: '#282828', fg: '#ebdbb2', dots: ['#83a598', '#b8bb26', '#fabd2f', '#fb4934']},
-	{id: 'latte', name: 'Daylight', bg: '#eff1f5', fg: '#4c4f69', dots: ['#1e66f5', '#40a02b', '#df8e1d', '#d20f39']},
+	{id: 'latte', name: 'Daylight', bg: '#f2f2ef', fg: '#4c4f69', dots: ['#1e66f5', '#40a02b', '#df8e1d', '#d20f39']},
+	{id: 'linen', name: 'Linen', bg: '#f6f1e7', fg: '#4a4338', dots: ['#3d6fbf', '#3d8c3a', '#b8860b', '#c44536']},
+	{id: 'sky', name: 'Sky', bg: '#d5e3f6', fg: '#2c3d52', dots: ['#3a6fbf', '#2f8f6b', '#c4922a', '#d04555']},
 	{id: 'omarchy', name: 'Omarchy', bg: '#1a1b26', fg: '#a9b1d6', dots: ['#7aa2f7', '#9ece6a', '#e0af68', '#f7768e']},
 ] as const
 export const ACCENTS = ['wallpaper', 'blue', 'mauve', 'teal', 'peach', 'green', 'pink'] as const
 export type ThemeId = (typeof THEMES)[number]['id']
 export type Prefs = {
 	theme: ThemeId
+	/** Palette Moon returns to. */
+	darkTheme: DarkThemeId
+	/** Palette Sun returns to. */
+	lightTheme: LightThemeId
+	/** Horizon, Your photo, or Omarchy. Off returns to this. */
+	pictureTheme: PictureThemeId
 	accent: (typeof ACCENTS)[number]
 	customBrandHsl?: string | null
 	backgroundVersion?: number | null
@@ -420,20 +799,59 @@ export type Prefs = {
 	omarchyBackground?: string | null
 	/** A plain colour behind everything instead of a picture (#rrggbb), or null for the picture. */
 	solidColor?: string | null
+	/** How the assistant looks (character, name, motion); see character/AssistantCharacter. */
+	assistantLook?: AssistantLook | null
+	/** How machine stats are drawn. Null means the one-line default. Saved per account. */
+	statView?: 'line' | 'blocks' | 'gauges' | null
+	/** Desktop Machines compact list. Null means off. Saved per account. */
+	machinesCompact?: boolean | null
+	/** Which readings this account shows, apart from temperatures. Null means all of them stay shown. */
+	statPicks?: {on: string[]; off: string[]} | null
+	/** Which temperature sensors this account shows. Null means each sensor's own default. */
+	tempPicks?: {on: string[]; off: string[]} | null
+	/** Fahrenheit when `f`. Null means Celsius. */
+	tempUnit?: 'f' | null
+	/** Notes this account has dismissed. The same id stays dismissed on every device. */
+	dismissedTutorials?: TutorialId[]
 }
 // New installs start on the Omarchy theme (the Omarchy desktop's own colours and background). Anyone
 // who already chose a theme keeps it: their choice is saved on the server and wins over this default.
-const DEFAULT_PREFS: Prefs = {theme: 'omarchy', accent: 'wallpaper'}
+const DEFAULT_PREFS: Prefs = {theme: 'omarchy', darkTheme: 'mocha', lightTheme: 'latte', pictureTheme: 'omarchy', accent: 'wallpaper'}
 // Plain colours to choose instead of a picture (the phone's background and the desktop's wallpaper).
 export const SOLID_COLORS = ['#1a1b26', '#11111b', '#000000', '#2e3440', '#1f2335', '#283618', '#3b2f2f', '#4a1942', '#0f3b57', '#7aa2f7', '#9ece6a', '#e0af68'] as const
 export const isSolidColor = (v: unknown): v is string => typeof v === 'string' && /^#[0-9a-f]{6}$/i.test(v)
+
+// Plain colours instead of a picture: a few to tap, any other with the colour picker, or the picture.
+export function SolidColors({value, onChange}: {value: string | null; onChange: (c: string | null) => void}) {
+	return (
+		<div className="solid-colors" role="radiogroup" aria-label="Solid colour" onKeyDown={(e) => rovingKeyDown(e, RADIO_SELECTOR)}>
+			<button role="radio" aria-checked={!value} tabIndex={!value || !SOLID_COLORS.includes(value as (typeof SOLID_COLORS)[number]) ? 0 : -1} className={`solid-swatch picture${!value ? ' on' : ''}`} onClick={() => onChange(null)} title="A picture (no solid colour)">
+				<Icon name="wallpaper" size={16} />
+			</button>
+			{SOLID_COLORS.map((c) => (
+				<button key={c} role="radio" aria-checked={value === c} tabIndex={value === c ? 0 : -1} aria-label={c} className={`solid-swatch${value === c ? ' on' : ''}`} style={{background: c}} onClick={() => onChange(c)} />
+			))}
+			<label className={`solid-swatch custom${value && !(SOLID_COLORS as readonly string[]).includes(value) ? ' on' : ''}`} title="Any colour" style={value && !(SOLID_COLORS as readonly string[]).includes(value) ? {background: value} : undefined}>
+				<Icon name="palette" size={16} />
+				<input type="color" value={value ?? '#1a1b26'} onChange={(e) => onChange(e.target.value.toLowerCase())} aria-label="Pick any colour" />
+			</label>
+		</div>
+	)
+}
 const LOCAL_KEY = 'omarchy-server:prefs'
 
 function clean(p: Partial<Prefs> | null | undefined): Prefs {
 	const theme = THEMES.some((t) => t.id === p?.theme) ? p!.theme! : DEFAULT_PREFS.theme
+	const slots = cleanThemeSlots(theme, p)
 	const accent = (ACCENTS as readonly string[]).includes(p?.accent as string) ? p!.accent! : DEFAULT_PREFS.accent
 	const omarchyBackground = typeof p?.omarchyBackground === 'string' && /^[0-9a-f]{16}$/.test(p.omarchyBackground) ? p.omarchyBackground : null
-	return {theme, accent, customBrandHsl: p?.customBrandHsl ?? null, backgroundVersion: p?.backgroundVersion ?? null, omarchyBackground, solidColor: isSolidColor(p?.solidColor) ? p.solidColor.toLowerCase() : null}
+	const statView = p?.statView === 'line' || p?.statView === 'blocks' || p?.statView === 'gauges' ? p.statView : null
+	const machinesCompact = typeof p?.machinesCompact === 'boolean' ? p.machinesCompact : null
+	const statPicks = cleanStatPicks(p?.statPicks)
+	const tempPicks = cleanTempPicks(p?.tempPicks)
+	const tempUnit = p?.tempUnit === 'f' ? 'f' : null
+	const dismissedTutorials = cleanTutorials(p?.dismissedTutorials)
+	return {theme, ...slots, accent, customBrandHsl: p?.customBrandHsl ?? null, backgroundVersion: p?.backgroundVersion ?? null, omarchyBackground, solidColor: isSolidColor(p?.solidColor) ? p.solidColor.toLowerCase() : null, assistantLook: p?.assistantLook ? cleanLook(p.assistantLook) : null, statView, machinesCompact, statPicks, tempPicks, tempUnit, dismissedTutorials}
 }
 export function readPrefs(): Prefs {
 	try {
@@ -473,7 +891,7 @@ export function useOmarchyThemes(enabled = true) {
 	return q
 }
 
-const FALLBACK_BRAND = '24 90% 50%' // Omarchy Server's default wallpaper colour
+const FALLBACK_BRAND = '24 90% 50%' // My Own Data Center's default wallpaper colour
 // The Omarchy theme takes every colour from the theme the Omarchy desktop uses right now: panels,
 // text and the palette that system icons are tinted with (see .sys-ico in styles.css).
 const OMARCHY_VARS = ['--bg', '--bg-solid', '--fg', '--fg-2', '--muted', '--faint', '--glass', '--glass-2', '--glass-press', '--line', '--line-2', '--sheet', '--dock', '--red', '--green', '--yellow', '--blue', '--mauve', '--teal', '--peach', '--pink']
@@ -489,7 +907,7 @@ function applyOmarchyPalette(root: HTMLElement, on: boolean) {
 	set('--bg-solid', mix(bg, '#000', 88))
 	set('--fg', fg)
 	set('--fg-2', mix(fg, bg, 88))
-	set('--muted', c.palette?.brightBlack && c.palette.brightBlack !== bg ? mix(c.palette.brightBlack, fg, 55) : mix(fg, bg, 62))
+	set('--muted', legibleMuted(bg, fg, c.palette?.brightBlack) ?? (c.palette?.brightBlack && c.palette.brightBlack !== bg ? mix(c.palette.brightBlack, fg, 55) : mix(fg, bg, 62)))
 	set('--faint', mix(fg, 'transparent', 8))
 	set('--glass', mix(bg, 'transparent', 94))
 	set('--glass-2', mix(fg, bg, 8))
@@ -512,51 +930,53 @@ export function applyPrefs(p: Prefs, brandHsl?: string | null) {
 	const root = document.documentElement
 	root.dataset.theme = p.theme
 	applyOmarchyPalette(root, p.theme === 'omarchy')
-	const light = p.theme === 'latte'
+	const light = isLightTheme(p.theme)
+	const lightBg = light ? (parseRgbColor(THEMES.find((t) => t.id === p.theme)?.bg) ?? undefined) : undefined
 	if (p.accent === 'wallpaper' && p.theme === 'omarchy') {
 		// The Omarchy desktop's own theme colours, once known (see useOmarchyThemes).
 		const c = omarchyColors
-		root.style.setProperty('--accent', c?.accent ?? '#7aa2f7')
-		root.style.setProperty('--accent-text', c?.accent ?? '#7aa2f7')
-		root.style.setProperty('--on-accent', c?.background ?? '#1a1b26')
+		const fill = c?.accent ?? '#7aa2f7'
+		root.style.setProperty('--accent', fill)
+		root.style.setProperty('--accent-text', fill)
+		root.style.setProperty('--on-accent', pickOnAccent(fill, '#111', c?.background ?? '#1a1b26'))
 	} else if (p.accent === 'wallpaper') {
 		const source = p.theme === 'custom' ? (p.customBrandHsl ?? brandHsl) : brandHsl
 		const [h, s, l] = (source ?? FALLBACK_BRAND).split(' ').map((v) => parseFloat(v))
-		root.style.setProperty('--accent', `hsl(${h} ${s}% ${l}%)`)
-		root.style.setProperty('--accent-text', `hsl(${h} ${Math.min(s, 95)}% ${light ? Math.min(l, 42) : Math.max(l, 66)}%)`)
+		root.style.setProperty('--accent', darkenHslForWhite(h, s, l))
+		const [r, g, b] = hslToRgb(h, Math.min(s, 95), Math.min(l, 42))
+		root.style.setProperty('--accent-text', (light && darkenForTextOn(`rgb(${r}, ${g}, ${b})`, lightBg)) || `hsl(${h} ${Math.min(s, 95)}% ${light ? Math.min(l, 42) : Math.max(l, 66)}%)`)
 		root.style.setProperty('--on-accent', '#fff')
 	} else {
-		root.style.setProperty('--accent', `var(--${p.accent})`)
-		root.style.setProperty('--accent-text', `var(--${p.accent})`)
-		root.style.setProperty('--on-accent', light ? '#fff' : '#111')
+		const token = `var(--${p.accent})`
+		root.style.setProperty('--accent', token)
+		const resolved = resolveCssColor(root, token)
+		root.style.setProperty('--accent-text', (light && darkenForTextOn(resolved, lightBg)) || token)
+		root.style.setProperty('--on-accent', pickOnAccent(resolved, light ? '#fff' : '#111'))
 	}
 	const meta = document.querySelector('meta[name="theme-color"]')
 	meta?.setAttribute('content', THEMES.find((t) => t.id === p.theme)?.bg ?? '#111')
 }
 
 // Appearance is cached in the browser for an instant first paint, and saved on the server per
-// Omarchy Server account so every device you sign in on gets it. The server counts each save (rev):
+// My Own Data Center account so every device you sign in on gets it. The server counts each save (rev):
 // a device takes the server's copy whenever it changed, checking again when it comes back to the
-// front (and every 20 s), and a change sends only what changed, so it never puts back another
-// device's older choice.
-const PREFS_REV_KEY = `${LOCAL_KEY}:rev`
-const prefsRev = () => {
-	try {
-		return Number(localStorage.getItem(PREFS_REV_KEY)) || 0
-	} catch {
-		return 0
-	}
-}
-const keepPrefsRev = (rev: unknown) => {
-	try {
-		if (Number(rev)) localStorage.setItem(PREFS_REV_KEY, String(rev))
-	} catch {}
-}
+// front (and every 20 s), and unsaved local edits stay pending until a save succeeds so offline
+// changes are never reverted by a poll.
 export function usePrefs(brandHsl: string | null | undefined, signedIn: boolean) {
 	const [prefs, setLocal] = useState<Prefs>(readPrefs)
 	const now = useRef(prefs)
 	now.current = prefs
-	const saving = useRef(0)
+	const syncRef = useRef<ReturnType<typeof createPrefsSync<Prefs>> | null>(null)
+	if (!syncRef.current) {
+		syncRef.current = createPrefsSync<Prefs>({
+			storage: typeof localStorage !== 'undefined' ? localStorage : undefined,
+			load: loadPrefs,
+			save: savePrefs,
+			getCurrent: () => now.current,
+			onApply: (next) => setLocal(next),
+			clean,
+		})
+	}
 	useLayoutEffect(() => {
 		applyPrefs(prefs, brandHsl)
 		try {
@@ -567,64 +987,65 @@ export function usePrefs(brandHsl: string | null | undefined, signedIn: boolean)
 	}, [prefs, brandHsl])
 	useEffect(() => {
 		if (!signedIn) return
-		let last = 0
-		const pull = () => {
-			if (saving.current || Date.now() - last < 3000) return
-			last = Date.now()
-			fetch('/api/prefs', {credentials: 'same-origin'})
-				.then((r) => (r.ok ? r.json() : null))
-				.then((body) => {
-					if (saving.current || !body) return
-					if (body.prefs) {
-						if (Number(body.prefs.rev) !== prefsRev() || JSON.stringify(clean(body.prefs)) !== JSON.stringify(now.current)) {
-							setLocal(clean(body.prefs))
-							keepPrefsRev(body.prefs.rev)
-						}
-					}
-					// First sign-in on the server: keep what this device already had.
-					else savePrefs(now.current).then((p) => keepPrefsRev(p?.rev))
-				})
-				.catch(() => {})
-		}
-		pull()
-		const onVisible = () => document.visibilityState === 'visible' && pull()
-		window.addEventListener('focus', pull)
+		const sync = syncRef.current!
+		void sync.pull()
+		const onVisible = () => document.visibilityState === 'visible' && void sync.pull()
+		const onFocus = () => void sync.pull()
+		const onOnline = () => void sync.pull({force: true})
+		window.addEventListener('focus', onFocus)
+		window.addEventListener('online', onOnline)
 		document.addEventListener('visibilitychange', onVisible)
 		const timer = window.setInterval(onVisible, 20_000)
 		return () => {
-			window.removeEventListener('focus', pull)
+			window.removeEventListener('focus', onFocus)
+			window.removeEventListener('online', onOnline)
 			document.removeEventListener('visibilitychange', onVisible)
 			window.clearInterval(timer)
 		}
 	}, [signedIn])
 	const setPrefs = useCallback(
-		(next: Prefs) => {
+		(next: Prefs | ((current: Prefs) => Prefs)) => {
 			const before = now.current
-			setLocal(next)
+			const resolved = resolvePrefsUpdate(before, next)
+			now.current = resolved
+			setLocal(resolved)
 			if (!signedIn) return
-			const patch = Object.fromEntries((['theme', 'accent', 'customBrandHsl', 'omarchyBackground', 'solidColor'] as const).filter((k) => (next[k] ?? null) !== (before[k] ?? null)).map((k) => [k, next[k] ?? null])) as Partial<Prefs>
-			if (!Object.keys(patch).length) return
-			saving.current++
-			savePrefs(patch)
-				.then((p) => keepPrefsRev(p?.rev))
-				.finally(() => saving.current--)
+			void syncRef.current?.update(before, resolved)
 		},
 		[signedIn],
 	)
 	return [prefs, setPrefs, setLocal] as const
 }
+function prefsTimeout(ms = 20_000) {
+	if (typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function') {
+		return {signal: AbortSignal.timeout(ms), cleanup: () => {}}
+	}
+	const ac = new AbortController()
+	const timer = window.setTimeout(() => ac.abort(), ms)
+	return {signal: ac.signal, cleanup: () => window.clearTimeout(timer)}
+}
+function loadPrefs(): Promise<{prefs?: (Prefs & {rev?: number}) | null} | null> {
+	const {signal, cleanup} = prefsTimeout()
+	return fetch('/api/prefs', {credentials: 'same-origin', signal})
+		.then((r) => (r.ok ? r.json() : null))
+		.catch(() => null)
+		.finally(cleanup)
+}
 function savePrefs(p: Partial<Prefs>): Promise<(Prefs & {rev?: number}) | null> {
 	const body: Record<string, unknown> = {}
-	for (const k of ['theme', 'accent', 'customBrandHsl', 'omarchyBackground', 'solidColor'] as const) if (k in p) body[k] = p[k] ?? null
+	for (const k of SYNCED_PREF_KEYS) if (k in p) body[k] = p[k] ?? null
+	const {signal, cleanup} = prefsTimeout()
 	return fetch('/api/prefs', {
 		method: 'POST',
 		credentials: 'same-origin',
 		headers: {'content-type': 'application/json', 'x-omarchy-server': '1'},
 		body: JSON.stringify(body),
+		signal,
 	})
 		.then((r) => (r.ok ? r.json() : null))
 		.then((b) => b?.prefs ?? null)
 		.catch(() => null)
+		.finally(cleanup)
 }
 
 // Resize a photo on the phone (keeps upload small, fixes rotation) and find its dominant colour.
@@ -681,29 +1102,44 @@ export const wallpaperUrl = (w?: Wallpaper | null) => (w?.id ? `/api/wallpaper/$
 
 export const customBackgroundUrl = (version?: number | null) => (version ? `/api/background?v=${version}` : null)
 
-export function Backdrop({wallpaper, prefs}: {wallpaper?: Wallpaper | null; prefs: Prefs}) {
-	const desktopBg = useOmarchyThemes(prefs.theme === 'omarchy' || prefs.theme === 'horizon').data?.current
+export function Backdrop({wallpaper, prefs, signedIn = false}: {wallpaper?: Wallpaper | null; prefs: Prefs; signedIn?: boolean}) {
+	const [desk] = useDeskConfig()
+	const solid = prefs.solidColor || solidOf(desk.wallpaper)
+	const wantsOmarchy = desk.wallpaper === 'omarchy' || prefs.theme === 'omarchy' || prefs.theme === 'horizon'
+	const desktopBg = useOmarchyThemes(wantsOmarchy).data?.current
 	const url =
-		prefs.theme === 'horizon'
-			? omarchyBackgroundUrl(prefs.omarchyBackground, desktopBg)
-			: prefs.theme === 'custom'
-				? (customBackgroundUrl(prefs.backgroundVersion) ?? wallpaperUrl(wallpaper))
-				: prefs.theme === 'omarchy'
+		desk.wallpaper === 'photo'
+			? (customBackgroundUrl(prefs.backgroundVersion) ?? wallpaperUrl(wallpaper))
+			: desk.wallpaper === 'server'
+				? wallpaperUrl(wallpaper)
+				: desk.wallpaper === 'omarchy' || prefs.theme === 'horizon' || prefs.theme === 'omarchy'
 					? omarchyBackgroundUrl(prefs.omarchyBackground, desktopBg)
-					: null
+					: prefs.theme === 'custom'
+						? (customBackgroundUrl(prefs.backgroundVersion) ?? wallpaperUrl(wallpaper))
+						: null
 	const [ready, setReady] = useState<string | null>(null)
-	const [failed, setFailed] = useState<string | null>(null)
+	const [failed, setFailed] = useState<{url: string; session: boolean} | null>(null)
 	useEffect(() => {
+		setFailed(null)
 		if (!url) return
+		let cancel = false
 		const img = new Image()
-		img.onload = () => setReady(url)
-		img.onerror = () => setFailed(url)
+		img.onload = () => {
+			if (!cancel) setReady(url)
+		}
+		img.onerror = () => {
+			if (!cancel) setFailed({url, session: signedIn})
+		}
 		img.src = url
-	}, [url])
-	if (prefs.solidColor) return <div className="backdrop" aria-hidden="true" style={{background: prefs.solidColor}} />
+		return () => {
+			cancel = true
+		}
+	}, [url, signedIn])
+	const blocked = wallpaperBlocked(failed?.url ?? null, failed?.session ?? false, url, signedIn)
+	if (solid) return <div className="backdrop" aria-hidden="true" style={{background: solid}} />
 	return (
 		<div className="backdrop" aria-hidden="true">
-			{url && failed !== url ? (
+			{url && !blocked ? (
 				<>
 					<div className={`wall${ready === url ? ' ready' : ''}`} style={{backgroundImage: `url(${url})`}} />
 					<div className="shade" />
@@ -725,6 +1161,15 @@ export function TerminalIcon({size = 56}: {size?: number}) {
 	)
 }
 
+// The assistant's icon is its character (Settings → Assistant → Assistant Appearance).
+export function AssistantIcon({size = 56}: {size?: number}) {
+	return (
+		<span className="app-icon assistant-icon sys-ico ac-icon" style={{width: size, height: size} as CSSProperties}>
+			<AssistantAvatar size={size} />
+		</span>
+	)
+}
+
 export function StoreIcon({size = 56}: {size?: number}) {
 	return (
 		<span className="app-icon store-icon sys-ico" style={{width: size, height: size, '--tone': 'var(--blue)'} as CSSProperties}>
@@ -736,12 +1181,17 @@ export function StoreIcon({size = 56}: {size?: number}) {
 	)
 }
 
-// ---- layout: phone or desktop ---------------------------------------------------------------
-// Stored per device (a phone and a PC signed into the same account want different layouts).
-// Auto picks the desktop on a wide screen with a mouse or trackpad.
+// ---- layout: phone or desktop (detection in layout.ts) ---------------------------------------
+// Stored per device (a phone and a PC signed into the same account want different layouts). Each
+// device is asked once, at its first sign-in (the welcome setup); Automatic is still there.
+//
+// Automatic: the desktop on a big enough screen that has a mouse or trackpad anywhere (a touchscreen
+// PC or a touch laptop still counts), never on a phone. It changes only on a clear change of size
+// (above 1000 px wide to switch to the desktop, below 860 px to switch back), so snapping a window to
+// half the screen or a scrollbar appearing doesn't flip it.
 export type LayoutPref = 'auto' | 'desktop' | 'phone'
 const LAYOUT_KEY = 'omarchy-server:layout'
-const WIDE = '(min-width: 1000px) and (min-height: 600px) and (pointer: fine)'
+const ASKED_KEY = 'omarchy-server:layout-asked'
 function readLayoutPref(): LayoutPref {
 	try {
 		const v = localStorage.getItem(LAYOUT_KEY)
@@ -754,43 +1204,97 @@ export function setLayoutPref(p: LayoutPref) {
 	try {
 		if (p === 'auto') localStorage.removeItem(LAYOUT_KEY)
 		else localStorage.setItem(LAYOUT_KEY, p)
+		localStorage.setItem(ASKED_KEY, '1')
 	} catch {
 		/* private mode: applies for this visit only */
 	}
 	window.dispatchEvent(new CustomEvent('touch:layout', {detail: p}))
 }
-export function useLayout(): {desktop: boolean; pref: LayoutPref} {
+// Has this device chosen (or been asked) yet? A device that already picked Desktop or Phone counts.
+export function layoutAsked(): boolean {
+	try {
+		return localStorage.getItem(ASKED_KEY) === '1' || localStorage.getItem(LAYOUT_KEY) !== null
+	} catch {
+		return true
+	}
+}
+export function useLayout(): {desktop: boolean; pref: LayoutPref; detected: boolean} {
 	const [pref, setPref] = useState<LayoutPref>(readLayoutPref)
-	const [wide, setWide] = useState(() => matchMedia(WIDE).matches)
+	const [wide, setWide] = useState(() => detectDesktop())
 	useEffect(() => {
-		const mq = matchMedia(WIDE)
-		const onMq = () => setWide(mq.matches)
+		const mq = matchMedia(LAYOUT_POINTER)
+		const check = () => setWide((was) => detectDesktop(was))
 		const onPref = (e: Event) => setPref((e as CustomEvent<LayoutPref>).detail ?? readLayoutPref())
-		mq.addEventListener('change', onMq)
+		mq.addEventListener('change', check)
+		window.addEventListener('resize', check)
 		window.addEventListener('touch:layout', onPref)
 		return () => {
-			mq.removeEventListener('change', onMq)
+			mq.removeEventListener('change', check)
+			window.removeEventListener('resize', check)
 			window.removeEventListener('touch:layout', onPref)
 		}
 	}, [])
-	return {desktop: pref === 'desktop' || (pref === 'auto' && wide), pref}
+	return {desktop: pref === 'desktop' || (pref === 'auto' && wide), pref, detected: wide}
+}
+
+// The phone page scroller is .shell (or .auth before sign-in). The document itself does not scroll.
+function phoneScroller(): HTMLElement | null {
+	return document.querySelector<HTMLElement>('.shell, .auth')
+}
+export function scrollPhoneToTop(behavior: ScrollBehavior = 'auto') {
+	phoneScroller()?.scrollTo({top: 0, behavior})
+	window.scrollTo({top: 0, behavior})
 }
 
 // ---- iOS keyboard viewport repair -------------------------------------------------------------
 // After the on-screen keyboard closes, iOS Safari can keep the shrunken viewport, so fixed
 // elements (the dock, the backdrop) sit too high and leave a strip at the bottom until the page
 // scrolls. A one-pixel scroll and back makes it measure again, even on screens that don't scroll.
+// A home-screen web app on iOS has no browser bars to put back. Opening the page's own scrolling and
+// scrolling it by a pixel there is what leaves iOS laying the app out short, with an undrawn strip
+// under the bottom bar that only reinstalling cleared. So it only runs in the browser.
+export const iosHomeScreenApp = () =>
+	(/iP(hone|ad|od)/.test(navigator.platform) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1)) &&
+	((navigator as Navigator & {standalone?: boolean}).standalone === true || matchMedia('(display-mode: standalone)').matches)
 export function nudgeViewport() {
-	if (document.documentElement.classList.contains('desk-mode')) return
+	if (document.documentElement.classList.contains('desk-mode') || iosHomeScreenApp()) return
 	const root = document.documentElement
-	const y = window.scrollY
-	const prev = root.style.minHeight
+	const scroller = phoneScroller()
+	const yWin = window.scrollY
+	const y = scroller?.scrollTop ?? yWin
+	const prevMin = root.style.minHeight
+	const prevOverflow = root.style.overflow
+	const prevPad = scroller?.style.paddingBottom ?? ''
+	// html/body overflow:hidden clips a 1px document scroll; open it for one frame so iOS remeasures.
 	root.style.minHeight = 'calc(100% + 2px)'
-	window.scrollTo(0, y + 1)
+	root.style.overflow = 'auto'
+	// Add to the used padding. Replacing it with 2px drops the dock padding and jumps the page.
+	if (scroller) scroller.style.paddingBottom = paddingBottomPlus(getComputedStyle(scroller).paddingBottom)
+	if (scroller) scroller.scrollTop = y + 1
+	window.scrollTo(0, yWin + 1)
 	requestAnimationFrame(() => {
-		window.scrollTo(0, y)
-		root.style.minHeight = prev
+		if (scroller) {
+			scroller.style.paddingBottom = prevPad
+			scroller.scrollTop = y
+		}
+		window.scrollTo(0, yWin)
+		root.style.minHeight = prevMin
+		root.style.overflow = prevOverflow
 	})
+}
+// If the page was zoomed in anyway (a pinch, or a field from an older build), put it back at 1×
+// when a full-screen view like the assistant closes. Capping the scale for a moment and then
+// lifting the cap resets it; pinch-to-zoom works again straight after.
+export function resetZoom() {
+	const vv = window.visualViewport
+	if (!vv || vv.scale <= 1.01) return
+	const meta = document.querySelector<HTMLMetaElement>('meta[name="viewport"]')
+	if (!meta) return
+	const content = meta.content
+	meta.content = `${content.replace(/,\s*maximum-scale=[^,]*/g, '')}, maximum-scale=1`
+	window.setTimeout(() => {
+		meta.content = content
+	}, 300)
 }
 let viewportTimers: number[] = []
 export function settleViewport() {
@@ -813,40 +1317,3 @@ export function watchKeyboardViewport() {
 	})
 }
 
-// ---- iOS home-screen app: bottom gap ------------------------------------------------------------
-// In a standalone web app with a translucent status bar, iOS 26 sometimes lays out fixed elements as
-// if the screen were a status bar shorter, leaving a strip under the dock until something scrolls.
-// A hidden marker pinned to bottom: 0 shows where iOS thinks the bottom is; the difference from the
-// real screen height goes into --ios-gap, which bottom-anchored elements add back. When iOS gets it
-// right the gap is 0 and nothing moves.
-export function watchStandaloneGap() {
-	const ios = /iP(hone|ad|od)/.test(navigator.platform) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1)
-	const standalone = (navigator as Navigator & {standalone?: boolean}).standalone === true || matchMedia('(display-mode: standalone)').matches
-	if (!ios || !standalone) return
-	const probe = document.createElement('div')
-	probe.setAttribute('aria-hidden', 'true')
-	probe.style.cssText = 'position:fixed;left:0;bottom:0;width:1px;height:1px;visibility:hidden;pointer-events:none'
-	document.body.appendChild(probe)
-	const root = document.documentElement
-	let last = -1
-	const measure = () => {
-		const vv = window.visualViewport
-		const keyboard = !!vv && window.innerHeight - vv.height > 80
-		const portrait = window.innerHeight >= window.innerWidth
-		const screenH = portrait ? Math.max(screen.height, screen.width) : Math.min(screen.height, screen.width)
-		const gap = keyboard || root.classList.contains('desk-mode') ? 0 : Math.round(screenH - probe.getBoundingClientRect().bottom)
-		const value = gap > 0 && gap <= 120 ? gap : 0
-		if (value !== last) {
-			last = value
-			root.style.setProperty('--ios-gap', `${value}px`)
-		}
-	}
-	measure()
-	for (const ms of [100, 300, 700, 1500, 3000]) window.setTimeout(measure, ms)
-	window.addEventListener('resize', measure)
-	window.addEventListener('orientationchange', () => window.setTimeout(measure, 300))
-	window.visualViewport?.addEventListener('resize', () => window.setTimeout(measure, 50))
-	window.addEventListener('scroll', measure, {passive: true})
-	document.addEventListener('visibilitychange', () => document.visibilityState === 'visible' && window.setTimeout(measure, 100))
-	document.addEventListener('focusout', () => [120, 450, 900].forEach((ms) => window.setTimeout(measure, ms)))
-}

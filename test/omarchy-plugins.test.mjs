@@ -5,7 +5,9 @@ import os from 'node:os'
 import {join} from 'node:path'
 import {after, before, describe, test} from 'node:test'
 
-import {createOmarchyPlugins, toListing} from '../omarchyd/omarchy-plugins.mjs'
+import {readFileSync} from 'node:fs'
+
+import {createOmarchyPlugins, pluginPage, toListing} from '../omarchyd/omarchy-plugins.mjs'
 
 const SHA = 'a'.repeat(40)
 const entry = (over = {}) => ({
@@ -92,6 +94,27 @@ describe('installing a plugin', () => {
 		assert.deepEqual((await plugins.list({category: 'Productivity'})).plugins.map((p) => p.id), ['acme.clock'])
 	})
 
+	test('a manifest of `{` does not reject the list or hide the other plugins', async () => {
+		setup()
+		const dir = join(home, '.config', 'omarchy', 'plugins')
+		await mkdir(join(dir, 'acme.weather'), {recursive: true})
+		await writeFile(join(dir, 'acme.weather', 'manifest.json'), JSON.stringify({id: 'acme.weather'}))
+		await mkdir(join(dir, 'acme.clock'), {recursive: true})
+		await writeFile(join(dir, 'acme.clock', 'manifest.json'), '{')
+		try {
+			const page = await plugins.list({})
+			assert.deepEqual(
+				page.plugins.map((p) => p.id),
+				['acme.clock', 'acme.weather'],
+			)
+			assert.equal(page.plugins.find((p) => p.id === 'acme.weather').installed, true)
+			assert.equal(page.plugins.find((p) => p.id === 'acme.clock').installed, true)
+			await plugins.remove({id: 'acme.clock'})
+		} finally {
+			await rm(dir, {recursive: true, force: true})
+		}
+	})
+
 	test('installs the verified commit, validates it, then turns it on in the desktop session', async () => {
 		setup()
 		await plugins.install({id: 'acme.weather'})
@@ -136,5 +159,24 @@ describe('installing a plugin', () => {
 		const p2 = createOmarchyPlugins({home, theme: {findCommand: async () => null, runCommand: async () => {}}, fetchImpl: async () => ({ok: true, json: async () => ({plugins: [entry({id: 'acme.x'})]})}), catalogUrls: ['x']})
 		assert.equal((await p2.list({})).available, false)
 		await assert.rejects(p2.install({id: 'acme.x'}), /doesn’t support plugins|doesn’t have plugins/)
+	})
+
+	test('offset reaches plugins past the 60 cap, and one response stays at 60', async () => {
+		const catalog = Array.from({length: 65}, (_, i) => entry({id: `acme.p${String(i).padStart(2, '0')}`, name: `P${String(i).padStart(2, '0')}`, stars: 100 - i, repo: `https://github.com/acme/p${i}`}))
+		setup(catalog)
+		const rows = catalog.map((p) => ({...p, id: p.id}))
+		assert.equal(pluginPage(rows, {limit: 90}).slice.length, 60)
+		assert.equal(pluginPage(rows, {limit: 30, offset: 60}).slice.length, 5)
+		const first = await plugins.list({limit: 90})
+		assert.equal(first.total, 65)
+		assert.equal(first.plugins.length, 60)
+		assert.equal(first.plugins[0].id, 'acme.p00')
+		const next = await plugins.list({limit: 30, offset: 60})
+		assert.deepEqual(next.plugins.map((p) => p.id), ['acme.p60', 'acme.p61', 'acme.p62', 'acme.p63', 'acme.p64'])
+		const src = readFileSync(new URL('../web/src/screens/Plugins.tsx', import.meta.url), 'utf8')
+		assert.match(src, /offset/)
+		assert.doesNotMatch(src, /setLimit\(\(l\) => l \+ 30\)/)
+		const swarm = readFileSync(new URL('../web/src/swarm/Swarm.tsx', import.meta.url), 'utf8')
+		assert.match(swarm, /limit:\s*60/)
 	})
 })

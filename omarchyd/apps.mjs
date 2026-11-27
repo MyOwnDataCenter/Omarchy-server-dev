@@ -15,47 +15,96 @@
 // (HMAC-signed, HttpOnly). It gets one at sign-in, or by a one-time hand-over from the web app when it
 // first opens an app. Cookies belong to a host, not a port, so one sign-in covers every app.
 import {writeAtomic} from './atomic.mjs'
+import {movedGithubUrl} from './moved.mjs'
 import {execFile} from 'node:child_process'
 import {createHash, createHmac, randomBytes, timingSafeEqual} from 'node:crypto'
-import {access, cp, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, writeFile} from 'node:fs/promises'
+import {lstatSync, readlinkSync, realpathSync} from 'node:fs'
+import {access, chmod, cp, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, symlink, writeFile} from 'node:fs/promises'
 import http from 'node:http'
 import https from 'node:https'
 import net from 'node:net'
 import os from 'node:os'
-import {join, resolve} from 'node:path'
+import {dirname, join, resolve} from 'node:path'
+import {fileURLToPath} from 'node:url'
 import tls from 'node:tls'
 import YAML from 'yaml'
 
-import {RpcError} from './rpc.mjs'
+import {createKeyedLock} from './locks.mjs'
+import {RpcError, handleRpc, sendError} from './rpc.mjs'
 import {SYSTEM_PERMISSIONS} from './system-apps.mjs'
 import {dualProtocolServer, tlsContext, wantsUpgrade} from './tls.mjs'
+import {linkProxy} from './proxy-link.mjs'
+import {installTargetId} from './install-target.mjs'
+import {usbComposeOverlay} from './usb.mjs'
+import {buildAppRedirectUris, buildOidcCaBundle, oidcComposeOverlay, oidcSummaryForStore, oidcVarsFor, parseManifestOidc, resolveAppOidcSpec} from './app-oidc.mjs'
+import {stoppedMessage} from './exec-error.mjs'
 
 export const APP_COOKIE = 'OMARCHY_APP_SESSION'
-// Every cookie Omarchy Server itself sets (and any it may set later under these prefixes).
+// Every cookie My Own Data Center itself sets (and any it may set later under these prefixes).
 export const OWN_COOKIE = /^(omarchy_server_|OMARCHY_)/i
 const STORE_FILES = ['omarchy-app-store.yml', 'umbrel-app-store.yml']
 const APP_FILES = ['omarchy-app.yml', 'umbrel-app.yml']
 const COMPOSE_FILES = ['omarchy-compose.yml', 'docker-compose.yml']
 const APP_ID = /^[a-z0-9][a-z0-9-]{0,63}$/
 const RESERVED = (p) => p === 7780 || p === 2021 || (p >= 40_000 && p <= 49_999)
+// Three different mistakes were one sentence, so a low port sounded like a port the server reserves.
+function portRefusal(name, port) {
+	if (port < 1024) return `${name} uses port ${port}. Apps need a port of 1024 or higher`
+	if (port > 65535) return `${name} lists port ${port}, which is not a valid port`
+	if (RESERVED(port)) return `${name} wants port ${port}, which this server keeps for itself`
+	return null
+}
+function bumpPort(start, avoid) {
+	let p = start
+	for (let i = 0; i < 65535; i++) {
+		if (p >= 1 && p <= 65535 && !avoid.has(p)) return p
+		p = p >= 65535 ? 1 : p + 1
+	}
+	return null
+}
+function nextHostPort(start, avoid) {
+	let p = start
+	for (let i = 0; i < 65535; i++) {
+		p = p >= 65535 ? 1024 : p + 1
+		if (p >= 1024 && !RESERVED(p) && !avoid.has(p)) return p
+		if (p === start) break
+	}
+	return null
+}
 const SESSION_DAYS = 30
 // Some stores keep icons and screenshots in a separate gallery site, by app id.
-// Stores every new Omarchy Server starts with (you can remove them under App Store → Stores). They're
-// downloaded from GitHub by your server; nothing from them is copied into Omarchy Server itself.
-// TouchWorkStation's own catalog: plain Docker Compose files from each project's official image, with
+// Stores every new My Own Data Center starts with (you can remove them under App Store → Stores). They're
+// downloaded from GitHub by your server; nothing from them is copied into My Own Data Center itself.
+// My Own Data Center's own catalog: plain Docker Compose files from each project's official image, with
 // original descriptions. Other stores (including Umbrel-format ones) can still be added by hand.
-export const DEFAULT_STORES = [{url: 'https://github.com/TouchWorkStation/app-store'}]
+export const DEFAULT_STORES = [{url: 'https://github.com/MyOwnDataCenter/app-store'}]
+// (Also the store's old address, from before the account moved.)
+export const isGithubAppStore = (url) => /github\.com\/(?:myowndatacenter|touchworkstation)\/app-store(\.git)?$/i.test(String(url ?? '').replace(/\/+$/, ''))
 const GALLERIES = {}
 // Variables omarchyd provides to every app (anything else a compose file needs without a default
-// means the app relies on something Omarchy Server doesn't offer yet).
-const PROVIDED = new Set(['APP_DATA_DIR', 'APP_DATA_ROOT', 'APP_ID', 'APP_DOMAIN', 'APP_VERSION', 'APP_PROXY_PORT', 'APP_HIDDEN_SERVICE', 'GATEWAY_IP', 'DEVICE_HOSTNAME', 'DEVICE_DOMAIN_NAME', 'APP_PASSWORD', 'APP_SEED', 'APP_SEED_32', 'UMBREL_ROOT', 'DOCKER_HOST', 'TZ', 'NETWORK_IP', 'TOR_PROXY_IP', 'TOR_PROXY_PORT', 'TOR_DATA_DIR', 'TOR_PASSWORD', 'SERVER_IP', 'DOWNLOADS_DIR', 'VIDEOS_DIR', 'MUSIC_DIR', 'PICTURES_DIR', 'DOCUMENTS_DIR', 'PUID', 'PGID', 'DOCKER_SOCKET', 'APP_GATEWAY_KEY'])
+// means the app relies on something My Own Data Center doesn't offer yet).
+const PROVIDED = new Set(['APP_DATA_DIR', 'APP_DATA_ROOT', 'APP_ID', 'APP_DOMAIN', 'APP_VERSION', 'APP_PROXY_PORT', 'APP_HIDDEN_SERVICE', 'GATEWAY_IP', 'DEVICE_HOSTNAME', 'DEVICE_DOMAIN_NAME', 'APP_PASSWORD', 'APP_SEED', 'APP_SEED_32', 'UMBREL_ROOT', 'DOCKER_HOST', 'TZ', 'NETWORK_IP', 'TOR_PROXY_IP', 'TOR_PROXY_PORT', 'TOR_DATA_DIR', 'TOR_PASSWORD', 'SERVER_IP', 'HOME', 'DOWNLOADS_DIR', 'VIDEOS_DIR', 'MUSIC_DIR', 'PICTURES_DIR', 'DOCUMENTS_DIR', 'PUID', 'PGID', 'DOCKER_SOCKET', 'APP_GATEWAY_KEY'])
 // Apps that talk to each other (an app and the apps it needs, or apps with fixed internal
 // addresses) share one container network, laid out the way their store expects (10.21.0.0/16).
 // Apps that don't stay on a private network of their own.
 export const SHARED_NETWORK = 'omarchy_main_network'
 // Your folders an app may be given (read-write; an access entry lets the app's user in).
 const USER_DIRS = {DOWNLOADS_DIR: 'Downloads', VIDEOS_DIR: 'Videos', MUSIC_DIR: 'Music', PICTURES_DIR: 'Pictures', DOCUMENTS_DIR: 'Documents'}
-const serverIp = () => Object.values(os.networkInterfaces()).flat().find((i) => i && i.family === 'IPv4' && !i.internal && !/^(10\.88|10\.89|172\.1[6-9]|172\.2\d|172\.3[01])\./.test(i.address))?.address ?? '127.0.0.1'
+// Podman and Docker bridges only. A LAN address in 172.16.0.0/12 (other than Docker's 172.17.0.0/16) is the server.
+const BRIDGE_IFACE = /^(docker0|podman.*|cni.*|br-.*|veth.*)$/
+const BRIDGE_ADDR = /^(10\.88\.|10\.89\.|172\.17\.)/
+export function pickServerIp(ifaces) {
+	for (const [name, addrs] of Object.entries(ifaces ?? {})) {
+		if (BRIDGE_IFACE.test(name)) continue
+		for (const i of addrs ?? []) {
+			if (!i || (i.family !== 'IPv4' && i.family !== 4) || i.internal) continue
+			if (BRIDGE_ADDR.test(i.address)) continue
+			return i.address
+		}
+	}
+	return '127.0.0.1'
+}
+const serverIp = () => pickServerIp(os.networkInterfaces())
 const SHARED_SUBNET = '10.21.0.0/16'
 const SHARED_GATEWAY = '10.21.0.1'
 // A shared Tor proxy for apps that route through Tor (started the first time one is installed),
@@ -67,34 +116,177 @@ const TOR_PASSWORD = 'moneyprintergobrrr' // the control password these store ap
 const APP_UID = 1000
 
 // Variables a compose file uses with no default, that we don't provide.
+// A store's address can be a whole repository (its default branch), one branch on GitHub
+// (…/tree/<branch>), or one pull request on GitHub (…/pull/<number>). The last two let a reviewer
+// install a submitted app exactly as submitted, before it's approved.
+export function storeSource(url) {
+	const pr = /^(https:\/\/github\.com\/[\w.-]+\/[\w.-]+)\/pull\/(\d{1,7})$/i.exec(url)
+	if (pr) return {remote: pr[1], ref: `pull/${pr[2]}/head`, label: `pull request #${pr[2]}`, slug: `pr-${pr[2]}`}
+	const tree = /^(https:\/\/github\.com\/[\w.-]+\/[\w.-]+)\/tree\/([\w.\-/]{1,120})$/i.exec(url)
+	if (tree && !tree[2].startsWith('-') && !tree[2].includes('..') && !tree[2].endsWith('/') && !tree[2].endsWith('.lock'))
+		return {remote: tree[1], ref: `refs/heads/${tree[2]}`, label: `branch ${tree[2]}`, slug: `branch-${tree[2].replace(/[^\w-]+/g, '-')}`}
+	return {remote: url, ref: 'HEAD'}
+}
+
 // ---- extra access an app asks for -------------------------------------------------------------
 // Worked out from the compose file itself (a listing can't leave anything out). Each needs your
 // explicit permission when installing; plain apps need none.
 // Where apps that are part of the server itself (system-apps.mjs) are listed.
 const BUILTIN_STORE = 'builtin:omarchy-server'
+// Apps brought over by the Unraid importer (unraid.mjs): listings it writes on this server, never
+// fetched from anywhere, so they're listed and installed like any store's.
+const IMPORTED_STORE = 'local:imported'
+// Apps published by another app on this server (a studio). Same idea: a folder of listings, not a
+// git clone, so a refresh can't wipe what was just published.
+const PUBLISHED_STORE = 'local:published'
+// The tool mounted into an app that is allowed to publish. It talks to a Unix socket that serves
+// only apps.publish and apps.unpublish, never the Podman socket and never the rest of omarchyd.
+const PUBLISH_CLI = fileURLToPath(new URL('./omarchy-publish', import.meta.url))
+const API_PROXY = fileURLToPath(new URL('./api-proxy', import.meta.url))
+const BIND_SHIM = fileURLToPath(new URL('./bind-localhost.c', import.meta.url))
+const PUBLISH_RPC = new Set(['/trpc/apps.publish', '/trpc/apps.unpublish'])
+const IMAGE_REF = /^[a-z0-9][a-z0-9._/-]{0,200}(?::[A-Za-z0-9_][A-Za-z0-9_.-]{0,40})?$/
+// The binary is not the container's entrypoint. A proxy in front of it demands the job API
+// token, and the sign-in gateway's own header on the web port. The image is Omarchy, the same
+// system the studio compiles on, so the binary's glibc matches. gcc builds the localhost shim
+// and is removed; gcc-libs stays because the binary links it.
+const OMARCHY_SETUP = fileURLToPath(new URL('./omarchy-setup.sh', import.meta.url))
+const runtimeContainerfile = ({webPort, apiPort, childPort, assets}) => `FROM docker.io/archlinux:base
+COPY omarchy-setup.sh /tmp/omarchy-setup.sh
+RUN sh /tmp/omarchy-setup.sh && rm /tmp/omarchy-setup.sh
+COPY app /usr/local/bin/app
+COPY api-proxy /usr/local/bin/api-proxy
+COPY bind-localhost.c /tmp/bind-localhost.c
+${assets ? 'COPY static /opt/app/static\n' : ''}RUN gcc -shared -fPIC -Os -o /usr/local/lib/omarchy-bind-localhost.so /tmp/bind-localhost.c -ldl \\
+ && rm /tmp/bind-localhost.c \\
+ && chmod 755 /usr/local/bin/app /usr/local/bin/api-proxy \\
+ && pacman -R --noconfirm gcc \\
+ && rm -rf /var/cache/pacman/pkg/*
+ENV WEB_PORT=${webPort} API_PORT=${apiPort} CHILD_PORT=${childPort} OMARCHY_APP_CWD=/opt/app
+WORKDIR /opt/app
+ENTRYPOINT ["/usr/local/bin/api-proxy"]
+`
 
 export const PERMISSIONS = {
 	containers: {label: 'Control your containers', detail: 'It can start, stop, create and delete every container you run (and see their settings and data). Container managers need this.'},
-	'low-ports': {label: 'Use network ports below 1024', detail: 'It listens on system ports such as 53 (DNS), 80 or 443. To allow it, Omarchy Server lets programs running as you use ports from that number up, for the whole server, and keeps that after this app is removed.'},
+	'low-ports': {label: 'Use network ports below 1024', detail: 'It listens on system ports such as 53 (DNS), 80 or 443. To allow it, this server lets programs running as you use ports from that number up, for the whole server, and keeps that after this app is removed.'},
 	devices: {label: 'Use hardware devices', detail: 'It gets direct access to devices plugged into your server, such as USB sticks or video cards.'},
 	network: {label: 'Change networking inside its container', detail: 'It can create network interfaces, routes and firewall rules inside its own container (VPNs need this). It can’t change your server’s own network.'},
 	privileged: {label: 'Run with every container permission', detail: 'It runs with all permissions inside its container. Containers here run as you, not as root, so it still can’t become root on your server.'},
 	'host-network': {label: 'Share the server’s own network', detail: 'It uses the server’s network directly instead of its own: it can reach services that listen only on this server, and other devices see it as the server. Home Assistant and similar apps need this to find devices.'},
 	'host-files': {label: 'Read and change folders on the server', detail: 'It can read and change these folders on your server, with your rights (containers here run as you).'},
+	publish: {label: 'Publish apps on this server', detail: 'It can add, update, and remove apps it publishes here. It cannot control your other containers, and it cannot change the rest of the server.'},
 	system: {label: 'Reach into the server’s system', detail: 'It can see or talk to parts of the server outside its container (other programs, system services or kernel features). Monitoring tools and smart-home hubs sometimes need this.'},
 	...SYSTEM_PERMISSIONS,
 }
 // Bind mounts no app may have, whatever it asks: your whole home folder, its hidden folders (SSH keys,
-// settings, Omarchy Server's own data and keys), and the system's own folders.
+// settings, My Own Data Center's own data and keys), and the system's own folders.
+// An app's own data is under ~/.local too. createBindSources still claims that one folder.
+const under = (p, base) => Boolean(base) && (p === base || p.startsWith(`${base}/`))
+const CLOCK_FILES = ['/etc/localtime', '/etc/timezone']
+// `home` may itself be a symlink. A path under the link or under its target is still inside home.
+function homeBases(home) {
+	if (typeof home !== 'string' || !home.startsWith('/')) return []
+	const base = resolve(home).replace(/\/+$/, '')
+	const bases = [base]
+	try {
+		const real = realpathSync(base)
+		if (real && real !== base) bases.push(real)
+	} catch {
+		/* home is not there yet */
+	}
+	return bases
+}
 function refusedMount(path, home) {
-	const under = (p, base) => p === base || p.startsWith(`${base}/`)
-	if (path === '/' || path === home || path === '/home' || under(path, '/root') || under(path, '/boot') || under(path, '/proc') || under(path, '/run/user') || under(path, '/var/lib') || under(path, '/usr') || under(path, '/bin') || under(path, '/sbin')) return true
-	if (under(path, '/etc') && !['/etc/localtime', '/etc/timezone'].includes(path)) return true
-	if (home && path.startsWith(`${home}/.`)) return true
-	if (/^\/home\/[^/]+$/.test(path) || (path.startsWith('/home/') && home && !under(path, home))) return true
+	const bases = homeBases(home)
+	if (path === '/' || bases.includes(path) || path === '/home' || under(path, '/root') || under(path, '/boot') || under(path, '/proc') || under(path, '/run/user') || under(path, '/var/lib') || under(path, '/usr') || under(path, '/bin') || under(path, '/sbin')) return true
+	if (under(path, '/etc') && !CLOCK_FILES.includes(path)) return true
+	if (bases.some((b) => path.startsWith(`${b}/.`))) return true
+	if (/^\/home\/[^/]+$/.test(path) || (path.startsWith('/home/') && bases.length && !bases.some((b) => under(path, b)))) return true
 	return false
 }
 const SOCKET = /(?:^|\/)(?:docker|podman)\.sock$|\$\{?DOCKER_SOCKET/
+const SYSTEM_PATH = /^\/run\/(dbus|systemd|udev)(\/|$)|^\/var\/run\/dbus(\/|$)|^\/(sys|lib\/modules|usr\/lib\/modules)(\/|$)/
+// Follow the longest prefix that exists, the way the folder picker does, so a symlink under an
+// allowed folder can't hide a refused one. Missing paths stay as resolved (Compose will create them).
+// lstat, not exists: a dangling symlink is the folder it names, not "missing so use the parent".
+// Only absolute paths: a leftover `$VAR` must not walk dirname to `.` and glue onto the process cwd.
+function realpathExisting(path, seen) {
+	if (!path || path.includes('\0') || !path.startsWith('/')) return path
+	seen ??= new Set()
+	if (seen.has(path) || seen.size > 32) return path
+	seen.add(path)
+	let st
+	try {
+		st = lstatSync(path)
+	} catch {
+		st = null
+	}
+	if (st?.isSymbolicLink()) {
+		let dest = ''
+		try {
+			dest = readlinkSync(path)
+		} catch {
+			return path
+		}
+		const abs = dest.startsWith('/') ? dest : resolve(dirname(path), dest)
+		return realpathExisting(resolve(abs), seen)
+	}
+	if (st) {
+		try {
+			return realpathSync(path)
+		} catch {
+			return path
+		}
+	}
+	const parent = dirname(path)
+	if (parent === path) return path
+	const realParent = realpathExisting(parent, seen)
+	return realParent === parent ? path : realParent + path.slice(parent.length)
+}
+// KEY=value lines Compose reads from a listing's .env (shell env still wins).
+export function parseDotEnv(text) {
+	const env = {}
+	for (const line of String(text).split('\n')) {
+		const t = line.trim()
+		if (!t || t.startsWith('#')) continue
+		const m = t.match(/^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/)
+		if (!m) continue
+		let v = m[2]
+		// A quoted value is read to its closing quote, so a trailing " # comment" is not part of it.
+		const quoted = /^(["'])([\s\S]*?)\1\s*(?:#.*)?$/.exec(v)
+		if (quoted) v = quoted[2]
+		else if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) v = v.slice(1, -1)
+		else {
+			const cut = v.search(/\s+#/)
+			if (cut >= 0) v = v.slice(0, cut).trimEnd()
+		}
+		env[m[1]] = v
+	}
+	return env
+}
+// Compose interpolates ${VAR} inside .env values from earlier keys and the process environment.
+function expandDotEnv(dotenv, overlay = {}) {
+	const out = {}
+	for (const [k, v] of Object.entries(dotenv ?? {})) out[k] = expandVars(String(v), {...dotenv, ...out, ...overlay})
+	return out
+}
+// The host folder a bind will actually use: expand is already done; collapse `..`, turn `~` and
+// leftover $HOME into the home folder Compose will see, and resolve relative sources from the app.
+function bindHostPath(raw, where = {}) {
+	let path = String(raw ?? '')
+	if (!path || path.includes('\0')) return path
+	const home = where.home
+	if (home) {
+		if (path === '~' || path.startsWith('~/')) path = `${home}${path.slice(1)}`
+		else if (path === '${HOME}' || path.startsWith('${HOME}/')) path = `${home}${path.slice('${HOME}'.length)}`
+		else if (path === '$HOME' || path.startsWith('$HOME/')) path = `${home}${path.slice('$HOME'.length)}`
+	}
+	const cwd = where.cwd ?? where.allowed?.[0]
+	if (path.startsWith('/')) path = resolve(path)
+	else if (cwd && !path.startsWith('$')) path = resolve(cwd, path)
+	return path.replace(/\/+$/, '') || '/'
+}
 // What a compose file asks of the server beyond an ordinary container. `where` (when known) says
 // which folders are the app's own: its data folder, the shared folders and your media folders
 // (Videos, Music…), which apps may use without asking; `expand` resolves its variables.
@@ -116,24 +308,43 @@ export function appPermissions(text, where = {}) {
 		if (s.privileged === true || s.privileged === 'true') add('privileged', name)
 		if (s.network_mode === 'host') add('host-network', name)
 		for (const k of ['pid', 'ipc', 'uts', 'cgroup']) if (s[k] === 'host') add('system', `${k}: host`)
-		if (s.userns_mode) add('system', `userns_mode: ${s.userns_mode}`)
-		for (const o of s.security_opt ?? []) add('system', `security_opt: ${o}`)
+		for (const o of s.security_opt ?? []) if (securityOptBreaksConfinement(o)) add('system', `security_opt: ${o}`)
 		for (const v of s.volumes ?? []) {
 			const type = typeof v === 'object' ? v?.type : null
 			if (type === 'volume' || type === 'tmpfs') continue
 			// A bare "/path" is an anonymous volume (inside the container), not a server folder.
 			if (typeof v === 'string' && !v.includes(':')) continue
+			const orig = typeof v === 'string' ? v.trim() : String(v?.source ?? '').trim()
 			const raw = typeof v === 'string' ? (where.expand ? where.expand(v) : v).split(':')[0] : String(where.expand ? where.expand(v?.source ?? '') : (v?.source ?? ''))
+			const looksBind = type === 'bind' || raw.startsWith('/') || raw.startsWith('$') || raw.startsWith('~') || raw.startsWith('.') || raw.includes('/') || (!raw && (type === 'bind' || orig.startsWith('$') || orig.startsWith('~') || orig.startsWith('/') || orig.startsWith('.')))
 			if (SOCKET.test(raw)) add('containers', name)
-			else if (/^\/dev(\/|$)/.test(raw) && !/^\/dev\/shm/.test(raw)) add('devices', raw)
-			else if (/^\/run\/(dbus|systemd|udev)(\/|$)|^\/var\/run\/dbus(\/|$)|^\/(sys|lib\/modules)(\/|$)/.test(raw)) add('system', raw)
-			else if (raw.startsWith('/') || raw.startsWith('$') || raw.startsWith('~')) {
-				// Absolute paths (after expanding): the app's own folders are fine; anything else asks.
-				const path = raw.replace(/\/+$/, '') || '/'
-				const own = (where.allowed ?? []).some((d) => path === d || path.startsWith(`${d}/`))
-				if (own || ['/etc/localtime', '/etc/timezone'].includes(path)) continue
-				if (refusedMount(path, where.home)) add('refused', path)
-				else add('host-files', path)
+			else if (looksBind) {
+				// Host paths (after expanding): resolve `..` and `~` the way Compose will, so an allowed
+				// prefix can't hide a hidden folder. Long-syntax `type: bind` and relative sources
+				// with a slash are binds too. Classify the real path (devices, system, own, refused).
+				const path = bindHostPath(raw, where)
+				if (!path || path.includes('\0') || path.startsWith('$')) {
+					add('refused', 'invalid path')
+					continue
+				}
+				// /etc/localtime is often a link into /usr/share/zoneinfo; allow the bind, don't follow it.
+				if (CLOCK_FILES.includes(path)) continue
+				const real = realpathExisting(path)
+				if (SOCKET.test(path) || SOCKET.test(real)) add('containers', name)
+				else if (/^\/dev(\/|$)/.test(real) && !/^\/dev\/shm/.test(real)) add('devices', real)
+				// System folders, as written or as resolved: on Arch (and so Omarchy) /lib is a link to
+				// /usr/lib, so /lib/modules resolves under /usr and must still count as a system folder.
+				else if (SYSTEM_PATH.test(path) || SYSTEM_PATH.test(real)) add('system', SYSTEM_PATH.test(path) ? path : real)
+				else {
+					const own = (where.allowed ?? []).some((d) => {
+						if (!d) return false
+						const base = realpathExisting(d)
+						return under(real, base) || under(real, d)
+					})
+					if (own) continue
+					if (refusedMount(real, where.home) || refusedMount(path, where.home)) add('refused', real)
+					else add('host-files', real)
+				}
 			}
 		}
 		for (const d of s.devices ?? []) add('devices', String(typeof d === 'string' ? d.split(':')[0] : d?.source ?? 'device'))
@@ -145,25 +356,81 @@ export function appPermissions(text, where = {}) {
 			else if (!/^(CHOWN|DAC_OVERRIDE|FOWNER|FSETID|SETUID|SETGID|SETPCAP|NET_BIND_SERVICE|KILL|AUDIT_WRITE|MKNOD|SETFCAP|SYS_CHROOT|SYS_NICE|SYS_RESOURCE|IPC_LOCK)$/.test(cap)) add('system', cap)
 		}
 		if (s.sysctls && Object.keys(s.sysctls).length) add('network', 'sysctls')
+		// Long syntax publishes the host port as one value (not host:container). Install calls this
+		// with no `where`, so a default such as ${PORT:-80} still has to expand. A start-end range
+		// counts from its low end. One part, or only `target`, is the container port.
+		const expandPort = (v) => (where.expand ? where.expand(v) : expandVars(String(v), {}))
 		for (const p of s.ports ?? []) {
-			const t = typeof p === 'object' ? String(p.published ?? '') : String(p).split('/')[0]
-			const parts = t.split(':')
-			const host = Number(parts.length >= 3 ? parts[parts.length - 2] : parts.length === 2 ? parts[0] : NaN)
+			const long = !!p && typeof p === 'object'
+			const spec = expandPort(long ? String(p.published ?? '') : String(p).split('/')[0])
+			const parts = long ? null : spec.split(':')
+			const hostPort = long ? spec : parts.length >= 3 ? parts[parts.length - 2] : parts.length === 2 ? parts[0] : ''
+			const host = Number(String(hostPort).split('-')[0])
 			if (Number.isInteger(host) && host > 0 && host < 1024) add('low-ports', host)
 		}
 	}
-	return [...found].map(([id, set]) => ({id, ...(PERMISSIONS[id] ?? {label: 'Not allowed', detail: 'Omarchy Server never gives an app these folders.'}), what: [...set].slice(0, 8)}))
+	return [...found].map(([id, set]) => ({id, ...(PERMISSIONS[id] ?? {label: 'Not allowed', detail: 'This server never gives an app these folders.'}), what: [...set].slice(0, 8)}))
 }
 
 // Compose-style ${NAME}, $NAME, ${NAME:-default}, ${NAME-default} and ${NAME:?message}.
+// The default may itself contain ${...}; a scan to the first } would stop too early.
 export function expandVars(text, env) {
-	return String(text).replace(/\$(?:\{([A-Za-z_][A-Za-z0-9_]*)(?:(:?)([-?+])([^}]*))?\}|([A-Za-z_][A-Za-z0-9_]*))/g, (_, name, colon, op, arg, bare) => {
-		const v = env[name ?? bare]
+	const s = String(text)
+	let out = ''
+	for (let i = 0; i < s.length; i++) {
+		if (s[i] !== '$') {
+			out += s[i]
+			continue
+		}
+		const braced = s[i + 1] === '{'
+		const nameAt = braced ? i + 2 : i + 1
+		const name = /^[A-Za-z_][A-Za-z0-9_]*/.exec(s.slice(nameAt))
+		if (!name) {
+			out += '$'
+			continue
+		}
+		let j = nameAt + name[0].length
+		let colon = false
+		let op = ''
+		let arg = ''
+		if (braced) {
+			if (s[j] === ':') {
+				colon = true
+				j++
+			}
+			if (s[j] === '-' || s[j] === '+' || s[j] === '?') {
+				op = s[j++]
+				const start = j
+				let depth = 0
+				while (j < s.length) {
+					if (s[j] === '$' && s[j + 1] === '{') {
+						depth++
+						j += 2
+						continue
+					}
+					if (s[j] === '}') {
+						if (depth === 0) break
+						depth--
+					}
+					j++
+				}
+				if (s[j] !== '}') {
+					out += '$'
+					continue
+				}
+				arg = s.slice(start, j)
+			} else if (s[j] !== '}') {
+				out += '$'
+				continue
+			}
+		}
+		const v = env[name[0]]
 		const empty = v === undefined || (colon && v === '')
-		if (op === '-') return empty ? arg : v
-		if (op === '+') return empty ? '' : arg
-		return v ?? ''
-	})
+		const repl = op === '-' ? (empty ? expandVars(arg, env) : v) : op === '+' ? (empty ? '' : expandVars(arg, env)) : (v ?? '')
+		out += repl
+		i = braced ? j : j - 1
+	}
+	return out
 }
 
 // Folders an app lets you place yourself (its listing's `folders:`): kept inside the app, or a folder
@@ -181,32 +448,100 @@ export function folderChoices(list) {
 			suggest: typeof f.suggest === 'string' && /^[A-Za-z0-9][\w .-]{0,60}$/.test(f.suggest) ? f.suggest : null,
 		}))
 }
+
+// Optional catalog MCP endpoint. Junk is ignored; the port is never opened to the network.
+export function parseMcp(raw) {
+	if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
+	const service = raw.service
+	const port = typeof raw.port === 'string' && raw.port.trim() ? Number(raw.port) : raw.port
+	const path = raw.path
+	const transport = raw.transport
+	if (typeof service !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$/.test(service)) return null
+	if (typeof port !== 'number' || !Number.isInteger(port) || port < 1 || port > 65535) return null
+	if (typeof path !== 'string' || !/^\/[^\s?#]{0,200}$/.test(path)) return null
+	if (transport !== 'http' && transport !== 'sse') return null
+	return {service, port, path, transport}
+}
 export const folderVar = (id) => `FOLDER_${id.toUpperCase()}`
-// Where you may put an app's folder: under your home, not hidden, not one Omarchy Server never gives an app.
+// Where you may put an app's folder: under your home, not hidden, not one My Own Data Center never gives an app.
 export function folderAllowed(path, home) {
 	if (typeof path !== 'string' || !path.startsWith('/') || path.includes('\0')) return false
 	const p = resolve(path)
-	if (p !== path.replace(/\/+$/, '') || !p.startsWith(`${home}/`)) return false
-	if (p.slice(home.length).split('/').some((part) => part.startsWith('.'))) return false
+	if (p !== path.replace(/\/+$/, '')) return false
+	const root = homeBases(home).find((b) => p.startsWith(`${b}/`))
+	if (!root) return false
+	if (p.slice(root.length).split('/').some((part) => part.startsWith('.'))) return false
 	return !refusedMount(p, home)
+}
+
+// ${VAR:+text} and ${VAR+text} expand to empty when VAR is unset, same as a default.
+// Comments are not settings: scan parsed string values, not the raw file.
+function composeValueText(text) {
+	const raw = String(text)
+	try {
+		const doc = YAML.parse(raw)
+		if (doc && typeof doc === 'object') {
+			const parts = []
+			const walk = (v) => {
+				if (typeof v === 'string') parts.push(v)
+				else if (Array.isArray(v)) for (const x of v) walk(x)
+				else if (v && typeof v === 'object') for (const x of Object.values(v)) walk(x)
+			}
+			walk(doc)
+			return parts.join('\n')
+		}
+	} catch {
+		/* not YAML: drop comments, then scan */
+	}
+	return raw
+		.split('\n')
+		.map((line) => {
+			if (line.trim().startsWith('#')) return ''
+			let out = ''
+			let quote = ''
+			for (let i = 0; i < line.length; i++) {
+				const c = line[i]
+				if (quote) {
+					out += c
+					if (c === quote && line[i - 1] !== '\\') quote = ''
+					continue
+				}
+				if (c === '"' || c === "'") {
+					quote = c
+					out += c
+					continue
+				}
+				if (c === '#' && (i === 0 || /\s/.test(line[i - 1]))) break
+				out += c
+			}
+			return out
+		})
+		.join('\n')
 }
 
 export function missingVars(text, alsoProvided = []) {
 	const out = new Set()
-	for (const m of String(text).replace(/\$\$/g, '').matchAll(/\$(?:\{([A-Za-z_][A-Za-z0-9_]*)([^}]*)\}|([A-Za-z_][A-Za-z0-9_]*))/g)) {
+	for (const m of composeValueText(text).replace(/\$\$/g, '').matchAll(/\$(?:\{([A-Za-z_][A-Za-z0-9_]*)([^}]*)\}|([A-Za-z_][A-Za-z0-9_]*))/g)) {
 		const name = m[1] ?? m[3]
 		const rest = m[2] ?? ''
-		if (/^:?[-=]/.test(rest)) continue // has a default
+		if (/^:?[-=+]/.test(rest)) continue // default, or ${VAR:+text} / ${VAR+text}
 		if (!PROVIDED.has(name) && !alsoProvided.includes(name) && !/^FOLDER_[A-Z0-9_]+$/.test(name)) out.add(name)
 	}
 	return [...out]
+}
+
+// no-new-privileges tightens the sandbox. Only options that turn confinement off are "system".
+function securityOptBreaksConfinement(value) {
+	const s = String(value ?? '').trim().toLowerCase()
+	if (s === 'label=disable' || s === 'label:disable') return true
+	return /^[^=:]+[=:]unconfined$/.test(s)
 }
 
 function execP(cmd, args, {env, cwd, timeout = 10 * 60_000} = {}) {
 	return new Promise((resolve, reject) => {
 		execFile(cmd, args, {cwd, timeout, maxBuffer: 32 * 1024 * 1024, env: {...process.env, ...env}}, (error, stdout, stderr) => {
 			if (error) {
-				error.message = `${cmd}: ${(stderr || error.message).toString().trim().split('\n').slice(-3).join(' ')}`
+				error.message = stoppedMessage(cmd, error, timeout) ?? `${cmd}: ${(stderr || error.message).toString().trim().split('\n').slice(-3).join(' ')}`
 				return reject(error)
 			}
 			resolve(stdout.toString())
@@ -214,6 +549,21 @@ function execP(cmd, args, {env, cwd, timeout = 10 * 60_000} = {}) {
 	})
 }
 const exists = (p) => access(p).then(() => true, () => false)
+const LOAD_CONCURRENCY = 16
+
+async function mapPool(items, n, fn) {
+	const out = new Array(items.length)
+	let i = 0
+	await Promise.all(
+		Array.from({length: Math.min(n, items.length)}, async () => {
+			while (i < items.length) {
+				const idx = i++
+				out[idx] = await fn(items[idx], idx)
+			}
+		}),
+	)
+	return out
+}
 const portFree = (port) =>
 	new Promise((resolve) => {
 		const s = net.createServer()
@@ -234,33 +584,177 @@ async function readYaml(dir, names) {
 	return null
 }
 
+async function readFirst(dir, names) {
+	for (const n of names) {
+		try {
+			return {name: n, text: await readFile(join(dir, n), 'utf8')}
+		} catch (e) {
+			if (e.code !== 'ENOENT') throw e
+		}
+	}
+	return null
+}
+
+// Public listing fields. Pick these by name so a later loadStore change cannot leak folder, store, or compose.
+const LIST_FIELDS = [
+	'id', 'name', 'tagline', 'icon', 'category', 'version', 'installSize', 'developer', 'unsupported', 'caution',
+	'needs', 'dependencies', 'implements', 'port', 'path', 'web', 'shared', 'folders', 'openPorts',
+	'requiresHttps', 'system', 'defaultUsername', 'defaultPassword', 'deterministicPassword', 'repo', 'oidc',
+]
+const DETAIL_FIELDS = [...LIST_FIELDS, 'description', 'releaseNotes', 'gallery', 'website', 'permissions']
+
+function pickFields(a, keys) {
+	const out = {}
+	for (const k of keys) if (a[k] !== undefined) out[k] = a[k]
+	return out
+}
+
+function installSizeOf(v) {
+	if (typeof v !== 'number' || !Number.isFinite(v) || v <= 0) return undefined
+	return v
+}
+
+// Browse payload: keep a shots count so Featured can pick apps that have screenshots.
+function toList(a) {
+	return {...pickFields(a, LIST_FIELDS), ...(Array.isArray(a.gallery) && a.gallery.length ? {shots: a.gallery.length} : {})}
+}
+
+function toDetail(a) {
+	return pickFields(a, DETAIL_FIELDS)
+}
+
 // Turn a store compose file into what omarchyd runs: no app_proxy, the web service published on
 // 127.0.0.1 only. Returns the compose text and where the gateway should forward to.
+// Text that screens draw. A listing can write a list or a mapping where text belongs, and a screen
+// cannot draw that, so anything that is not text (or a number or true/false) is left out.
+const listingText = (v) => (typeof v === 'string' ? v : typeof v === 'number' && Number.isFinite(v) ? String(v) : typeof v === 'boolean' ? String(v) : undefined)
+const stringList = (v) => (Array.isArray(v) ? v.map((x) => (typeof x === 'string' ? x : typeof x === 'number' && Number.isFinite(x) ? String(x) : null)).filter(Boolean) : [])
 // The apps `id` needs, dependencies first (a depth-first post-order).
 function orderNeeds(id, byId, seen = new Set(), out = []) {
-	for (const d of (byId.get(id)?.a.dependencies ?? []).filter((x) => typeof x === 'string')) {
-		if (seen.has(d)) continue
+	for (const d of stringList(byId.get(id)?.a.dependencies)) {
+		if (d === id || seen.has(d)) continue
 		seen.add(d)
 		orderNeeds(d, byId, seen, out)
 		out.push(d)
 	}
 	return out
 }
-const varName = (v) => /^\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?$/.exec(String(v ?? '').trim())?.[1] ?? null
-export function prepareCompose(appId, text, allocatePort, {shared = false, vars = {}, web = null} = {}) {
-	const doc = YAML.parse(text) ?? {}
-	const services = doc.services ?? {}
-	const proxy = services.app_proxy?.environment ?? {}
-	delete services.app_proxy
-	delete doc.version
-	for (const [key, s] of Object.entries(services)) {
-		if (!s || typeof s !== 'object') continue
-		if (Array.isArray(s.depends_on)) s.depends_on = s.depends_on.filter((d) => d !== 'app_proxy')
-		else if (s.depends_on && typeof s.depends_on === 'object') delete s.depends_on.app_proxy
-		// Store apps find their own services as <app>_<service>_1 (e.g. immich_postgres_1).
-		if (!s.container_name && s.network_mode !== 'host') s.container_name = `${appId}_${key}_1`
+// True when `id` depends on itself or the dependency links come back to an app already on the path.
+// An app already checked and found loop-free is not walked again: apps that share dependencies
+// would otherwise be walked once per path through them, which grows without end.
+function dependencyLoop(id, byId) {
+	const path = new Set()
+	const clear = new Set()
+	const visit = (cur) => {
+		if (path.has(cur)) return true
+		if (clear.has(cur)) return false
+		const row = byId.get(cur)
+		if (!row) return false
+		path.add(cur)
+		for (const d of stringList(row.a.dependencies)) if (visit(d)) return true
+		path.delete(cur)
+		clear.add(cur)
+		return false
 	}
-	if (shared) doc.networks = {...(doc.networks ?? {}), default: {name: SHARED_NETWORK, external: true}}
+	return visit(id)
+}
+const varName = (v) => /^\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?$/.exec(String(v ?? '').trim())?.[1] ?? null
+// A number round-trip drops digits past 2^53 and leading zeros. Compose reads 0400 as octal.
+class KeptSource {
+	constructor(source) {
+		this.source = source
+	}
+}
+function emitCompose(doc) {
+	YAML.visit(doc, {
+		Scalar(_key, node) {
+			if (typeof node.source === 'string' && (typeof node.value === 'number' || typeof node.value === 'bigint')) node.value = new KeptSource(node.source)
+		},
+	})
+	const schema = doc.schema.clone()
+	schema.tags.unshift({
+		identify: (value) => value instanceof KeptSource,
+		default: true,
+		tag: 'tag:yaml.org,2002:str',
+		stringify: (node) => node.value.source,
+	})
+	doc.schema = schema
+	return doc.toString({lineWidth: 0})
+}
+const pairKey = (pair) => (YAML.isScalar(pair.key) ? String(pair.key.value) : String(pair.key))
+const asJSON = (item) => (item && typeof item.toJSON === 'function' ? item.toJSON() : item)
+function appendPort(svc, spec) {
+	const ports = svc.get('ports')
+	// Seq.add stores the value as-is. A bare string has no toJSON, so later filters throw.
+	if (YAML.isSeq(ports)) ports.items.push(new YAML.Scalar(spec))
+	else if (ports == null) svc.set('ports', [spec])
+	else if (Array.isArray(ports)) svc.set('ports', [...ports, spec])
+	else svc.set('ports', [...(typeof ports === 'string' ? [...ports] : [ports]), spec])
+}
+function retainPorts(svc, keep) {
+	const ports = svc.get('ports')
+	if (YAML.isSeq(ports)) ports.items = ports.items.filter((item) => keep(asJSON(item)))
+	else if (Array.isArray(ports)) svc.set('ports', ports.filter((item) => keep(asJSON(item))))
+}
+function hostPortNumber(spec, expand) {
+	const long = !!spec && typeof spec === 'object'
+	const raw = long ? String(spec.published ?? '') : String(spec ?? '').split('/')[0]
+	const expanded = expand ? expand(raw) : String(raw)
+	const parts = long ? null : expanded.split(':')
+	const hostPort = long ? expanded : parts.length >= 3 ? parts[parts.length - 2] : parts.length === 2 ? parts[0] : ''
+	const host = Number(String(hostPort).split('-')[0])
+	return Number.isInteger(host) && host > 0 ? host : null
+}
+// A low port left in the file is published when Compose expands it, even if lowPorts was never called.
+function dropLowPorts(text, expand) {
+	const doc = YAML.parseDocument(String(text ?? ''))
+	const services = doc.get('services')
+	if (!YAML.isMap(services)) return text
+	for (const pair of services.items) {
+		if (!YAML.isMap(pair.value)) continue
+		retainPorts(pair.value, (p) => {
+			const host = hostPortNumber(p, expand)
+			return !(host && host < 1024)
+		})
+	}
+	return emitCompose(doc)
+}
+export function prepareCompose(appId, text, allocatePort, {shared = false, vars = {}, web = null, mcp = null} = {}) {
+	const doc = YAML.parseDocument(String(text ?? ''))
+	if (doc.errors.length) throw doc.errors[0]
+	if (!doc.contents) doc.contents = doc.createNode({})
+	if (!YAML.isMap(doc.contents)) throw new Error('Compose file must be a mapping')
+	const serviceNodes = doc.get('services')
+	if (!YAML.isMap(serviceNodes)) throw new Error('This app’s compose file lists no services, so there is nothing to start')
+	const proxyNode = serviceNodes.get('app_proxy')
+	const envNode = YAML.isMap(proxyNode) ? proxyNode.get('environment') : null
+	const proxy = YAML.isMap(envNode) ? (envNode.toJSON() ?? {}) : {}
+	serviceNodes.delete('app_proxy')
+	doc.delete('version')
+	for (const pair of serviceNodes.items) {
+		const s = pair.value
+		if (!YAML.isMap(s)) continue
+		// Podman ignores userns_mode (UsernsMode stays private). Leave it out of the file that
+		// runs, and say so, instead of asking for a system permission that will not be applied.
+		if (s.has('userns_mode')) {
+			console.error(`[omarchyd] ${appId}: userns_mode is ignored by Podman and was left out of ${pairKey(pair)}`)
+			s.delete('userns_mode')
+		}
+		const dep = s.get('depends_on')
+		if (YAML.isSeq(dep)) dep.items = dep.items.filter((item) => asJSON(item) !== 'app_proxy')
+		else if (YAML.isMap(dep)) dep.delete('app_proxy')
+		// Store apps find their own services as <app>_<service>_1 (e.g. immich_postgres_1).
+		if (!s.get('container_name') && s.get('network_mode') !== 'host') s.set('container_name', `${appId}_${pairKey(pair)}_1`)
+	}
+	if (shared) {
+		const existing = doc.get('networks')
+		// A map parsed from the file has .set. One just assigned is a plain object (Document.get unwraps it).
+		if (YAML.isMap(existing)) existing.set('default', {name: SHARED_NETWORK, external: true})
+		else doc.set('networks', {...(existing && typeof existing === 'object' && !Array.isArray(existing) ? existing : {}), default: {name: SHARED_NETWORK, external: true}})
+	}
+	const byName = {}
+	for (const pair of serviceNodes.items) if (YAML.isMap(pair.value)) byName[pairKey(pair)] = pair.value
+	const services = Object.fromEntries(Object.entries(byName).map(([k, n]) => [k, n.toJSON() ?? {}]))
 	// APP_PORT / APP_HOST may name a variable from the app's exports.sh (e.g. $APP_MEMPOOL_PORT).
 	const resolved = (v) => {
 		const n = varName(v)
@@ -269,7 +763,11 @@ export function prepareCompose(appId, text, allocatePort, {shared = false, vars 
 	const appPort = Number(resolved(proxy.APP_PORT))
 	const host = String(proxy.APP_HOST ?? '').trim()
 	let internalPort = null
+	let webContainerPort = null
+	let boundService = null // the service that received the web loopback publish
+	const containerPort = (p) => Number(String(typeof p === 'object' ? p.target : p).split('/')[0].split(':').pop())
 	if (Number.isInteger(appPort) && appPort > 0) {
+		webContainerPort = appPort
 		if (/^\$\{?GATEWAY_IP\}?$/.test(host) || host === '127.0.0.1') {
 			internalPort = appPort // the app is on the host network, bound to 127.0.0.1 (GATEWAY_IP)
 		} else {
@@ -281,25 +779,42 @@ export function prepareCompose(appId, text, allocatePort, {shared = false, vars 
 			const key = services[host] ? host : services[name] ? name : byContainer ? byContainer : byAddress ? byAddress : Object.keys(services).length === 1 ? Object.keys(services)[0] : null
 			if (!key) throw new Error(`Can’t tell which service is the web interface (${host || 'none named'})`)
 			internalPort = allocatePort()
-			services[key].ports = [...(services[key].ports ?? []), `127.0.0.1:${internalPort}:${appPort}`]
+			appendPort(byName[key], `127.0.0.1:${internalPort}:${appPort}`)
+			boundService = key
 		}
 	}
-	// TouchWorkStation listings are plain Docker Compose files: the listing names its web service and
+	// My Own Data Center listings are plain Docker Compose files: the listing names its web service and
 	// port (web: {service, port}). Any host port the file publishes for it (so it also runs on its own
-	// with `docker compose up`) gives way to Omarchy Server's private one behind the sign-in.
+	// with `docker compose up`) gives way to My Own Data Center's private one behind the sign-in.
 	if (!internalPort && web && services[web.service] && Number.isInteger(web.port)) {
-		const svc = services[web.service]
-		if (svc.network_mode === 'host') {
+		const svc = byName[web.service]
+		webContainerPort = web.port
+		if (services[web.service].network_mode === 'host') {
 			internalPort = null // holds its own port, like Home Assistant
 		} else {
-			const containerPort = (p) => Number(String(typeof p === 'object' ? p.target : p).split('/')[0].split(':').pop())
-			svc.ports = (svc.ports ?? []).filter((p) => containerPort(p) !== web.port)
+			retainPorts(svc, (p) => containerPort(p) !== web.port)
 			internalPort = allocatePort()
-			svc.ports.push(`127.0.0.1:${internalPort}:${web.port}`)
+			appendPort(svc, `127.0.0.1:${internalPort}:${web.port}`)
+			boundService = web.service
 		}
 	}
-	doc.services = services
-	return {text: YAML.stringify(doc), internalPort}
+	// MCP is published on 127.0.0.1 only. The web loopback is reused only for the service that got it.
+	const mcpPort = typeof mcp?.port === 'string' && mcp.port.trim() ? Number(mcp.port) : mcp?.port
+	const mcpSvc = mcp?.service ? services[mcp.service] : null
+	let mcpInternalPort = null
+	const sameBinding = boundService !== null && mcp?.service === boundService && webContainerPort !== null && mcpPort === webContainerPort
+	if (mcpSvc && typeof mcpPort === 'number' && Number.isInteger(mcpPort) && mcpPort >= 1 && mcpPort <= 65535) {
+		if (sameBinding) mcpInternalPort = internalPort
+		else if (mcpSvc.network_mode !== 'host') {
+			retainPorts(byName[mcp.service], (p) => containerPort(p) !== mcpPort)
+			mcpInternalPort = allocatePort()
+			appendPort(byName[mcp.service], `127.0.0.1:${mcpInternalPort}:${mcpPort}`)
+		} else if (boundService === null && internalPort && webContainerPort !== null && mcpPort === webContainerPort) {
+			// The app binds this port on 127.0.0.1 itself. Nothing else can publish it.
+			mcpInternalPort = internalPort
+		}
+	}
+	return {text: emitCompose(doc), internalPort, mcpInternalPort}
 }
 
 // Can a browser use this app's web page right now? One answer for every screen:
@@ -307,7 +822,7 @@ export function prepareCompose(appId, text, allocatePort, {shared = false, vars 
 //   starting      not answering yet, and it was started only a moment ago
 //   unreachable   its containers run, but nothing answers on its web port (see `result`/`error`)
 //   stopped       its containers aren't running
-//   gateway-down  the app answers, but Omarchy Server's own port for it isn't open
+//   gateway-down  the app answers, but My Own Data Center's own port for it isn't open
 //   no-web        it has no web page
 // `probe` is what asking the app gave: {result: 'answered' | 'refused' | 'timeout' | 'error' | 'no-web', status}.
 export function readinessOf({probe, container = 'running', runningForMs = Infinity, graceMs = 120_000, gatewayOpen = true}) {
@@ -321,7 +836,33 @@ export function readinessOf({probe, container = 'running', runningForMs = Infini
 	return 'unreachable'
 }
 
-export function createApps({dataDir, home = os.homedir(), webPort = 7780, run = execP, gatewayHost = '0.0.0.0', allowFileStores = false, firewall = null, defaultStores = DEFAULT_STORES, tlsDir = join(dataDir, 'tls'), secure = tlsContext({dir: tlsDir, lazy: true}), startGraceMs = 120_000, systemApps = null}) {
+// Whether Podman itself works (issue #88), not just whether its socket file is there. The common way
+// it breaks: its storage was made for another user or home folder (a renamed user, a restored backup,
+// a copied VM), so it refuses to start, and apps only say "Cannot connect to the Docker daemon".
+export async function podmanHealth(run, env, home) {
+	const storageHelp = (where) =>
+		`Podman’s storage still belongs to ${where}, not to ${home}, so it won’t start (this happens after renaming the user or restoring another machine’s home folder). Move ~/.local/share/containers aside, or run “podman system reset”, then reinstall your apps.`
+	try {
+		const res = await run('podman', ['info', '--format', 'json'], {env, timeout: 30_000})
+		let info = null
+		try {
+			info = JSON.parse(typeof res === 'string' ? res : (res?.stdout ?? ''))
+		} catch {
+			/* nothing to compare: it ran, so it works */
+		}
+		const root = String(info?.store?.graphRoot ?? '')
+		if (root && root.startsWith('/home/') && !root.startsWith(home + '/')) return {ok: false, message: storageHelp(root.replace(/\/\.local\/share\/containers\/storage$/, ''))}
+		return {ok: true}
+	} catch (e) {
+		const text = `${e.stderr ?? ''} ${e.message ?? ''}`
+		const other = /(\/home\/[^/\s"']+)\/\.local\/share\/containers/.exec(text)?.[1]
+		if (e.code === 'ENOENT') return {ok: false, message: 'Apps need Podman. Run the installer again to add it.'}
+		if ((other && other !== home) || /does not match our (static|graph|run|tmp) dir/i.test(text)) return {ok: false, message: storageHelp(other && other !== home ? other : 'another user')}
+		return {ok: false, message: `Podman didn’t start: ${text.replace(/^\s*(podman:\s*)?(Error:\s*)?/i, '').trim().split('\n').slice(-1)[0].slice(0, 300)}`}
+	}
+}
+
+export function createApps({dataDir, home = os.homedir(), webPort = 7780, run = execP, gatewayHost = '0.0.0.0', allowFileStores = false, firewall = null, defaultStores = DEFAULT_STORES, tlsDir = join(dataDir, 'tls'), secure = tlsContext({dir: tlsDir, lazy: true}), startGraceMs = 120_000, systemApps = null, deviceExists = exists, forwardInstall = null, remoteApps = async () => [], oidc = null, getTailscaleStatus = null, usbReleased = null}) {
 	const base = join(dataDir, 'apps')
 	const storesDir = join(base, 'stores')
 	const installedDir = join(base, 'installed')
@@ -329,8 +870,24 @@ export function createApps({dataDir, home = os.homedir(), webPort = 7780, run = 
 	const engineEnv = {DOCKER_HOST: process.env.DOCKER_HOST ?? `unix://${process.env.XDG_RUNTIME_DIR ?? `/run/user/${process.getuid?.() ?? 1000}`}/podman/podman.sock`}
 
 	let state = {stores: [], apps: [], recent: []}
+	// Set when apps.json exists but cannot be used. Saves refuse, so a later install cannot
+	// replace the bytes the owner may still be able to repair.
+	let stateDamaged = false
 	let secret
+	let publishToken = ''
+	let publishServer = null
+	const publishSock = join(base, 'publish.sock')
+	const publishTokenFile = join(base, 'publish.token')
 	const busy = new Map() // appId -> {state, progress}
+	const oidcRuntimeVars = new Map() // appId -> {OIDC_*} (memory only; never written to apps.json)
+	const lock = createKeyedLock()
+	// Uninstalls of different apps must not overlap: each would still see the other and leave Tor up.
+	let uninstallQueue = Promise.resolve()
+	const afterUninstalls = (fn) => {
+		const run = uninstallQueue.then(fn, fn)
+		uninstallQueue = run.then(() => {}, () => {})
+		return run
+	}
 	let statesCache = new Map(), statesAt = 0, statesInFlight = null
 	// When an app stops being busy (installed, started, stopped…), look at it afresh next time.
 	const busyDelete = busy.delete.bind(busy)
@@ -338,14 +895,44 @@ export function createApps({dataDir, home = os.homedir(), webPort = 7780, run = 
 	const gateways = new Map() // appId -> {server, port}
 	const tickets = new Map() // one-time hand-overs from the web app
 	let registryCache = null
+	let registryGen = 0
+	let registryFlightGen = 0
 	let registryWarm = null
 
+	// Apps come back after a reboot only if Podman's own restart unit is on (it's off by default, and
+	// rootless Podman has no daemon to do it). It's a user unit, so this needs no sudo: servers set up
+	// before the installer did it get it here too (issue #89).
+	run('systemctl', ['--user', 'enable', 'podman-restart.service'], {timeout: 20_000}).catch(() => {})
 	const ready = (async () => {
 		await mkdir(storesDir, {recursive: true, mode: 0o700})
 		await mkdir(installedDir, {recursive: true, mode: 0o700})
+		// Only a missing file is a new install. Empty, truncated, or wrong-shaped JSON must stay
+		// byte-for-byte: the migrations below would otherwise save an empty app list over it.
+		let text = null
 		try {
-			state = {...state, ...JSON.parse(await readFile(stateFile, 'utf8'))}
-		} catch {}
+			text = await readFile(stateFile, 'utf8')
+		} catch (error) {
+			if (error.code !== 'ENOENT') stateDamaged = true
+		}
+		if (text !== null && !stateDamaged) {
+			let data
+			try {
+				data = JSON.parse(text)
+			} catch {
+				data = undefined
+			}
+			const plain = (v) => !!v && typeof v === 'object' && !Array.isArray(v)
+			const ok =
+				plain(data) &&
+				Array.isArray(data.apps) &&
+				data.apps.every(plain) &&
+				Array.isArray(data.stores) &&
+				data.stores.every((s) => plain(s) && typeof s.url === 'string') &&
+				(data.recent === undefined || Array.isArray(data.recent))
+			if (ok) state = {...state, ...data, recent: Array.isArray(data.recent) ? data.recent : []}
+			else stateDamaged = true
+		}
+		if (stateDamaged) console.error('[omarchyd] couldn’t load apps.json; leaving it unchanged')
 		const sf = join(base, 'secret')
 		try {
 			secret = await readFile(sf)
@@ -353,13 +940,62 @@ export function createApps({dataDir, home = os.homedir(), webPort = 7780, run = 
 			secret = randomBytes(32)
 			await writeFile(sf, secret, {mode: 0o600})
 		}
+		if (stateDamaged) return
+		await chmod(base, 0o700).catch(() => {})
+		try {
+			publishToken = (await readFile(publishTokenFile, 'utf8')).trim()
+			if (!publishToken) throw new Error('empty')
+		} catch {
+			publishToken = randomBytes(32).toString('base64url')
+			await writeFile(publishTokenFile, `${publishToken}\n`, {mode: 0o644})
+		}
+		// The apps directory is private to this user. 0644 lets a container read the mounted file
+		// (its user is not this one). Other accounts still cannot traverse the directory.
+		await chmod(publishTokenFile, 0o644).catch(() => {})
+		await rm(publishSock, {force: true}).catch(() => {})
+		publishServer = http.createServer(async (req, res) => {
+			const url = new URL(req.url ?? '/', 'http://localhost')
+			if (req.method !== 'POST' || !PUBLISH_RPC.has(url.pathname)) {
+				sendError(res, new RpcError('NOT_FOUND', 'This socket only publishes and unpublishes apps'))
+				return
+			}
+			await handleRpc(req, res, url, {'apps.publish': {kind: 'mutation', run: publish}, 'apps.unpublish': {kind: 'mutation', run: unpublish}}, authenticatePublish)
+		})
+		await new Promise((resolve, reject) => {
+			publishServer.once('error', reject)
+			publishServer.listen(publishSock, resolve)
+		})
+		publishServer.unref()
+		await chmod(publishSock, 0o666).catch(() => {})
 		// First start: add the default stores (they download the first time the App Store opens).
 		if (!state.defaultsAdded) {
 			for (const d of defaultStores) if (!state.stores.some((x) => x.url.toLowerCase() === d.url.toLowerCase())) state.stores.push({url: d.url, ...(d.name ? {name: d.name} : {}), syncedAt: 0})
 			state.defaultsAdded = true
 			await save()
 		}
-		// Omarchy Server uses only the TouchWorkStation store: remove the Umbrel store servers were given
+		// The account that publishes the stores moved (TouchWorkStation → MyOwnDataCenter): follow it,
+		// once, before GitHub's redirect from the old name can go away. Installed apps follow their store.
+		if (!state.storesMoved) {
+			let moved = false
+			for (const s of [...state.stores]) {
+				const next = movedGithubUrl(s.url)
+				if (!next) continue
+				moved = true
+				const oldUrl = s.url
+				if (state.stores.some((x) => x !== s && x.url.toLowerCase() === next.toLowerCase())) state.stores = state.stores.filter((x) => x !== s)
+				else {
+					s.url = next
+					s.syncedAt = 0
+					delete s.meta
+				}
+				await rm(storeDir(oldUrl), {recursive: true, force: true}).catch(() => {})
+				for (const a of state.apps) if (a.store?.toLowerCase() === oldUrl.toLowerCase()) a.store = next
+			}
+			// Only written when something moved (nothing to do leaves the saved file as it was).
+			state.storesMoved = true
+			if (moved) await save()
+		}
+		// My Own Data Center uses only its own store: remove the Umbrel store servers were given
 		// before (once). Apps already installed from it keep running; they just get no updates from it.
 		if (!state.umbrelStoreRemoved) {
 			const old = state.stores.filter((x) => /github\.com\/getumbrel\/umbrel-apps(\.git)?$/i.test(x.url))
@@ -369,7 +1005,72 @@ export function createApps({dataDir, home = os.homedir(), webPort = 7780, run = 
 			state.umbrelStoreRemoved = true
 			await save()
 		}
-		for (const a of state.apps) if (a.state === 'installing') Object.assign(a, {state: 'error', error: 'Install was interrupted. Uninstall it and install again.'})
+		// A local clone of the catalog (file://) replaces the GitHub store so App Store and updates
+		// read the tree you sync, the same way Software update reads the local omarchy-server clone.
+		const localDefault = defaultStores.find((d) => /^file:\/\//.test(d.url))
+		if (localDefault) {
+			const localUrl = normalize(localDefault.url)
+			let changed = false
+			for (const s of state.stores) {
+				if (isGithubAppStore(s.url) || (s.localDefault && s.url.toLowerCase() !== localUrl.toLowerCase())) {
+					const oldUrl = s.url
+					await rm(storeDir(oldUrl), {recursive: true, force: true}).catch(() => {})
+					s.url = localUrl
+					s.syncedAt = 0
+					s.localDefault = true
+					delete s.meta
+					for (const a of state.apps) if (a.store?.toLowerCase() === oldUrl.toLowerCase()) a.store = localUrl
+					changed = true
+				} else if (s.url.toLowerCase() === localUrl.toLowerCase() && !s.localDefault) {
+					s.localDefault = true
+					changed = true
+				}
+			}
+			for (const a of state.apps) {
+				if (!isGithubAppStore(a.store)) continue
+				a.store = localUrl
+				changed = true
+			}
+			if (!state.stores.some((s) => s.url.toLowerCase() === localUrl.toLowerCase())) {
+				state.stores.unshift({url: localUrl, syncedAt: 0, localDefault: true})
+				changed = true
+			}
+			if (changed) await save()
+		} else {
+			const githubDefault = defaultStores.find((d) => isGithubAppStore(d.url))
+			if (githubDefault) {
+				const ghUrl = normalize(githubDefault.url)
+				let changed = false
+				const keep = []
+				for (const s of state.stores) {
+					const wasLocal = s.localDefault || (!allowFileStores && /^file:\/\//.test(s.url))
+					if (!wasLocal) {
+						keep.push(s)
+						continue
+					}
+					const oldUrl = s.url
+					await rm(storeDir(oldUrl), {recursive: true, force: true}).catch(() => {})
+					for (const a of state.apps) if (a.store?.toLowerCase() === oldUrl.toLowerCase()) a.store = ghUrl
+					if (!keep.some((x) => isGithubAppStore(x.url)) && !state.stores.some((x) => x !== s && isGithubAppStore(x.url))) {
+						s.url = ghUrl
+						s.syncedAt = 0
+						delete s.localDefault
+						delete s.meta
+						keep.push(s)
+					}
+					changed = true
+				}
+				if (changed) {
+					state.stores = keep
+					await save()
+				}
+			}
+		}
+		for (const a of state.apps) {
+			if (a.state !== 'installing') continue
+			if (a.oidc?.enabled) await oidc?.removeAppClient(a.id).catch(() => {})
+			Object.assign(a, {state: 'error', error: 'Install was interrupted. Uninstall it and install again.'})
+		}
 		// Newer versions ask about more kinds of access (host network, server folders, system access).
 		// Apps you already installed keep what they have, so they keep working and updating.
 		if ((state.permissionsVersion ?? 1) < 2) {
@@ -383,10 +1084,34 @@ export function createApps({dataDir, home = os.homedir(), webPort = 7780, run = 
 			state.permissionsVersion = 2
 			await save()
 		}
+		// Apps installed before their own data under ~/.local was claimed have an empty dataDirs
+		// list, so the container user never received it. Jellyfin runs as user 1000 and then cannot
+		// write /config. Claim those folders once. A later start does not chown them again.
+		let claimed = false
+		for (const a of state.apps) {
+			if (a.system || a.state === 'error') continue
+			const previousDirs = a.dataDirs
+			const previousUsers = a.userDirs
+			try {
+				const text = await readFile(join(appDir(a.id), 'compose.omarchy.yml'), 'utf8').catch(() => '')
+				if (!text) continue
+				const had = new Set(a.dataDirs ?? [])
+				await createBindSources(a, text)
+				const fresh = (a.dataDirs ?? []).filter((d) => !had.has(d))
+				if (!fresh.length) continue
+				await prepareOwnership({...a, dataDirs: fresh, userDirs: []})
+				claimed = true
+			} catch (e) {
+				a.dataDirs = previousDirs
+				a.userDirs = previousUsers
+				console.error('[omarchyd] ownership', a.id, e.message)
+			}
+		}
+		if (claimed) await save()
 		for (const a of state.apps) if (a.system && a.state !== 'error') systemApps?.resume(a)
 		for (const a of state.apps) if (a.port && a.state !== 'error') await openGateways(a).catch((e) => console.error('[omarchyd] gateway', a.id, e.message))
 	})()
-	const save = () => writeAtomic(stateFile, () => JSON.stringify(state, null, 2))
+	const save = () => (stateDamaged ? Promise.reject(new RpcError('PRECONDITION_FAILED', 'apps.json is damaged and was left unchanged.')) : writeAtomic(stateFile, () => JSON.stringify(state)))
 	const appDir = (id) => join(installedDir, id)
 	const project = (id) => `omarchy-${id}`
 
@@ -415,9 +1140,9 @@ export function createApps({dataDir, home = os.homedir(), webPort = 7780, run = 
 	// ---- gateway --------------------------------------------------------------------------------
 	function forwardHeaders(req) {
 		const h = {...req.headers}
-		// Browsers send a server's cookies to every port on it, so Omarchy Server's own sign-in cookies
+		// Browsers send a server's cookies to every port on it, so My Own Data Center's own sign-in cookies
 		// (the web app's session, omarchyd's browser session, the app session) arrive here too. None of
-		// them is ever passed to an app: an app that saw them could act as you in Omarchy Server.
+		// them is ever passed to an app: an app that saw them could act as you in My Own Data Center.
 		const cookies = (h.cookie ?? '')
 			.split(';')
 			.map((c) => c.trim())
@@ -433,9 +1158,9 @@ export function createApps({dataDir, home = os.homedir(), webPort = 7780, run = 
 		const h = req.headers.host ?? 'localhost'
 		return h.startsWith('[') ? h.slice(0, h.indexOf(']') + 1) : h.split(':')[0]
 	}
-	// Apps open inside Omarchy Server's own page (desktop windows, the full-screen app view). Many
+	// Apps open inside My Own Data Center's own page (desktop windows, the full-screen app view). Many
 	// apps forbid being shown inside another page; for their responses through this gateway that is
-	// relaxed to exactly one embedder: the Omarchy Server web app on this same host. Nothing else changes.
+	// relaxed to exactly one embedder: the My Own Data Center web app on this same host. Nothing else changes.
 	const frameable = (headers, host) => {
 		const out = {...headers}
 		delete out['x-frame-options']
@@ -458,7 +1183,7 @@ export function createApps({dataDir, home = os.homedir(), webPort = 7780, run = 
 	// The sign-in gateway in front of an app. Normally it owns the app's port and forwards to the
 	// app's private one (127.0.0.1:internalPort). Apps that hold their own port themselves (host
 	// network: Home Assistant, Plex, Pi-hole…) get a "view" gateway on a port of its own instead, so
-	// they can still be shown inside Omarchy Server; it passes requests on unchanged, without
+	// they can still be shown inside My Own Data Center; it passes requests on unchanged, without
 	// proxy headers (some apps, like Home Assistant, refuse requests that claim to come via a proxy).
 	const gatewayKey = (id, view) => (view ? `${id}:view` : id)
 	async function openGateway(app, {view = false} = {}) {
@@ -487,7 +1212,7 @@ export function createApps({dataDir, home = os.homedir(), webPort = 7780, run = 
 				tickets.delete(url.searchParams.get('t') ?? '')
 				if (!t || t.exp < Date.now() || t.appId !== app.id) {
 					res.writeHead(403, {'content-type': 'text/plain'})
-					return res.end('This link has expired. Open the app again from Omarchy Server.')
+					return res.end('This link has expired. Open the app again from My Own Data Center.')
 				}
 				res.writeHead(302, {'set-cookie': sessionCookie(issueSession(t.userId)), location: safePath(url.searchParams.get('r')), 'cache-control': 'no-store'})
 				return res.end()
@@ -509,8 +1234,10 @@ export function createApps({dataDir, home = os.homedir(), webPort = 7780, run = 
 				r.pipe(res)
 			})
 			up.on('timeout', () => up.destroy(new Error('timeout')))
+			linkProxy(req, res, up)
 			up.on('error', () => {
-				if (!res.headersSent) res.writeHead(502, {'content-type': 'text/plain'})
+				if (res.headersSent) return
+				res.writeHead(502, {'content-type': 'text/plain; charset=utf-8'})
 				res.end(`${app.name ?? app.id} isn’t answering yet. If it just started, give it a moment.`)
 			})
 			req.pipe(up)
@@ -587,46 +1314,54 @@ export function createApps({dataDir, home = os.homedir(), webPort = 7780, run = 
 	function checkUrl(url) {
 		if (/^https:\/\/[\w.-]+(:\d+)?\/[\w.\-~/]+$/.test(url)) return
 		if (allowFileStores && /^file:\/\//.test(url)) return
+		if (defaultStores.some((d) => /^file:\/\//.test(d.url) && normalize(d.url) === url)) return
 		throw new RpcError('BAD_REQUEST', 'Enter the store’s https:// address, e.g. https://github.com/someone/app-store')
 	}
 	async function loadStore(url) {
 		const dir = storeDir(url)
-		let meta = (await readYaml(dir, STORE_FILES))?.data
+		let meta = (await readYaml(dir, STORE_FILES).catch(() => null))?.data
+		if (!meta || typeof meta !== 'object' || Array.isArray(meta)) meta = null
 		const gallery = GALLERIES[url.toLowerCase().replace(/\.git$/, '')] ?? (typeof meta?.gallery === 'string' && /^https:\/\//.test(meta.gallery) ? meta.gallery.replace(/\/+$/, '') : null)
 		const apps = []
 		// First pass: every app and the variables each one's exports.sh provides (apps that need
 		// another app read that app's variables, such as its address and passwords).
-		const found = []
-		for (const entry of await readdir(dir, {withFileTypes: true})) {
-			if (!entry.isDirectory() || entry.name.startsWith('.')) continue
-			const m = await readYaml(join(dir, entry.name), APP_FILES).catch(() => null)
-			if (!m?.data?.id || m.data.id !== entry.name || !APP_ID.test(m.data.id)) continue
-			const c = await readYaml(join(dir, entry.name), COMPOSE_FILES).catch(() => null)
-			if (!c) continue
-			const compose = await readFile(join(dir, entry.name, c.name), 'utf8')
-			const exportsText = await readFile(join(dir, entry.name, 'exports.sh'), 'utf8').catch(() => '')
-			// `export NAME=…`, a bare `export NAME`, or one written out for later (echo "export NAME=…" >> .env).
-			const exported = [...exportsText.matchAll(/\bexport\s+([A-Za-z_][A-Za-z0-9_]*)\b/g)].map((m) => m[1])
-			found.push({a: m.data, entry, compose, exported})
-		}
+		const entries = (await readdir(dir, {withFileTypes: true})).filter((e) => e.isDirectory() && !e.name.startsWith('.'))
+		const found = (
+			await mapPool(entries, LOAD_CONCURRENCY, async (entry) => {
+				const appPath = join(dir, entry.name)
+				const [m, c, exportsText] = await Promise.all([readYaml(appPath, APP_FILES).catch(() => null), readFirst(appPath, COMPOSE_FILES).catch(() => null), readFile(join(appPath, 'exports.sh'), 'utf8').catch(() => '')])
+				const rawId = m?.data?.id
+				const id = typeof rawId === 'string' || (typeof rawId === 'number' && Number.isFinite(rawId)) ? String(rawId) : ''
+				if (!id || id !== entry.name || !APP_ID.test(id) || !c) return null
+				// `export NAME=…`, a bare `export NAME`, or one written out for later (echo "export NAME=…" >> .env).
+				const exported = [...exportsText.matchAll(/\bexport\s+([A-Za-z_][A-Za-z0-9_]*)\b/g)].map((x) => x[1])
+				return {a: {...m.data, id}, entry, compose: c.text, exported}
+			})
+		).filter(Boolean)
 		const byId = new Map(found.map((f) => [f.a.id, f]))
 		// Everything an app needs, all the way down (bitcoin → lightning → …).
 		const needsOf = (id, seen = new Set()) => {
-			for (const d of (byId.get(id)?.a.dependencies ?? []).filter((x) => typeof x === 'string')) {
-				if (seen.has(d)) continue
+			for (const d of stringList(byId.get(id)?.a.dependencies)) {
+				if (d === id || seen.has(d)) continue
 				seen.add(d)
 				needsOf(d, seen)
 			}
 			return seen
 		}
-		const neededByOthers = new Set(found.flatMap((f) => (f.a.dependencies ?? []).filter((x) => typeof x === 'string')))
+		const neededByOthers = new Set(found.flatMap((f) => stringList(f.a.dependencies)))
 		for (const {a, entry, compose, exported} of found) {
-			const deps = (a.dependencies ?? []).filter((x) => typeof x === 'string')
-			const all = [...needsOf(a.id)]
+			const deps = stringList(a.dependencies)
+			const loop = dependencyLoop(a.id, byId)
+			const all = [...needsOf(a.id)].filter((d) => d !== a.id)
 			const absent = all.filter((d) => !byId.has(d))
 			const fromDeps = all.flatMap((d) => byId.get(d)?.exported ?? [])
 			const missing = missingVars(compose, [...exported, ...fromDeps])
-			const unsupported = absent.length ? `Needs ${absent.join(', ')}, which isn’t in this store.` : null
+			const unsupported = loop
+				? (deps.includes(a.id) ? 'It depends on itself.' : 'It is part of a dependency loop.')
+				: absent.length
+					? `Needs ${absent.join(', ')}, which isn’t in this store.`
+					: null
+			const needs = loop ? [] : orderNeeds(a.id, byId).filter((d) => d !== a.id)
 			// Settings it can use but doesn't require: from another app it works with when that app is
 			// installed (e.g. Mempool), or ones nothing here provides. It installs either way; they stay empty.
 			const optionalFrom = [...new Set(missing.flatMap((v) => found.filter((f) => f.exported.includes(v)).map((f) => String(f.a.name ?? f.a.id))))]
@@ -634,37 +1369,45 @@ export function createApps({dataDir, home = os.homedir(), webPort = 7780, run = 
 			const caution = optionalFrom.length
 				? `Works with ${optionalFrom.join(', ')} too: install ${optionalFrom.length > 1 ? 'them' : 'it'} to use those features.`
 				: unknown.length
-					? `Some features may not work here: it expects settings Omarchy Server doesn’t have (${unknown.slice(0, 3).join(', ')}).`
+					? `Some features may not work here: it expects settings this server doesn’t have (${unknown.slice(0, 3).join(', ')}).`
 					: null
+			const installSize = installSizeOf(a.installSize)
 			const media = (f) => (typeof f === 'string' && /^https:\/\//.test(f) ? f : gallery && typeof f === 'string' && /^[\w.-]+$/.test(f) ? `${gallery}/${a.id}/${f}` : null)
+			const mcp = parseMcp(a.mcp)
+			const manifestOidc = parseManifestOidc(a.oidc)
+			const oidcInfo = oidcSummaryForStore(a.id, manifestOidc)
 			apps.push({
 				id: a.id,
 				name: String(a.name ?? a.id),
-				tagline: a.tagline,
+				tagline: listingText(a.tagline),
 				icon: media(a.icon) ?? (gallery ? `${gallery}/${a.id}/icon.svg` : undefined),
-				category: a.category,
+				category: listingText(a.category),
 				version: a.version !== undefined ? String(a.version) : undefined,
+				...(installSize !== undefined ? {installSize} : {}),
 				port: Number(a.port) || undefined,
 				path: typeof a.path === 'string' ? a.path : '',
-				description: a.description,
-				developer: a.developer,
-				website: a.website,
-				gallery: (a.gallery ?? []).map(media).filter(Boolean),
-				releaseNotes: a.releaseNotes,
+				description: listingText(a.description),
+				developer: listingText(a.developer),
+				website: listingText(a.website),
+				gallery: (Array.isArray(a.gallery) ? a.gallery : []).map(media).filter(Boolean),
+				releaseNotes: listingText(a.releaseNotes),
 				dependencies: deps,
-				// Everything installed along with it, in install order (what it needs comes first).
-				...(all.length ? {needs: orderNeeds(a.id, byId)} : {}),
+				// Everything installed along with it, in install order (what it needs comes first). Never itself.
+				...(needs.length ? {needs} : {}),
 				...(Array.isArray(a.implements) ? {implements: a.implements.filter((x) => typeof x === 'string')} : {}),
-				shared: deps.length > 0 || neededByOthers.has(a.id) || /ipv4_address/.test(compose),
-				defaultUsername: a.defaultUsername || undefined,
-				defaultPassword: a.defaultPassword || undefined,
+				shared: a.shared === true || deps.length > 0 || neededByOthers.has(a.id) || /ipv4_address/.test(compose),
+				defaultUsername: listingText(a.defaultUsername) || undefined,
+				defaultPassword: listingText(a.defaultPassword) || undefined,
 				deterministicPassword: a.deterministicPassword === true,
 				// Needs a secure (https://) page in the browser, e.g. for WebCodecs or the Web Crypto API.
 				...(a.requiresHttps === true ? {requiresHttps: true} : {}),
-				permissions: appPermissions(compose, whereFor({id: a.id, port: a.port, version: a.version, folders: folderChoices(a.folders)})).map((p) => p.id),
-				...(Array.isArray(a.openPorts) ? {openPorts: a.openPorts.map(Number).filter((n) => Number.isInteger(n) && n >= 1 && n <= 65535 && n !== 22).slice(0, 16)} : {}),
+				...(Array.isArray(a.openPorts) ? {openPorts: a.openPorts.map(Number).filter((n) => Number.isInteger(n) && n >= 1 && n <= 65535 && n !== 22 && n !== mcp?.port).slice(0, 16)} : {}),
 				...(folderChoices(a.folders).length ? {folders: folderChoices(a.folders)} : {}),
 				...(a.web && typeof a.web.service === 'string' && Number.isInteger(Number(a.web.port)) ? {web: {service: a.web.service, port: Number(a.web.port), ...(a.web.https === true ? {https: true} : {})}} : {}),
+				...(mcp ? {mcp} : {}),
+				...(manifestOidc ? {manifestOidc} : {}),
+				...(oidcInfo ? {oidc: oidcInfo} : {}),
+				...(a.publish === true ? {publish: true} : {}),
 				...(unsupported ? {unsupported} : {}),
 				...(caution ? {caution} : {}),
 				folder: join(dir, entry.name),
@@ -677,52 +1420,141 @@ export function createApps({dataDir, home = os.homedir(), webPort = 7780, run = 
 			const repo = url.replace(/\.git$/, '').split('/').pop() ?? 'store'
 			meta = {id: slug, name: repo.replace(/[-_]+/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase())}
 		}
+		const src = storeSource(url)
+		if (src.label) meta = {id: `${meta.id}~${src.slug}`, name: `${meta.name ?? meta.id} · ${src.label}`}
 		return {url, meta: {id: String(meta.id), name: String(meta.name ?? meta.id)}, apps}
 	}
+	const syncFlights = new Map()
 	async function syncStore(url) {
+		const key = url.toLowerCase()
+		const inflight = syncFlights.get(key)
+		if (inflight) return inflight
+		const flight = syncStoreNow(url).finally(() => {
+			if (syncFlights.get(key) === flight) syncFlights.delete(key)
+		})
+		syncFlights.set(key, flight)
+		return flight
+	}
+	async function syncStoreNow(url) {
 		const dir = storeDir(url)
+		const {remote, ref} = storeSource(url)
 		if (await exists(join(dir, '.git'))) {
 			// A shallow clone can't `pull --ff-only` once the store has moved on (the new tip doesn't
 			// connect to the one commit it has), so take the store's latest commit as it is.
-			await run('git', ['-C', dir, 'fetch', '--depth', '1', 'origin', 'HEAD'], {timeout: 120_000})
+			await run('git', ['-C', dir, 'fetch', '--depth', '1', 'origin', ref], {timeout: 120_000})
 			await run('git', ['-C', dir, 'reset', '--hard', 'FETCH_HEAD'], {timeout: 60_000})
 			await run('git', ['-C', dir, 'clean', '-fdx'], {timeout: 60_000})
-		} else await run('git', ['clone', '--depth', '1', '--', url, dir], {timeout: 120_000})
+		} else if (ref === 'HEAD') await run('git', ['clone', '--depth', '1', '--', url, dir], {timeout: 120_000})
+		else {
+			// One branch or one pull request: fetch just that.
+			await mkdir(dir, {recursive: true})
+			await run('git', ['init', '-q', dir], {timeout: 30_000})
+			await run('git', ['-C', dir, 'remote', 'add', 'origin', remote], {timeout: 30_000})
+			await run('git', ['-C', dir, 'fetch', '--depth', '1', 'origin', ref], {timeout: 120_000})
+			await run('git', ['-C', dir, 'reset', '--hard', 'FETCH_HEAD'], {timeout: 60_000})
+		}
+	}
+	let registryFlight = null
+	// A publish rewrites the local store while a registry read may already be in flight. Drop that
+	// read, and do not let it cache the listing it started with.
+	function dropRegistry() {
+		registryGen += 1
+		registryCache = null
+		registryFlight = null
 	}
 	async function registry({refresh = false} = {}) {
 		await ready
-		if (registryCache && !refresh && Date.now() - registryCache.at < 60 * 60_000) return registryCache.list
+		if (registryFlight && registryFlightGen === registryGen) return registryFlight
+		if (registryCache && registryCache.gen === registryGen && !refresh && Date.now() - registryCache.at < 60 * 60_000) return registryCache.list
+		const gen = registryGen
+		const flight = loadRegistry({refresh, gen}).finally(() => {
+			if (registryFlight === flight) registryFlight = null
+		})
+		registryFlight = flight
+		registryFlightGen = gen
+		return flight
+	}
+	async function loadRegistry({refresh = false, gen = registryGen} = {}) {
+		const snapshot = [...state.stores]
+		const stillAdded = (url) => state.stores.some((x) => x.url.toLowerCase() === url.toLowerCase())
 		const list = []
-		for (const s of state.stores) {
+		let dirty = false
+		let storeFailed = false
+		for (const s of snapshot) {
+			if (!stillAdded(s.url)) continue
 			if (refresh || Date.now() - (s.syncedAt ?? 0) > 60 * 60_000) {
 				try {
+					// A failed download rejects every caller waiting on this read. It is not turned
+					// into an empty store, and the flight is dropped so the next read tries again.
 					await syncStore(s.url)
+					if (!stillAdded(s.url)) {
+						await rm(storeDir(s.url), {recursive: true, force: true}).catch(() => {})
+						continue
+					}
 					s.syncedAt = Date.now()
-				} catch {}
+					dirty = true
+				} catch (e) {
+					if (!stillAdded(s.url)) {
+						await rm(storeDir(s.url), {recursive: true, force: true}).catch(() => {})
+						continue
+					}
+					// The client toasts this. A raw git error becomes "Internal error" and looks like success was the only other outcome.
+					const stderr = e && typeof e === 'object' && e.stderr != null ? String(e.stderr) : ''
+					const line = stderr.split('\n').map((l) => l.trim()).filter(Boolean).at(-1)
+						?? String(e?.message ?? e ?? 'download failed').split('\n').map((l) => l.trim()).filter(Boolean).at(-1)
+						?? 'download failed'
+					const failure = new RpcError('BAD_GATEWAY', `Couldn't reach ${s.url}: ${line}`)
+					// The hourly check going offline is not a reason to hide a catalog that is already on disk.
+					// It is not cached, so the next read tries the network again. "Check for new apps" still fails.
+					if (refresh || !(await exists(join(storeDir(s.url), '.git')))) throw failure
+					storeFailed = true
+					console.error(`[omarchyd] ${failure.message}; showing the copy already downloaded`)
+				}
 			}
+			if (!stillAdded(s.url)) continue
 			try {
 				const loaded = await loadStore(s.url)
+				if (!stillAdded(s.url)) continue
 				if (s.name) loaded.meta.name = s.name
+				const prev = s.meta
 				s.meta = loaded.meta
+				if (!prev || prev.id !== loaded.meta.id || prev.name !== loaded.meta.name) dirty = true
 				list.push(loaded)
-			} catch {}
+			} catch {
+				// Don't cache a hole where this store should be. The next open tries again.
+				storeFailed = true
+			}
+		}
+		try {
+			if ((await readdir(storeDir(IMPORTED_STORE))).length) list.push(await loadStore(IMPORTED_STORE))
+		} catch {
+			/* nothing imported */
+		}
+		try {
+			if ((await readdir(storeDir(PUBLISHED_STORE))).length) list.push(await loadStore(PUBLISHED_STORE))
+		} catch {
+			/* nothing published */
 		}
 		// Apps that are part of the server itself (Tailscale) come first, so a store can't stand in for them.
-		if (systemApps) list.unshift({url: BUILTIN_STORE, meta: {id: 'omarchy-server', name: 'Omarchy Server'}, apps: systemApps.listings()})
+		if (systemApps) list.unshift({url: BUILTIN_STORE, meta: {id: 'omarchy-server', name: 'MODC'}, apps: systemApps.listings()})
+		const current = list.filter((l) => l.url === BUILTIN_STORE || l.url === IMPORTED_STORE || l.url === PUBLISHED_STORE || stillAdded(l.url))
 		// Installed apps pick up how their listing says to open them (https, an https app inside),
 		// so an app installed before its listing changed doesn't need reinstalling.
 		for (const app of state.apps) {
 			if (app.system) continue
-			const src = list.find((l) => !app.store || l.url === app.store)?.apps.find((x) => x.id === app.id) ?? list.flatMap((l) => l.apps).find((x) => x.id === app.id)
+			const src = current.find((l) => !app.store || l.url === app.store)?.apps.find((x) => x.id === app.id) ?? current.flatMap((l) => l.apps).find((x) => x.id === app.id)
 			if (!src) continue
-			if (src.requiresHttps) app.requiresHttps = true
+			const requiresHttps = !!src.requiresHttps
+			const internalHttps = !!src.web?.https
+			if (!!app.requiresHttps !== requiresHttps || !!app.internalHttps !== internalHttps) dirty = true
+			if (requiresHttps) app.requiresHttps = true
 			else delete app.requiresHttps
-			if (src.web?.https) app.internalHttps = true
+			if (internalHttps) app.internalHttps = true
 			else delete app.internalHttps
 		}
-		await save()
-		registryCache = {at: Date.now(), list}
-		return list
+		if (dirty) await save()
+		if (!storeFailed && gen === registryGen) registryCache = {at: Date.now(), list: current, gen}
+		return current
 	}
 	// An app's listing. An installed app stays with the store it came from (two stores can list the
 	// same id with different folders and settings, and an update must never switch between them).
@@ -756,11 +1588,12 @@ export function createApps({dataDir, home = os.homedir(), webPort = 7780, run = 
 	const entropyKey = () => createHmac('sha256', secret).update('omarchy-server app entropy v1').digest('hex')
 	const deriveEntropy = (identifier) => createHmac('sha256', entropyKey()).update(identifier).digest('hex')
 	const appPassword = (id) => deriveEntropy(`app-${id}-seed-APP_PASSWORD`)
-	function composeEnv(app) {
+	function composeEnv(app, {isolate = false} = {}) {
 		const dir = appDir(app.id)
 		const host = os.hostname().split('.')[0]
 		// Variables from every installed app (an app reads those of the apps it needs), its own last.
-		const others = Object.assign({}, ...state.apps.filter((a) => a.id !== app.id).map((a) => a.exports ?? {}))
+		// Review runs exports before the app is installed and must not see other apps' secrets.
+		const others = isolate ? {} : Object.assign({}, ...state.apps.filter((a) => a.id !== app.id).map((a) => a.exports ?? {}))
 		return {
 			...engineEnv,
 			...others,
@@ -770,6 +1603,7 @@ export function createApps({dataDir, home = os.homedir(), webPort = 7780, run = 
 			TOR_PROXY_PORT,
 			TOR_PASSWORD,
 			TOR_DATA_DIR: join(base, 'shared-root', 'tor', 'data'),
+			HOME: home,
 			APP_DATA_DIR: dir,
 			APP_DATA_ROOT: dir,
 			APP_ID: app.id,
@@ -788,17 +1622,18 @@ export function createApps({dataDir, home = os.homedir(), webPort = 7780, run = 
 			// Community-store compose files reach shared folders through this root; it maps
 			// <root>/data/storage/downloads to your Downloads folder.
 			UMBREL_ROOT: join(base, 'shared-root'),
-			// TouchWorkStation listings: your own folders and this server's address, by name.
+			// My Own Data Center listings: your own folders and this server's address, by name.
 			...Object.fromEntries(Object.entries(USER_DIRS).map(([k, d]) => [k, join(home, d)])),
 			SERVER_IP: serverIp(),
 			DOCKER_SOCKET: engineEnv.DOCKER_HOST.replace(/^unix:\/\//, ''),
 			PUID: String(APP_UID),
 			PGID: String(APP_UID),
 			// Sent by its sign-in gateway with every request (x-omarchy-gateway), so an app that
-			// leaves sign-in to Omarchy Server can tell requests that came through it.
+			// leaves sign-in to My Own Data Center can tell requests that came through it.
 			APP_GATEWAY_KEY: deriveEntropy(`app-${app.id}-gateway`),
 			// Folders you placed when installing (its listing's `folders:`); otherwise inside the app.
 			...Object.fromEntries((app.folderIds ?? []).map((id) => [folderVar(id), app.folders?.[id] ?? join(dir, 'folders', id)])),
+			...(oidcRuntimeVars.get(app.id) ?? {}),
 		}
 	}
 	async function sharedRoot() {
@@ -810,34 +1645,180 @@ export function createApps({dataDir, home = os.homedir(), webPort = 7780, run = 
 			await symlink(join(home, 'Downloads'), link).catch(() => {})
 		}
 	}
-	const compose = (app, ...args) => run('docker-compose', ['-p', project(app.id), '-f', join(appDir(app.id), 'compose.omarchy.yml'), ...args], {env: composeEnv(app), cwd: appDir(app.id)})
+	const usbFile = (id) => join(appDir(id), 'compose.usb.yml')
+	const oidcFile = (id) => join(appDir(id), 'compose.oidc.yml')
+	const isLoopbackHost = (h) => {
+		const clean = String(h ?? '').toLowerCase().replace(/^\[|\]$/g, '')
+		return clean === 'localhost' || clean === '::1' || clean.startsWith('127.')
+	}
+	function lanIpv4s() {
+		const out = []
+		for (const [name, list] of Object.entries(os.networkInterfaces())) {
+			if (/^(docker|podman|veth|virbr|br-|cni|tailscale)/i.test(name)) continue
+			for (const i of list ?? []) if (!i.internal && i.family === 'IPv4' && !out.includes(i.address)) out.push(i.address)
+		}
+		return out
+	}
+	function usableIssuerHint(raw) {
+		const v = String(raw ?? '').trim()
+		if (!v) return ''
+		try {
+			const u = new URL(v)
+			if ((u.protocol !== 'https:' && u.protocol !== 'http:') || !u.hostname || u.username || u.password) return ''
+			if (isLoopbackHost(u.hostname)) return ''
+			return u.origin
+		} catch {
+			return ''
+		}
+	}
+	async function effectiveIssuerForApp(issuerHint = '') {
+		const st = await oidc?.procedures['oidc.status'].run().catch(() => null)
+		if (st?.issuerUrl) return st.issuerUrl
+		const hasCa = await exists(join(tlsDir, 'ca.crt'))
+		const ip = serverIp()
+		if (ip && !isLoopbackHost(ip)) return `${hasCa ? 'https' : 'http'}://${ip}:${webPort}`
+		const hint = usableIssuerHint(issuerHint)
+		if (hint) return hint
+		return `${hasCa ? 'https' : 'http'}://${os.hostname()}.local:${webPort}`
+	}
+	async function resolveSpecForApp(app, src = null) {
+		if (!app || app.system) return null
+		const manifest = src ? (src.manifestOidc ?? null) : (app.manifestOidc ?? (await findInRegistry(app.id).catch(() => null))?.manifestOidc ?? null)
+		return resolveAppOidcSpec(app.id, manifest)
+	}
+	async function readSecretFromOverlay(appId) {
+		const raw = await readFile(oidcFile(appId), 'utf8').catch(() => '')
+		const m = /omarchy_oidc_[A-Za-z0-9_-]{16,}/.exec(raw)
+		return m ? m[0] : ''
+	}
+	async function writeOidcOverlay(app, spec, {issuerHint = '', forceEnabled = false} = {}) {
+		const path = oidcFile(app.id)
+		const enabled = forceEnabled || Boolean(app.oidc?.enabled)
+		if (!oidc || !enabled || !spec || app.system) {
+			oidcRuntimeVars.delete(app.id)
+			await rm(path, {force: true}).catch(() => {})
+			return null
+		}
+		const ts = await getTailscaleStatus?.().catch(() => null)
+		const issuerUrl = await effectiveIssuerForApp(issuerHint)
+		const redirectUris = buildAppRedirectUris({
+			port: app.port,
+			redirectPaths: spec.redirectPaths,
+			issuerUrl,
+			hostname: os.hostname(),
+			ips: lanIpv4s(),
+			tailscaleDns: ts?.available ? ts.self?.dnsName : '',
+			tailscaleIps: ts?.available ? ts.self?.ips : [],
+		})
+		const existingSecret = await readSecretFromOverlay(app.id)
+		const ensured = await oidc.ensureAppClient({
+			appId: app.id,
+			name: app.name,
+			redirectUris,
+			requirePkce: spec.requirePkce,
+			existingSecret,
+		})
+		const vars = oidcVarsFor(issuerUrl, ensured.client.id, ensured.clientSecret, app.port)
+		oidcRuntimeVars.set(app.id, vars)
+		const composeText = await readFile(join(appDir(app.id), 'compose.omarchy.yml'), 'utf8').catch(() => '')
+		const {caPath, bundlePath} = issuerUrl.startsWith('https://')
+			? await buildOidcCaBundle({caCertPath: join(tlsDir, 'ca.crt'), outDir: appDir(app.id)})
+			: {caPath: null, bundlePath: null}
+		const overlay = oidcComposeOverlay({composeText, app, spec, oidcVars: vars, caPath, bundlePath, issuerUrl})
+		if (!overlay) await rm(path, {force: true}).catch(() => {})
+		else await writeAtomic(path, overlay, {mode: 0o600})
+		return {client: ensured.client, clientSecret: ensured.clientSecret, issuerUrl, created: ensured.created}
+	}
+	async function writeUsbOverlay(app) {
+		const path = usbFile(app.id)
+		const text = await readFile(join(appDir(app.id), 'compose.omarchy.yml'), 'utf8').catch(() => '')
+		const names = Object.keys((YAML.parse(text) ?? {}).services ?? {})
+		const plugged = []
+		// deviceExists is access() on the server. A test can answer for a stick path when a private /dev is not available.
+		for (const d of app.usbDevices ?? []) if (d?.path && (await deviceExists(d.path))) plugged.push(d)
+		const overlay = usbComposeOverlay(names, plugged)
+		if (!overlay) await rm(path, {force: true})
+		else await writeFile(path, overlay, {mode: 0o600})
+		return plugged.map((d) => d.id)
+	}
+	async function compose(app, ...args) {
+		const files = ['-f', join(appDir(app.id), 'compose.omarchy.yml')]
+		const extra = usbFile(app.id)
+		if (await exists(extra)) files.push('-f', extra)
+		const oidcExtra = oidcFile(app.id)
+		if (await exists(oidcExtra)) files.push('-f', oidcExtra)
+		try {
+			return await run('docker-compose', ['-p', project(app.id), ...files, ...args], {env: composeEnv(app), cwd: appDir(app.id)})
+		} catch (e) {
+			// "Cannot connect to the Docker daemon" means Podman itself isn't answering: say why instead.
+			if (/Cannot connect to the Docker daemon|podman\.sock.*(refused|no such file)/i.test(String(e.message))) {
+				const h = await engineHealth({fresh: true})
+				if (!h.ok) throw new RpcError('PRECONDITION_FAILED', h.message)
+			}
+			throw e
+		}
+	}
+	// An image built on this server (localhost/…) is not in a registry. `compose pull` would fail it.
+	async function pullApp(app) {
+		const text = await readFile(join(appDir(app.id), 'compose.omarchy.yml'), 'utf8').catch(() => '')
+		let local = false
+		try {
+			const doc = YAML.parse(text) ?? {}
+			const images = Object.values(doc.services ?? {}).map((s) => s?.image).filter(Boolean)
+			local = images.length > 0 && images.every((img) => String(img).startsWith('localhost/'))
+		} catch {}
+		if (!local) await compose(app, 'pull')
+	}
 
 	// Bind-mount sources that don't exist yet are folders the app expects to own (Podman won't
 	// create them the way Docker does).
 	async function createBindSources(app, text) {
-		const env = composeEnv(app)
+		const overlay = {...process.env, ...composeEnv(app)}
+		const dotenv = expandDotEnv(parseDotEnv(await readFile(join(appDir(app.id), '.env'), 'utf8').catch(() => '')), overlay)
+		const env = {...dotenv, ...overlay}
 		const shared = join(base, 'shared-root')
 		const doc = YAML.parse(text) ?? {}
 		app.dataDirs = []
 		app.userDirs = []
+		const dir = appDir(app.id)
+		const allowed = [dir, shared, ...Object.values(USER_DIRS).map((d) => join(home, d)), ...Object.values(app.folders ?? {}).filter((p) => typeof p === 'string')]
 		for (const s of Object.values(doc.services ?? {})) {
 			for (const v of s?.volumes ?? []) {
+				if (v && typeof v === 'object' && (v.type === 'volume' || v.type === 'tmpfs')) continue
 				// Expand first: a source like ${APP_DATA_DIR:-.}/data has a colon of its own.
+				// A short string is a bind only when it starts with / . or ~ (Compose's rule). pgdata:/var is a named volume.
 				const src = typeof v === 'string' ? expandVars(v, env).split(':')[0] : v?.source && expandVars(v.source, env)
-				if (!src || !/^[/.]/.test(src)) continue
-				const path = resolve(appDir(app.id), src)
+				if (!src || typeof src !== 'string') continue
+				if (typeof v === 'string' && !src.startsWith('/') && !src.startsWith('.') && !src.startsWith('~')) continue
+				const path = bindHostPath(src, {home, cwd: dir})
+				if (!path.startsWith('/') || path.includes('\0') || CLOCK_FILES.includes(path)) continue
+				const real = realpathExisting(path)
+				// Drop escaped app-dir symlinks even when the target is refused, so Compose cannot follow them.
+				// Never touch host files such as /etc/localtime (those are not under the app folder).
+				if (under(path, dir) && (await lstat(path).then((st) => st.isSymbolicLink(), () => false))) {
+					const target = await realpath(path).catch(() => '')
+					// The app folder and the shared root sit under ~/.local. A link that stays inside
+					// them is the app's own data, not a way out to SSH keys or this server's files.
+					const ownTarget = target && (under(target, dir) || under(target, shared))
+					const ok = ownTarget || (target && allowed.some((d) => under(target, d)) && !refusedMount(target, home))
+					if (!ok) await rm(path, {force: true})
+				}
+				// Hidden home folders are refused, except the app's own folder and the shared root.
+				// Judge where it really is: a link inside the app folder can lead anywhere.
+				const own = under(real, dir) || under(real, shared)
+				if (!own && (refusedMount(real, home) || refusedMount(path, home))) continue
 				// One of your folders (Videos, Music…): make sure it exists and let the app's user in.
-				const mine = Object.values(USER_DIRS).map((d) => join(home, d)).find((d) => path === d || path.startsWith(`${d}/`))
+				const mine = Object.values(USER_DIRS).map((d) => join(home, d)).find((d) => under(path, d) || under(real, d))
 				if (mine) {
 					if (!(await exists(path))) await mkdir(path, {recursive: true})
 					app.userDirs = [...new Set([...(app.userDirs ?? []), mine])]
 					continue
 				}
 				// Only inside the app's own folder, or the shared folders (e.g. a Downloads subfolder).
-				if (!path.startsWith(appDir(app.id)) && !path.startsWith(shared)) continue
+				if (!under(path, dir) && !under(path, shared) && !under(real, dir) && !under(real, shared)) continue
 				if (!(await exists(path))) await mkdir(path, {recursive: true})
 				// Folders inside the app's own folder are its data: they get handed to its container user.
-				if (path.startsWith(`${appDir(app.id)}/`) && (await stat(path).then((st) => st.isDirectory(), () => false))) app.dataDirs.push(path)
+				if (under(path, dir) && under(realpathExisting(path), dir) && path !== dir && (await lstat(path).then((st) => st.isDirectory(), () => false))) app.dataDirs.push(path)
 			}
 		}
 	}
@@ -869,10 +1850,11 @@ export function createApps({dataDir, home = os.homedir(), webPort = 7780, run = 
 	// An app's exports.sh (bash from its store) sets extra variables, such as ports or derived
 	// passwords. It runs in a bubblewrap sandbox: no network, read-only system, only its own app folder
 	// (writable, as some keep generated passwords there), a clean environment, and a time limit. Its exported variables are returned.
-	async function runExports(app) {
-		const dir = appDir(app.id)
+	async function runExports(app, dir = appDir(app.id), {isolate = false} = {}) {
 		if (!(await exists(join(dir, 'exports.sh')))) return {}
-		const base = composeEnv({...app, exports: {}})
+		const base = composeEnv({...app, exports: {}}, {isolate})
+		base.APP_DATA_DIR = dir
+		base.APP_DATA_ROOT = dir
 		const ips = Object.values(os.networkInterfaces()).flat().filter((i) => i && i.family === 'IPv4' && !i.internal).map((i) => i.address).join(' ')
 		// The server's key never enters the sandbox. derive_entropy looks its answer up in a table
 		// made here; an identifier that isn't in it yet is noted, and the script runs again with it
@@ -929,6 +1911,14 @@ export function createApps({dataDir, home = os.homedir(), webPort = 7780, run = 
 		return ok && (await exists(sock))
 	}
 
+	// Whether Podman itself works, not just whether its socket file is there (see podmanHealth).
+	let health = null
+	async function engineHealth({fresh = false} = {}) {
+		if (!fresh && health && Date.now() - health.at < 30_000) return health
+		health = {...(await podmanHealth(run, engineEnv, home)), at: Date.now()}
+		return health
+	}
+
 	async function liveState(a) {
 		if (a.system) return systemApps ? systemApps.liveState(a) : 'unknown'
 		try {
@@ -966,10 +1956,11 @@ export function createApps({dataDir, home = os.homedir(), webPort = 7780, run = 
 				apps.map(async (a) => {
 					if (a.system) return out.set(a.id, await liveState(a))
 					const states = byProject.get(project(a.id)) ?? []
-					out.set(a.id, states.some((x) => x === 'running') ? 'running' : 'stopped')
+					const st = states.some((x) => x === 'running') ? 'running' : 'stopped'
+					out.set(a.id, await shownLive(a, st))
 				}),
 			)
-		} else await Promise.all(apps.map(async (a) => out.set(a.id, await liveState(a))))
+		} else await Promise.all(apps.map(async (a) => out.set(a.id, await shownLive(a, await liveState(a)))))
 		return out
 	}
 	async function liveStates() {
@@ -989,12 +1980,12 @@ export function createApps({dataDir, home = os.homedir(), webPort = 7780, run = 
 
 	// Ask the app's web port directly (not through its gateway), the way the gateway reaches it:
 	// https when the listing says the app itself speaks https.
-	function askWeb(app) {
+	function askWeb(app, {timeout = 6000} = {}) {
 		const target = app.internalPort ?? app.port
 		if (!target) return Promise.resolve({result: 'no-web'})
 		const secureUpstream = !!app.internalPort && !!app.internalHttps
 		return new Promise((resolve) => {
-			const opts = {host: '127.0.0.1', port: target, path: app.path || '/', method: 'GET', timeout: 6000, headers: {accept: 'text/html'}, ...(secureUpstream ? {rejectUnauthorized: false} : {})}
+			const opts = {host: '127.0.0.1', port: target, path: app.path || '/', method: 'GET', timeout, headers: {accept: 'text/html'}, ...(secureUpstream ? {rejectUnauthorized: false} : {})}
 			const req = (secureUpstream ? https : http).request(opts, (r) => {
 				r.resume()
 				resolve({result: 'answered', status: r.statusCode, location: r.headers.location ?? null})
@@ -1003,6 +1994,18 @@ export function createApps({dataDir, home = os.homedir(), webPort = 7780, run = 
 			req.on('error', (e) => resolve({result: e.code === 'ECONNREFUSED' ? 'refused' : 'error', error: e.code ?? e.message}))
 			req.end()
 		})
+	}
+	// The list used to trust Podman alone, so a container whose page is down still looked running.
+	// Ask the app's own port (never the sign-in gateway) and only after it has had time to start.
+	const LIST_WEB_MS = 800
+	async function shownLive(app, container) {
+		if (container !== 'running' || app.system) return container
+		if (!(app.internalPort || app.port)) return container
+		const asked = await askWeb(app, {timeout: LIST_WEB_MS})
+		if (asked.result === 'answered' && (asked.status ?? 500) < 500) return 'running'
+		if (asked.result !== 'refused' && asked.result !== 'timeout') return container
+		const runningForMs = Date.now() - (startedAt.get(app.id) ?? bootedAt)
+		return runningForMs > startGraceMs ? 'stopped' : 'running'
 	}
 	async function probe(app) {
 		const asked = await askWeb(app)
@@ -1023,7 +2026,7 @@ export function createApps({dataDir, home = os.homedir(), webPort = 7780, run = 
 		// Read the stores once after start, in the background, so installed apps get any listing changes.
 		if (!registryCache && !registryWarm) registryWarm = registry().catch(() => {}).finally(() => (registryWarm = null))
 		const live = await liveStates()
-		return state.apps.map((a) => {
+		const local = state.apps.map((a) => {
 			const b = busy.get(a.id)
 			return {
 				id: a.id,
@@ -1041,10 +2044,17 @@ export function createApps({dataDir, home = os.homedir(), webPort = 7780, run = 
 				...(a.state === 'error' ? {error: a.error} : {}),
 				credentials: (() => {
 					const password = a.deterministicPassword ? appPassword(a.id) : a.defaultPassword
-					return {defaultUsername: a.defaultUsername, defaultPassword: password, showBeforeOpen: !!password}
+					const apiToken = a.store === PUBLISHED_STORE && !!password && (a.openPorts?.length ?? 0) > 0
+					return {defaultUsername: a.defaultUsername, defaultPassword: password, showBeforeOpen: !!password, ...(apiToken ? {label: 'API token'} : {})}
 				})(),
+				...(a.store === PUBLISHED_STORE && a.openPorts?.[0] ? {apiPort: a.openPorts[0]} : {}),
+				computerId: 'server',
+				...(a.oidc?.enabled ? {oidc: {enabled: true, mode: a.oidc.mode}} : {}),
 			}
 		})
+		const remote = await remoteApps().catch(() => [])
+		const elsewhere = (Array.isArray(remote) ? remote : []).filter((a) => a && a.id && a.computerId && a.computerId !== 'server')
+		return [...local, ...elsewhere]
 	}
 	const findInstalled = (id) => {
 		const a = state.apps.find((x) => x.id === id)
@@ -1081,6 +2091,30 @@ export function createApps({dataDir, home = os.homedir(), webPort = 7780, run = 
 		await writeFile(file, YAML.stringify(doc), {mode: 0o600})
 		await run('docker-compose', ['-p', 'omarchy-tor', '-f', file, 'up', '-d'], {env: engineEnv, cwd: dir})
 	}
+	// The prepared compose file may already have the address filled in. The store file still names the variable.
+	async function composeMentionsTor(dir) {
+		for (const name of ['compose.omarchy.yml', ...COMPOSE_FILES]) {
+			const text = await readFile(join(dir, name), 'utf8').catch(() => '')
+			if (/\$\{?TOR_PROXY_IP\b/.test(text) || text.includes(TOR_PROXY_IP)) return true
+		}
+		return false
+	}
+	// `exceptId` is the app being removed. Tor stops only when nothing still installed uses it.
+	async function stopTorIfIdle(exceptId) {
+		const dir = join(base, 'system', 'tor')
+		const file = join(dir, 'compose.yml')
+		if (!(await exists(file))) return
+		for (const other of state.apps) {
+			if (other.id === exceptId) continue
+			if (await composeMentionsTor(appDir(other.id))) return
+		}
+		// A second call (two uninstalls, or uninstallAll after the last app) must not fail once Tor is gone.
+		if (!(await exists(file))) return
+		await run('docker-compose', ['-p', 'omarchy-tor', '-f', file, 'down'], {env: engineEnv, cwd: dir}).catch(async (error) => {
+			if (await exists(file)) throw error
+		})
+		await rm(dir, {recursive: true, force: true})
+	}
 
 	// The store's files for an app, into its folder. On an update the folder already holds the app's
 	// data, owned by its container user: files the app keeps in those data folders are left as they
@@ -1089,7 +2123,16 @@ export function createApps({dataDir, home = os.homedir(), webPort = 7780, run = 
 	async function copyListing(src, app) {
 		const dir = appDir(app.id)
 		const fresh = !(await exists(dir))
-		const filter = (p) => !p.split('/').includes('.git')
+		// Listing-dir symlinks that point outside the listing (for example keys → ~/.ssh) must not
+		// be copied: Compose would bind the target, and chown would follow it.
+		const filter = async (p) => {
+			if (p.split('/').includes('.git')) return false
+			const st = await lstat(p).catch(() => null)
+			if (!st?.isSymbolicLink()) return true
+			const target = await realpath(p).catch(() => null)
+			const root = await realpath(src.folder).catch(() => src.folder)
+			return !!(target && under(target, root))
+		}
 		if (fresh) return cp(src.folder, dir, {recursive: true, filter})
 		const stage = await mkdtemp(join(base, `.update-${app.id}-`))
 		try {
@@ -1108,16 +2151,50 @@ export function createApps({dataDir, home = os.homedir(), webPort = 7780, run = 
 				if (!['EACCES', 'EPERM'].includes(error.code)) throw error
 				await run('podman', ['unshare', 'cp', '-rT', '--no-preserve=ownership', stage, dir], {env: engineEnv})
 			}
+			// cp never deletes. An old omarchy-compose.yml would keep winning over the new docker-compose.yml.
+			for (const name of ['omarchy-compose.yml', 'docker-compose.yml', 'exports.sh']) {
+				if (await exists(join(stage, name))) continue
+				const target = join(dir, name)
+				if (data.some((d) => target === d || target.startsWith(`${d}/`))) continue
+				await rm(target, {force: true})
+			}
 		} finally {
 			await rm(stage, {recursive: true, force: true}).catch(() => {})
 		}
 	}
 
-	function systemPortFor(app) {
-		const used = new Set(state.apps.filter((a) => a.id !== app.id).map((a) => a.internalPort))
-		let p = 20_000 + (parseInt(createHash('sha256').update(app.id).digest('hex').slice(0, 4), 16) % 9000)
-		while (used.has(p)) p++
-		return p
+	// Loopback ports already given to other apps, plus every app's public and view port
+	// (the gateway listens on those, so a private 127.0.0.1 bind cannot reuse the number).
+	function takenLoopbacks(exceptId) {
+		const used = new Set()
+		for (const other of state.apps) {
+			if (other.port) used.add(other.port)
+			if (other.viewPort) used.add(other.viewPort)
+			if (other.id === exceptId) continue
+			if (other.internalPort) used.add(other.internalPort)
+			if (other.mcpInternalPort) used.add(other.mcpInternalPort)
+		}
+		return used
+	}
+
+	// Own loopback ports stay put on update even while the container still holds them.
+	async function allocateLoopback(appId, used, keep = new Set()) {
+		const span = 9000
+		const base = 20_000
+		let p = base + (parseInt(createHash('sha256').update(String(appId)).digest('hex').slice(0, 4), 16) % span)
+		for (let n = 0; n < span; n++) {
+			if (!used.has(p) && (keep.has(p) || (await portFree(p)))) {
+				used.add(p)
+				return p
+			}
+			p = base + ((p - base + 1) % span)
+		}
+		throw new Error(`No free private port for ${appId}`)
+	}
+
+	async function systemPortFor(app) {
+		const keep = new Set([app.internalPort, app.mcpInternalPort].filter((p) => Number.isInteger(p)))
+		return allocateLoopback(app.id, takenLoopbacks(app.id), keep)
 	}
 
 	async function placeApp(src, app) {
@@ -1127,13 +2204,17 @@ export function createApps({dataDir, home = os.homedir(), webPort = 7780, run = 
 		app.exports = await runExports(app)
 		const c = await readYaml(dir, COMPOSE_FILES)
 		const text = await readFile(join(dir, c.name), 'utf8')
-		// Other apps' ports (an update keeps the app's own).
-		const used = new Set(state.apps.filter((a) => a.id !== app.id).map((a) => a.internalPort))
+		// Other apps' ports (an update keeps the app's own). A second call is the MCP loopback port.
+		const used = takenLoopbacks(app.id)
+		const keep = new Set([app.internalPort, app.mcpInternalPort].filter((p) => Number.isInteger(p)))
+		// Web and MCP each ask once. Reserve both before the synchronous compose rewrite.
+		const reserved = [await allocateLoopback(app.id, used, keep), await allocateLoopback(app.id, used, keep)]
+		let cursor = 0
 		const prepared = prepareCompose(app.id, text, () => {
-			let p = 20_000 + (parseInt(createHash('sha256').update(app.id).digest('hex').slice(0, 4), 16) % 9000)
-			while (used.has(p)) p++
+			const p = reserved[cursor++]
+			if (!Number.isInteger(p)) throw new Error(`No free private port for ${app.id}`)
 			return p
-		}, {shared: !!src.shared, vars: composeEnv(app), web: src.web ?? null})
+		}, {shared: !!src.shared, vars: composeEnv(app), web: src.web ?? null, mcp: src.mcp ?? null})
 		app.shared = !!src.shared
 		if (app.shared) await ensureSharedNetwork()
 		if (/\$\{?TOR_PROXY_IP\b/.test(text)) await ensureTor()
@@ -1141,17 +2222,36 @@ export function createApps({dataDir, home = os.homedir(), webPort = 7780, run = 
 		let finalText = prepared.text
 		if ((app.permissions ?? []).includes('containers')) {
 			const sock = engineEnv.DOCKER_HOST.replace(/^unix:\/\//, '')
-			const doc = YAML.parse(finalText)
-			for (const svc of Object.values(doc.services ?? {}))
-				svc.volumes = (svc.volumes ?? []).map((v) => (typeof v === 'string' && SOCKET.test(v.split(':')[0]) ? [sock, ...v.split(':').slice(1)].join(':') : v))
-			finalText = YAML.stringify(doc)
+			const edited = YAML.parseDocument(finalText)
+			if (edited.errors.length) throw edited.errors[0]
+			const services = edited.get('services')
+			if (YAML.isMap(services)) {
+				for (const pair of services.items) {
+					if (!YAML.isMap(pair.value)) continue
+					const volumes = pair.value.get('volumes')
+					if (!YAML.isSeq(volumes)) continue
+					for (const item of volumes.items) {
+						if (!YAML.isScalar(item) || typeof item.value !== 'string' || !SOCKET.test(item.value.split(':')[0])) continue
+						item.value = [sock, ...item.value.split(':').slice(1)].join(':')
+					}
+				}
+			}
+			finalText = emitCompose(edited)
 		}
+		if ((app.permissions ?? []).includes('publish')) finalText = await attachPublish(finalText, app)
 		// System ports (below 1024): only for apps you allowed; the helper lowers the limit once.
-		const low = appPermissions(finalText).find((p) => p.id === 'low-ports')
-		if (low && (app.permissions ?? []).includes('low-ports') && firewall?.lowPorts) await firewall.lowPorts(Math.min(...low.what.map(Number)))
+		// Expand with the env Compose will bind: the app .env, process env, and composeEnv (exports.sh).
+		const dotenv = parseDotEnv(await readFile(join(dir, '.env'), 'utf8').catch(() => ''))
+		const where = whereFor(app, dotenv)
+		const low = appPermissions(finalText, where).find((p) => p.id === 'low-ports')
+		const allowLow = (app.permissions ?? []).includes('low-ports')
+		if (low && !allowLow) finalText = dropLowPorts(finalText, where.expand)
+		else if (low && allowLow && firewall?.lowPorts) await firewall.lowPorts(Math.min(...low.what.map(Number)))
 		prepared.text = finalText
 		await writeFile(join(dir, 'compose.omarchy.yml'), prepared.text, {mode: 0o600})
 		await createBindSources(app, prepared.text)
+		if (prepared.mcpInternalPort) app.mcpInternalPort = prepared.mcpInternalPort
+		else delete app.mcpInternalPort
 		return prepared.internalPort
 	}
 
@@ -1161,19 +2261,93 @@ export function createApps({dataDir, home = os.homedir(), webPort = 7780, run = 
 
 	// The extra access a listing's compose file asks for.
 	// The folders an app may use without asking, and how its variables expand, for appPermissions.
-	function whereFor(app) {
+	function whereFor(app, dotenv = {}) {
 		// Before you place them, an app's folders count as its own (inside the app's folder).
-		const env = composeEnv({id: app.id, port: app.port, version: app.version, folderIds: (app.folders ?? []).map((f) => f.id)})
+		// After placing, `folders` is id → path and Compose will expand FOLDER_* to those paths.
+		const folderIds = app.folderIds ?? (Array.isArray(app.folders) ? app.folders.map((f) => f.id) : [])
+		const folders = app.folders && !Array.isArray(app.folders) ? app.folders : undefined
+		const env = composeEnv({id: app.id, port: app.port, version: app.version, folderIds, folders, exports: app.exports})
+		const merged = {...expandDotEnv(dotenv, {...process.env, ...env}), ...process.env, ...env}
 		return {
 			home,
-			expand: (v) => expandVars(String(v), env).replace(/^\.(?=\/|$)/, appDir(app.id)).replace(/^~(?=\/|$)/, home),
-			allowed: [appDir(app.id), join(base, 'shared-root'), ...Object.values(USER_DIRS).map((d) => join(home, d))],
+			cwd: appDir(app.id),
+			expand: (v) => expandVars(String(v), merged).replace(/^\.(?=\/|$)/, appDir(app.id)).replace(/^~(?=\/|$)/, home),
+			allowed: [appDir(app.id), join(base, 'shared-root'), ...Object.values(USER_DIRS).map((d) => join(home, d)), ...Object.values(folders ?? {})],
+		}
+	}
+	const publishPermission = () => ({id: 'publish', ...PERMISSIONS.publish, what: []})
+	// Same expansion placeApp uses, but in a throwaway copy so a review cannot write into the store.
+	async function listingExports(src) {
+		if (!(await exists(join(src.folder, 'exports.sh')))) return src.exports ?? {}
+		const stage = await mkdtemp(join(base, `.exports-${String(src.id).replace(/[^a-z0-9-]/gi, '') || 'app'}-`))
+		try {
+			const filter = async (p) => {
+				if (p.split('/').includes('.git')) return false
+				const st = await lstat(p).catch(() => null)
+				if (!st?.isSymbolicLink()) return true
+				const target = await realpath(p).catch(() => null)
+				const root = await realpath(src.folder).catch(() => src.folder)
+				return !!(target && under(target, root))
+			}
+			await cp(src.folder, stage, {recursive: true, filter})
+			return await runExports({
+				id: src.id,
+				port: src.port,
+				version: src.version,
+				folderIds: src.folderIds,
+				folders: src.folders && !Array.isArray(src.folders) ? src.folders : undefined,
+				ownSecretsOnly: true,
+			}, stage, {isolate: true})
+		} finally {
+			await rm(stage, {recursive: true, force: true}).catch(() => {})
 		}
 	}
 	async function permissionsOf(src) {
 		if (src.system) return systemApps?.permissions(src.id) ?? []
 		const c = await readYaml(src.folder, COMPOSE_FILES).catch(() => null)
-		return c ? appPermissions(await readFile(join(src.folder, c.name), 'utf8'), whereFor(src)) : []
+		if (!c) return src.publish === true ? [publishPermission()] : []
+		const dotenv = parseDotEnv(await readFile(join(src.folder, '.env'), 'utf8').catch(() => ''))
+		const exported = await listingExports(src)
+		const perms = appPermissions(await readFile(join(src.folder, c.name), 'utf8'), whereFor({...src, exports: {...(src.exports ?? {}), ...exported}}, dotenv))
+		if (src.publish === true && !perms.some((p) => p.id === 'publish')) perms.push(publishPermission())
+		return perms
+	}
+	// A studio that you allowed to publish gets the tool, the token, and a socket that serves only
+	// those two calls. The socket is not in the listing: the server adds it after you allow it.
+	async function attachPublish(text, app) {
+		const doc = YAML.parse(text) ?? {}
+		const env = composeEnv(app)
+		const expand = (v) => expandVars(String(v), {...process.env, ...env}).replace(/^~(?=\/|$)/, home)
+		const lines = []
+		const seen = new Set()
+		for (const svc of Object.values(doc.services ?? {})) {
+			if (!svc || typeof svc !== 'object') continue
+			for (const v of svc.volumes ?? []) {
+				if (typeof v !== 'string' || !v.includes(':')) continue
+				const parts = v.split(':')
+				if (parts.length >= 3 && /^(ro|rw|z|Z)$/.test(parts.at(-1))) parts.pop()
+				const dest = parts.pop()
+				const hostPath = bindHostPath(expand(parts.join(':')), {home, cwd: appDir(app.id)}).replace(/\/+$/, '')
+				const container = (expand(dest).replace(/\/+$/, '') || '/').replace(/\/+$/, '') || '/'
+				if (!container.startsWith('/') || container.split('/').includes('..')) continue
+				if (!under(hostPath, home) || hostPath === home) continue
+				if (/[\n\r\t]/.test(container) || /[\n\r\t]/.test(hostPath)) continue
+				if (hostPath.slice(home.length).split('/').some((part) => part.startsWith('.'))) continue
+				if (refusedMount(hostPath, home)) continue
+				const line = `${container}\t${hostPath}`
+				if (seen.has(line)) continue
+				seen.add(line)
+				lines.push(line)
+			}
+			svc.volumes = [...(svc.volumes ?? []), `${publishSock}:/run/omarchy/publish.sock`, `${publishTokenFile}:/run/omarchy/publish.token:ro`, `${join(appDir(app.id), 'publish.mounts')}:/run/omarchy/publish.mounts:ro`, `${PUBLISH_CLI}:/usr/local/bin/omarchy-publish:ro`]
+			const vars = {OMARCHY_PUBLISH_SOCK: '/run/omarchy/publish.sock', OMARCHY_PUBLISH_TOKEN: '/run/omarchy/publish.token', OMARCHY_PUBLISH_MOUNTS: '/run/omarchy/publish.mounts'}
+			if (Array.isArray(svc.environment)) {
+				svc.environment = svc.environment.filter((e) => !Object.keys(vars).some((k) => String(e).startsWith(`${k}=`)))
+				svc.environment.push(...Object.entries(vars).map(([k, val]) => `${k}=${val}`))
+			} else svc.environment = {...(svc.environment ?? {}), ...vars}
+		}
+		await writeFile(join(appDir(app.id), 'publish.mounts'), `${lines.join('\n')}${lines.length ? '\n' : ''}`, {mode: 0o644})
+		return YAML.stringify(doc)
 	}
 
 	// What installing `id` involves: the apps it needs that aren't installed yet, then the app.
@@ -1192,116 +2366,194 @@ export function createApps({dataDir, home = os.homedir(), webPort = 7780, run = 
 	}
 
 	async function install(input) {
-		await ready
+		const target = installTargetId(input?.target)
+		if (target === false) throw new RpcError('BAD_REQUEST', 'That computer can’t take this install.')
 		const id = String(input?.appId ?? '')
-		const failed = state.apps.find((a) => a.id === id && a.state === 'error')
-		if (failed) {
-			// A failed install: clear it away and start over.
-			if (await exists(join(appDir(id), 'compose.omarchy.yml'))) await compose(failed, 'down', '--remove-orphans').catch(() => {})
-			await removeAppDir(id)
-			state.apps = state.apps.filter((a) => a !== failed)
+		if (target) {
+			if (typeof forwardInstall !== 'function') throw new RpcError('PRECONDITION_FAILED', 'That computer can’t take this install yet.')
+			await ready
+			const plan = await installPlan(id)
+			const payload = []
+			for (const src of plan) {
+				if (src.system) throw new RpcError('PRECONDITION_FAILED', `${src.name} installs on this server only.`)
+				const file = src.folder ? await readFirst(src.folder, COMPOSE_FILES) : null
+				const compose = file?.text ?? ''
+				if (!compose || compose.length > 200_000 || compose.includes('\0')) throw new RpcError('PRECONDITION_FAILED', `${src.name} has no compose file this computer can install.`)
+				payload.push({appId: src.id, name: src.name, version: src.version ?? '', icon: src.icon ?? '', compose})
+			}
+			await forwardInstall(target, {apps: payload})
+			return true
+		}
+		// Marked before the first await so uninstall cannot pass the busy check while prechecks run.
+		const held = new Map()
+		let handedOff = false
+		const hold = (appId) => {
+			if (!appId || held.has(appId) || busy.has(appId)) return
+			const token = {state: 'installing', progress: 0}
+			busy.set(appId, token)
+			held.set(appId, token)
+		}
+		const releaseHeld = () => {
+			if (handedOff) return
+			for (const appId of held.keys()) busy.delete(appId)
+			held.clear()
+		}
+		hold(id)
+		try {
+		await ready
+		return await lock(`install:${id}`, async () => {
+			try {
+			hold(id)
+			if (stateDamaged) throw new RpcError('PRECONDITION_FAILED', 'apps.json is damaged and was left unchanged.')
+			// A failed install stays until the plan and the checks succeed. Deleting it first
+			// made a later port conflict look like the app was gone.
+			if (state.apps.some((a) => a.id === id && a.state !== 'error')) throw new RpcError('CONFLICT', 'That app is already installed')
+			const plan = await installPlan(id)
+			for (const src of plan) hold(src.id)
+			if (plan.some((src) => !src.system)) {
+				if (!(await engineAvailable())) throw new RpcError('PRECONDITION_FAILED', 'Apps need Podman. Run the installer again to add it.')
+				const h = await engineHealth({fresh: true})
+				if (!h.ok) throw new RpcError('PRECONDITION_FAILED', h.message)
+			}
+			if (plan.some((src) => src.system) && !systemApps) throw new RpcError('PRECONDITION_FAILED', 'This server can’t install system apps')
+			// Check every port first, so nothing starts installing if one of them can't.
+			const ports = new Set()
+			for (const src of plan) {
+				if (!src.port) continue
+				const refusal = portRefusal(src.name, src.port)
+				if (refusal) throw new RpcError('PRECONDITION_FAILED', refusal)
+				// Error-state apps are about to be replaced, so their recorded ports are not in use.
+				if (ports.has(src.port) || state.apps.some((a) => a.port === src.port && a.state !== 'error') || !(await portFree(src.port))) throw new RpcError('CONFLICT', `Port ${src.port} is already in use, so ${src.name} can’t be installed`)
+				ports.add(src.port)
+			}
+			// Folders you placed yourself (see folderChoices): checked, and made, before anything installs.
+			const placed = new Map()
+			for (const f of Array.isArray(input?.folders) ? input.folders : []) {
+				const src = plan.find((p) => p.id === f?.appId)
+				if (!src || !(src.folders ?? []).some((c) => c.id === f.id) || !f.path) continue
+				const path = String(f.path).replace(/\/+$/, '')
+				if (!folderAllowed(path, home)) throw new RpcError('BAD_REQUEST', `${src.name} can’t use ${path}: pick a folder inside your home folder (not a hidden one).`)
+				// The deepest part that already exists must really be there, not a link to somewhere else.
+				let probe = path
+				while (!(await exists(probe))) probe = probe.slice(0, probe.lastIndexOf('/')) || '/'
+				const real = await realpath(probe)
+				if (real !== probe && !folderAllowed(join(real, path.slice(probe.length)), home)) throw new RpcError('BAD_REQUEST', `${path} leads outside your home folder, so ${src.name} can’t use it.`)
+				if ((await exists(path)) && !(await stat(path)).isDirectory()) throw new RpcError('BAD_REQUEST', `${path} isn’t a folder.`)
+				placed.set(`${src.id}/${f.id}`, path)
+			}
+			for (const path of placed.values()) await mkdir(path, {recursive: true})
+			// Extra access: after folders are placed, so FOLDER_* is the path Compose will expand.
+			const granted = new Set(Array.isArray(input?.grant) ? input.grant.map(String) : [])
+			const needs = new Map()
+			for (const src of plan) {
+				const folderIds = (src.folders ?? []).map((f) => f.id)
+				const folders = Object.fromEntries(folderIds.filter((fid) => placed.has(`${src.id}/${fid}`)).map((fid) => [fid, placed.get(`${src.id}/${fid}`)]))
+				const perms = await permissionsOf({...src, folderIds, folders})
+				const refused = perms.find((p) => p.id === 'refused')
+				if (refused) throw new RpcError('FORBIDDEN', `${src.name} asks for folders this server never gives an app: ${refused.what.join(', ')}.`)
+				needs.set(src.id, perms.map((p) => p.id))
+			}
+			const missing = [...new Set([...needs.values()].flat())].filter((p) => !granted.has(p))
+			if (missing.length) throw new RpcError('PRECONDITION_FAILED', `Installing needs your permission: ${missing.map((p) => PERMISSIONS[p].label.toLowerCase()).join(', ')}.`)
+			// Checks passed: clear the failed app and failed dependencies the same way, then start over.
+			let cleared = false
+			for (const src of plan) {
+				const failed = state.apps.find((a) => a.id === src.id && a.state === 'error')
+				if (!failed) continue
+				if (await exists(join(appDir(src.id), 'compose.omarchy.yml'))) await compose(failed, 'down', '--remove-orphans').catch(() => {})
+				await removeAppDir(src.id)
+				await oidc?.removeAppClient(src.id).catch(() => {})
+				state.apps = state.apps.filter((a) => a !== failed)
+				cleared = true
+			}
+			if (cleared) await save()
+			const wantOidc = input?.oidc === true
+			const oidcIssuerHint = typeof input?.oidcIssuerUrl === 'string' ? input.oidcIssuerUrl.trim() : ''
+			// Every app in the plan shows as installing right away; they then install one after another.
+			const queued = plan.map((src) => {
+				const leftover = state.apps.find((a) => a.id === src.id && a.state === 'error')
+				if (leftover) state.apps = state.apps.filter((a) => a !== leftover)
+				const oidcSpec = wantOidc && src.id === id && !src.system ? resolveAppOidcSpec(src.id, src.manifestOidc) : null
+				const app = {id: src.id, name: src.name, version: src.version, icon: src.icon, port: src.port, path: src.path, defaultUsername: src.defaultUsername, defaultPassword: src.defaultPassword, deterministicPassword: src.deterministicPassword, ...(src.requiresHttps ? {requiresHttps: true} : {}), ...(src.web?.https ? {internalHttps: true} : {}), ...(src.openPorts?.length ? {openPorts: src.openPorts} : {}), ...(src.mcp ? {mcp: src.mcp} : {}), ...(src.manifestOidc ? {manifestOidc: src.manifestOidc} : {}), ...(oidcSpec ? {oidc: {enabled: true, mode: oidcSpec.mode}} : {}), ...(src.store ? {store: src.store} : {}), ...(src.implements?.length ? {implements: src.implements} : {}), ...(src.needs?.length ? {needs: src.needs} : {}), ...(src.folders?.length ? {folderIds: src.folders.map((f) => f.id), folders: Object.fromEntries(src.folders.filter((f) => placed.has(`${src.id}/${f.id}`)).map((f) => [f.id, placed.get(`${src.id}/${f.id}`)]))} : {}), installedAt: Date.now(), state: 'installing', permissions: needs.get(src.id) ?? [], ownSecretsOnly: true}
+				state.apps.push(app)
+				busy.set(app.id, {state: 'installing', progress: 0})
+				return {src, app}
+			})
 			await save()
-		}
-		if (state.apps.some((a) => a.id === id)) throw new RpcError('CONFLICT', 'That app is already installed')
-		const plan = await installPlan(id)
-		// Every extra access the apps ask for must be allowed explicitly, for this install.
-		const granted = new Set(Array.isArray(input?.grant) ? input.grant.map(String) : [])
-		const needs = new Map()
-		for (const src of plan) {
-			const perms = await permissionsOf(src)
-			const refused = perms.find((p) => p.id === 'refused')
-			if (refused) throw new RpcError('FORBIDDEN', `${src.name} asks for folders Omarchy Server never gives an app: ${refused.what.join(', ')}.`)
-			needs.set(src.id, perms.map((p) => p.id))
-		}
-		const missing = [...new Set([...needs.values()].flat())].filter((p) => !granted.has(p))
-		if (missing.length) throw new RpcError('PRECONDITION_FAILED', `Installing needs your permission: ${missing.map((p) => PERMISSIONS[p].label.toLowerCase()).join(', ')}.`)
-		if (plan.some((src) => !src.system) && !(await engineAvailable())) throw new RpcError('PRECONDITION_FAILED', 'Apps need Podman. Run the Omarchy Server installer again to add it.')
-		if (plan.some((src) => src.system) && !systemApps) throw new RpcError('PRECONDITION_FAILED', 'This server can’t install system apps')
-		// Check every port first, so nothing starts installing if one of them can't.
-		const ports = new Set()
-		for (const src of plan) {
-			if (!src.port) continue
-			if (src.port < 1024 || src.port > 65535 || RESERVED(src.port)) throw new RpcError('PRECONDITION_FAILED', `${src.name} wants port ${src.port}, which Omarchy Server keeps for itself`)
-			if (ports.has(src.port) || state.apps.some((a) => a.port === src.port) || !(await portFree(src.port))) throw new RpcError('CONFLICT', `Port ${src.port} is already in use, so ${src.name} can’t be installed`)
-			ports.add(src.port)
-		}
-		// Folders you placed yourself (see folderChoices): checked, and made, before anything installs.
-		const placed = new Map()
-		for (const f of Array.isArray(input?.folders) ? input.folders : []) {
-			const src = plan.find((p) => p.id === f?.appId)
-			if (!src || !(src.folders ?? []).some((c) => c.id === f.id) || !f.path) continue
-			const path = String(f.path).replace(/\/+$/, '')
-			if (!folderAllowed(path, home)) throw new RpcError('BAD_REQUEST', `${src.name} can’t use ${path}: pick a folder inside your home folder (not a hidden one).`)
-			// The deepest part that already exists must really be there, not a link to somewhere else.
-			let probe = path
-			while (!(await exists(probe))) probe = probe.slice(0, probe.lastIndexOf('/')) || '/'
-			const real = await realpath(probe)
-			if (real !== probe && !folderAllowed(join(real, path.slice(probe.length)), home)) throw new RpcError('BAD_REQUEST', `${path} leads outside your home folder, so ${src.name} can’t use it.`)
-			if ((await exists(path)) && !(await stat(path)).isDirectory()) throw new RpcError('BAD_REQUEST', `${path} isn’t a folder.`)
-			placed.set(`${src.id}/${f.id}`, path)
-		}
-		for (const path of placed.values()) await mkdir(path, {recursive: true})
-		// Every app in the plan shows as installing right away; they then install one after another.
-		const queued = plan.map((src) => {
-			const leftover = state.apps.find((a) => a.id === src.id && a.state === 'error')
-			if (leftover) state.apps = state.apps.filter((a) => a !== leftover)
-			const app = {id: src.id, name: src.name, version: src.version, icon: src.icon, port: src.port, path: src.path, defaultUsername: src.defaultUsername, defaultPassword: src.defaultPassword, deterministicPassword: src.deterministicPassword, ...(src.requiresHttps ? {requiresHttps: true} : {}), ...(src.web?.https ? {internalHttps: true} : {}), ...(src.openPorts?.length ? {openPorts: src.openPorts} : {}), ...(src.store ? {store: src.store} : {}), ...(src.implements?.length ? {implements: src.implements} : {}), ...(src.folders?.length ? {folderIds: src.folders.map((f) => f.id), folders: Object.fromEntries(src.folders.filter((f) => placed.has(`${src.id}/${f.id}`)).map((f) => [f.id, placed.get(`${src.id}/${f.id}`)]))} : {}), installedAt: Date.now(), state: 'installing', permissions: needs.get(src.id) ?? [], ownSecretsOnly: true}
-			state.apps.push(app)
-			busy.set(app.id, {state: 'installing', progress: 0})
-			return {src, app}
-		})
-		await save()
-		;(async () => {
-			let broken = null
-			for (const {src, app} of queued) {
-				if (broken) {
-					Object.assign(app, {state: 'error', error: `Couldn’t install ${broken}, which this app needs.`})
-					busy.delete(app.id)
-					continue
-				}
-				busy.set(app.id, {state: 'installing', progress: 5})
-				if (src.system) {
+			handedOff = true
+			held.clear()
+			;(async () => {
+				let broken = null
+				for (const {src, app} of queued) {
+					if (broken) {
+						Object.assign(app, {state: 'error', error: `Couldn’t install ${broken}, which this app needs.`})
+						busy.delete(app.id)
+						continue
+					}
+					busy.set(app.id, {state: 'installing', progress: 5})
+					if (src.system) {
+						try {
+							app.system = true
+							app.store = BUILTIN_STORE
+							app.internalPort = await systemPortFor(app)
+							busy.set(app.id, {state: 'installing', progress: 20})
+							await systemApps.install(app)
+							markStarted(app.id)
+							await openGateways(app)
+							delete app.state
+							delete app.error
+						} catch (error) {
+							Object.assign(app, {state: 'error', error: error.message})
+							broken = app.name
+						} finally {
+							busy.delete(app.id)
+							await save().catch(() => {})
+						}
+						continue
+					}
 					try {
-						app.system = true
-						app.store = BUILTIN_STORE
-						app.internalPort = systemPortFor(app)
-						busy.set(app.id, {state: 'installing', progress: 20})
-						await systemApps.install(app)
+						await sharedRoot()
+						app.internalPort = await placeApp(src, app)
+						if (app.oidc?.enabled) {
+							try {
+								await writeOidcOverlay(app, await resolveSpecForApp(app, src), {issuerHint: oidcIssuerHint})
+							} catch (oidcErr) {
+								console.error(`[omarchyd] oidc setup for ${app.id} failed:`, oidcErr?.message ?? oidcErr)
+								delete app.oidc
+								oidcRuntimeVars.delete(app.id)
+								await rm(oidcFile(app.id), {force: true}).catch(() => {})
+								await oidc?.removeAppClient(app.id).catch(() => {})
+							}
+						}
+						await prepareOwnership(app)
+						busy.set(app.id, {state: 'installing', progress: 15})
+						await pullApp(app)
+						busy.set(app.id, {state: 'installing', progress: 85})
+						await compose(app, 'up', '-d', '--remove-orphans')
 						markStarted(app.id)
 						await openGateways(app)
 						delete app.state
 						delete app.error
 					} catch (error) {
+						if (app.oidc?.enabled) await oidc?.removeAppClient(app.id).catch(() => {})
 						Object.assign(app, {state: 'error', error: error.message})
 						broken = app.name
 					} finally {
 						busy.delete(app.id)
 						await save().catch(() => {})
 					}
-					continue
 				}
-				try {
-					await sharedRoot()
-					app.internalPort = await placeApp(src, app)
-					await prepareOwnership(app)
-					busy.set(app.id, {state: 'installing', progress: 15})
-					await compose(app, 'pull')
-					busy.set(app.id, {state: 'installing', progress: 85})
-					await compose(app, 'up', '-d', '--remove-orphans')
-					markStarted(app.id)
-					await openGateways(app)
-					delete app.state
-					delete app.error
-				} catch (error) {
-					Object.assign(app, {state: 'error', error: error.message})
-					broken = app.name
-				} finally {
-					busy.delete(app.id)
-					await save().catch(() => {})
-				}
+			})()
+			return true
+			} catch (error) {
+				releaseHeld()
+				throw error
 			}
-		})()
-		return true
+		})
+		} catch (error) {
+			releaseHeld()
+			throw error
+		}
 	}
 
 	async function update(input) {
@@ -1309,35 +2561,98 @@ export function createApps({dataDir, home = os.homedir(), webPort = 7780, run = 
 		const app = findInstalled(String(input?.appId ?? ''))
 		if (app.system) throw new RpcError('PRECONDITION_FAILED', `${app.name} is updated with the rest of the system (Omarchy’s updates).`)
 		if (busy.has(app.id)) throw new RpcError('CONFLICT', `${app.name} is busy`)
-		const src = await findInRegistry(app.id)
-		if (!src) throw new RpcError('NOT_FOUND', 'That app is no longer in your stores')
-		// An update never adds access you didn't allow. (Apps installed before permissions existed keep what they run with.)
-		const wants = (await permissionsOf(src)).map((p) => p.id)
-		app.permissions ??= wants
-		const extra = wants.filter((p) => !app.permissions.includes(p) && !(Array.isArray(input?.grant) && input.grant.includes(p)))
-		if (extra.length) throw new RpcError('PRECONDITION_FAILED', `This update asks for more access (${extra.map((p) => PERMISSIONS[p].label.toLowerCase()).join(', ')}). Uninstall and install it again to allow that.`)
-		// Folders a newer listing lets you place start inside the app; the ones you placed stay put.
-		if (src.folders?.length) app.folderIds = [...new Set([...(app.folderIds ?? []), ...src.folders.map((f) => f.id)])]
+		busy.set(app.id, {state: 'updating', progress: 0})
+		let src
+		let wants
+		try {
+			src = await findInRegistry(app.id)
+			if (!src) throw new RpcError('NOT_FOUND', 'That app is no longer in your stores')
+			// An update never adds access you didn't allow. (Apps installed before permissions existed keep what they run with.)
+			const wantsPerms = await permissionsOf({...src, folderIds: app.folderIds, folders: app.folders && !Array.isArray(app.folders) ? app.folders : undefined})
+			const refused = wantsPerms.find((p) => p.id === 'refused')
+			if (refused) throw new RpcError('FORBIDDEN', `${src.name} asks for folders this server never gives an app: ${refused.what.join(', ')}.`)
+			wants = wantsPerms.map((p) => p.id)
+			app.permissions ??= wants
+			const extra = wants.filter((p) => !app.permissions.includes(p) && !(Array.isArray(input?.grant) && input.grant.includes(p)))
+			if (extra.length) throw new RpcError('PRECONDITION_FAILED', `This update asks for more access (${extra.map((p) => PERMISSIONS[p].label.toLowerCase()).join(', ')}). Uninstall and install it again to allow that.`)
+			for (const p of Array.isArray(input?.grant) ? input.grant.map(String) : []) if (wants.includes(p) && !app.permissions.includes(p)) app.permissions.push(p)
+			// Folders a newer listing lets you place start inside the app; the ones you placed stay put.
+			if (src.folders?.length) app.folderIds = [...new Set([...(app.folderIds ?? []), ...src.folders.map((f) => f.id)])]
+		} catch (error) {
+			busy.delete(app.id)
+			throw error
+		}
 		busy.set(app.id, {state: 'updating', progress: 10})
 		let step = 'getting its files ready'
+		// placeApp records the new loopback port before the new containers are up. Keep the old one if that fails.
+		const previousMcpPort = app.mcpInternalPort
+		const composePath = join(appDir(app.id), 'compose.omarchy.yml')
+		const previousCompose = await readFile(composePath).catch(() => null)
+		const previousExports = app.exports
+		const usbPath = usbFile(app.id)
+		const previousUsb = await readFile(usbPath).catch(() => null)
+		const oidcPath = oidcFile(app.id)
+		const previousOidc = await readFile(oidcPath).catch(() => null)
+		let switched = false
+		let usbWritten = false
+		let oidcWritten = false
+		let wasStopped = false
 		try {
+			wasStopped = (await liveState(app)) === 'stopped'
 			const internalPort = await placeApp(src, app)
+			await writeUsbOverlay(app)
+			usbWritten = true
+			if (app.oidc?.enabled) {
+				await writeOidcOverlay(app, await resolveSpecForApp(app, src))
+				oidcWritten = true
+			}
 			await prepareOwnership(app)
 			step = 'downloading the new version'
 			busy.set(app.id, {state: 'updating', progress: 25})
 			// The old version keeps running (and stays reachable) while the new one downloads.
-			await compose(app, 'pull')
+			await pullApp(app)
 			step = 'starting the new version'
 			busy.set(app.id, {state: 'updating', progress: 85})
 			closeGateway(app.id)
 			app.internalPort = internalPort
-			await compose(app, 'up', '-d', '--remove-orphans')
-			markStarted(app.id)
+			switched = true
+			if (wasStopped) await compose(app, 'up', '--no-start', '--remove-orphans')
+			else {
+				await compose(app, 'up', '-d', '--remove-orphans')
+				markStarted(app.id)
+			}
 			app.permissions = [...new Set([...app.permissions, ...wants])]
+			const nextPorts = [...(src.openPorts ?? [])]
+			for (const p of app.openPorts ?? []) if (!nextPorts.includes(p)) await firewall?.close(p)
+			if (nextPorts.length) app.openPorts = nextPorts
+			else delete app.openPorts
 			Object.assign(app, {version: src.version, name: src.name, icon: src.icon, path: src.path, requiresHttps: src.requiresHttps || undefined, internalHttps: src.web?.https || undefined})
+			if (src.mcp) app.mcp = src.mcp
+			else delete app.mcp
+			if (src.manifestOidc) app.manifestOidc = src.manifestOidc
+			else delete app.manifestOidc
+			if (src.needs?.length) app.needs = src.needs
+			else delete app.needs
 			delete app.state
 			delete app.error
 		} catch (error) {
+			if (!switched) {
+				if (previousMcpPort) app.mcpInternalPort = previousMcpPort
+				else delete app.mcpInternalPort
+			}
+			// placeApp rewrites the compose file and exports before pull. Put them back if pull or up fails.
+			if (previousCompose) await writeFile(composePath, previousCompose, {mode: 0o600}).catch(() => {})
+			else await rm(composePath, {force: true}).catch(() => {})
+			if (usbWritten) {
+				if (previousUsb) await writeFile(usbPath, previousUsb, {mode: 0o600}).catch(() => {})
+				else await rm(usbPath, {force: true}).catch(() => {})
+			}
+			if (oidcWritten) {
+				if (previousOidc) await writeFile(oidcPath, previousOidc, {mode: 0o600}).catch(() => {})
+				else await rm(oidcPath, {force: true}).catch(() => {})
+			}
+			if (previousExports === undefined) delete app.exports
+			else app.exports = previousExports
 			if (error instanceof RpcError) throw error
 			console.error(`[omarchyd] updating ${app.id}:`, error)
 			const detail = String(error.message ?? error).replace(/\s+/g, ' ').trim().slice(-300)
@@ -1355,11 +2670,30 @@ export function createApps({dataDir, home = os.homedir(), webPort = 7780, run = 
 		await ready
 		const app = findInstalled(String(input?.appId ?? ''))
 		if (busy.has(app.id)) throw new RpcError('CONFLICT', `${app.name} is busy`)
+		const verb = {up: 'start', stop: 'stop', restart: 'restart'}[args[0]] ?? pending
 		busy.set(app.id, {state: pending})
 		try {
-			if (app.system) await systemApps[{up: 'start', stop: 'stop', restart: 'restart'}[args[0]]](app)
+			let pluggedIds = null
+			if (!app.system && (args[0] === 'up' || args[0] === 'restart')) {
+				pluggedIds = await writeUsbOverlay(app)
+				if (app.oidc?.enabled) await writeOidcOverlay(app, await resolveSpecForApp(app))
+			}
+			if (app.system) await systemApps[verb](app)
+			// `restart` leaves the running container on the old device list. Recreate so the overlay just written is what runs.
+			else if (args[0] === 'restart') await compose(app, 'up', '-d', '--force-recreate')
 			else await compose(app, ...args)
-			if (args[0] === 'up' || args[0] === 'restart') markStarted(app.id)
+			if (args[0] === 'up' || args[0] === 'restart') {
+				markStarted(app.id)
+				if (!app.system) {
+					app.usbApplied = pluggedIds ?? []
+					await save()
+				}
+			}
+		} catch (error) {
+			if (error instanceof RpcError) throw error
+			console.error(`[omarchyd] ${verb} ${app.id}:`, error)
+			const detail = String(error?.message ?? error).replace(/\s+/g, ' ').trim().slice(-300)
+			throw new RpcError('BAD_GATEWAY', `${app.name ?? app.id} couldn’t ${verb}: ${detail}`)
 		} finally {
 			busy.delete(app.id)
 		}
@@ -1369,28 +2703,45 @@ export function createApps({dataDir, home = os.homedir(), webPort = 7780, run = 
 	async function uninstall(input) {
 		await ready
 		const app = findInstalled(String(input?.appId ?? ''))
+		if (busy.has(app.id)) throw new RpcError('CONFLICT', `${app.name} is busy`)
+		busy.set(app.id, {state: 'uninstalling'})
+		try {
 		// Keep apps that other installed apps rely on (unless another app stands in for it).
 		const provides = [app.id, ...(app.implements ?? [])]
 		const users = []
 		for (const other of state.apps) {
 			if (other.id === app.id) continue
-			const src = await findInRegistry(other.id).catch(() => null)
-			const needs = (src?.needs ?? []).filter((n) => provides.includes(n))
+			const otherNeeds = Array.isArray(other.needs) ? other.needs : ((await findInRegistry(other.id).catch(() => null))?.needs ?? [])
+			const needs = otherNeeds.filter((n) => provides.includes(n))
 			if (needs.some((n) => !state.apps.some((a) => a.id !== app.id && a.state !== 'error' && (a.id === n || (a.implements ?? []).includes(n))))) users.push(other.name ?? other.id)
 		}
 		if (users.length) throw new RpcError('PRECONDITION_FAILED', `${users.join(', ')} ${users.length > 1 ? 'need' : 'needs'} ${app.name ?? app.id}. Uninstall ${users.length > 1 ? 'them' : 'it'} first.`)
-		busy.set(app.id, {state: 'uninstalling'})
-		try {
-			closeGateway(app.id)
-			if (app.port) await firewall?.close(app.port)
-			if (app.viewPort) await firewall?.close(app.viewPort)
-			for (const p of app.openPorts ?? []) await firewall?.close(p)
-			if (app.system) await systemApps?.uninstall(app)
-			if (await exists(join(appDir(app.id), 'compose.omarchy.yml'))) await compose(app, 'down', '--volumes', '--remove-orphans').catch(() => {})
-			await removeAppDir(app.id)
-			state.apps = state.apps.filter((a) => a.id !== app.id)
-			state.recent = state.recent.filter((r) => r !== app.id)
-			await save()
+			await afterUninstalls(async () => {
+				closeGateway(app.id)
+				if (app.port) await firewall?.close(app.port)
+				if (app.viewPort) await firewall?.close(app.viewPort)
+				for (const p of app.openPorts ?? []) await firewall?.close(p)
+				// A failed `down` (or a system uninstall) leaves the app in place so it can be retried.
+				try {
+					if (app.system) await systemApps?.uninstall(app)
+					if (await exists(join(appDir(app.id), 'compose.omarchy.yml'))) await compose(app, 'down', '--volumes', '--remove-orphans')
+				} catch (error) {
+					if (error instanceof RpcError) throw error
+					console.error(`[omarchyd] uninstalling ${app.id}:`, error)
+					const detail = String(error.message ?? error).replace(/\s+/g, ' ').trim().slice(-300)
+					throw new RpcError('BAD_GATEWAY', `Couldn’t uninstall ${app.name ?? app.id}: ${detail}`)
+				}
+				await removeAppDir(app.id)
+				oidcRuntimeVars.delete(app.id)
+				await oidc?.removeAppClient(app.id).catch(() => {})
+				state.apps = state.apps.filter((a) => a.id !== app.id)
+				state.recent = state.recent.filter((r) => r !== app.id)
+				await save()
+				// The sticks it had attached: their udev rules go too (as when a stick is detached).
+				await usbReleased?.(app.usbDevices ?? [])
+				// After this app is gone, so the other uninstall in a pair is not still counted.
+				await stopTorIfIdle(app.id)
+			})
 		} finally {
 			busy.delete(app.id)
 		}
@@ -1398,10 +2749,25 @@ export function createApps({dataDir, home = os.homedir(), webPort = 7780, run = 
 	}
 
 	async function updates() {
+		const stores = await registry()
+		const byId = new Map(stores.flatMap((s) => s.apps.map((a) => [a.id, a])))
 		const out = []
 		for (const a of state.apps) {
 			if (a.system) continue
-			const src = await findInRegistry(a.id).catch(() => null)
+			let src = null
+			if (a.store) {
+				const st = stores.find((x) => x.url.toLowerCase() === a.store.toLowerCase())
+				src = st?.apps.find((x) => x.id === a.id) ?? null
+			} else {
+				for (const st of stores) {
+					const hit = st.apps.find((x) => x.id === a.id && !x.web)
+					if (hit) {
+						src = hit
+						break
+					}
+				}
+				src ??= byId.get(a.id)
+			}
 			if (src?.version && a.version && src.version !== a.version) out.push({id: a.id, version: src.version})
 		}
 		return out
@@ -1457,13 +2823,264 @@ export function createApps({dataDir, home = os.homedir(), webPort = 7780, run = 
 		appUsage = {at: Date.now(), list: [...by].map(([id, u]) => ({id, ...u})), running: null}
 	}
 	function usage() {
-		if (!appUsage.running && Date.now() - appUsage.at > 5000) appUsage.running = measureApps().catch(() => (appUsage.running = null))
 		return appUsage.list
+	}
+	function refreshUsage() {
+		if (!appUsage.running) appUsage.running = measureApps().catch(() => (appUsage.running = null))
+	}
+
+	// Running installed apps that declared mcp:. Loopback only; never an openPort.
+	async function mcpTargets() {
+		await ready
+		const live = await liveStates()
+		const out = []
+		for (const a of state.apps) {
+			if (!a.mcp || !a.mcpInternalPort) continue
+			const b = busy.get(a.id)
+			const shown = b?.state ?? (a.state === 'error' ? 'unknown' : (live.get(a.id) ?? 'unknown'))
+			if (shown !== 'running' && shown !== 'ready') continue
+			const path = typeof a.mcp.path === 'string' && a.mcp.path.startsWith('/') ? a.mcp.path : `/${a.mcp.path ?? ''}`
+			out.push({appId: a.id, name: a.name, url: `http://127.0.0.1:${a.mcpInternalPort}${path}`, transport: a.mcp.transport, running: true})
+		}
+		return out
+	}
+
+	const assertOwner = (auth) => {
+		if (auth?.userId !== 'owner') throw new RpcError('FORBIDDEN', 'Only the server’s owner can publish apps')
+	}
+	// A bearer token from the publish file. It is not a sign-in: other procedures ignore it.
+	function authenticatePublish(req) {
+		const path = String(req?.url ?? '').split('?')[0]
+		if (!PUBLISH_RPC.has(path)) return null
+		const bearer = /^Bearer (\S+)$/.exec(req?.headers?.authorization ?? '')?.[1]
+		if (!bearer || !publishToken) return null
+		const got = Buffer.from(bearer)
+		const want = Buffer.from(publishToken)
+		if (got.length !== want.length || !timingSafeEqual(got, want)) return null
+		return {userId: 'owner', kind: 'publish'}
+	}
+	async function assertBinary(binary) {
+		const real = await realpath(String(binary ?? '')).catch(() => '')
+		if (!real) throw new RpcError('BAD_REQUEST', 'That binary isn’t there')
+		const homeReal = await realpath(home).catch(() => home)
+		const underHome = real === homeReal || real.startsWith(`${homeReal}/`)
+		const hidden = real.slice(homeReal.length).split('/').some((part) => part.startsWith('.'))
+		if (!underHome || hidden || refusedMount(real, homeReal)) throw new RpcError('BAD_REQUEST', 'The binary has to be a file inside your home folder')
+		const st = await stat(real)
+		if (!st.isFile()) throw new RpcError('BAD_REQUEST', 'The binary has to be a file inside your home folder')
+		if (st.size > 512 * 1024 * 1024) throw new RpcError('BAD_REQUEST', 'That binary is larger than 512 MB')
+		return real
+	}
+	// Files the published web page serves (a generated app's static/). Ordinary files only.
+	async function assertAssets(dir) {
+		const real = await realpath(String(dir ?? '')).catch(() => '')
+		if (!real) throw new RpcError('BAD_REQUEST', 'Those files aren’t there')
+		const homeReal = await realpath(home).catch(() => home)
+		const hidden = real.slice(homeReal.length).split('/').some((part) => part.startsWith('.'))
+		if (!(real === homeReal || real.startsWith(`${homeReal}/`)) || hidden || refusedMount(real, homeReal)) throw new RpcError('BAD_REQUEST', 'Those files have to be inside your home folder')
+		if (!(await stat(real)).isDirectory()) throw new RpcError('BAD_REQUEST', 'Those files have to be a folder')
+		const pending = [real]
+		let size = 0
+		while (pending.length) {
+			const dir = pending.pop()
+			for (const name of await readdir(dir)) {
+				if (name.startsWith('.')) throw new RpcError('BAD_REQUEST', 'Those files can’t include a hidden folder')
+				const path = join(dir, name)
+				const st = await lstat(path)
+				if (st.isSymbolicLink()) throw new RpcError('BAD_REQUEST', 'Those files can’t include a link')
+				if (st.isDirectory()) pending.push(path)
+				else if (st.isFile()) {
+					size += st.size
+					if (size > 64 * 1024 * 1024) throw new RpcError('BAD_REQUEST', 'Those files are larger than 64 MB')
+				} else throw new RpcError('BAD_REQUEST', 'Those files have to be ordinary files')
+			}
+		}
+		return real
+	}
+	// Wrap a release binary in a small image. The studio never gets the Podman socket.
+	// The image runs the proxy, not the binary: the token stays in the container's environment.
+	async function buildRuntimeImage(id, version, binary, ports, assets) {
+		const tag = `localhost/omarchy-published/${id}:${version}`
+		const context = await mkdtemp(join(os.tmpdir(), 'omarchy-publish-'))
+		try {
+			await cp(binary, join(context, 'app'))
+			await chmod(join(context, 'app'), 0o755)
+			await cp(API_PROXY, join(context, 'api-proxy'))
+			await chmod(join(context, 'api-proxy'), 0o755)
+			await cp(BIND_SHIM, join(context, 'bind-localhost.c'))
+			await cp(OMARCHY_SETUP, join(context, 'omarchy-setup.sh'))
+			if (assets) await cp(assets, join(context, 'static'), {recursive: true})
+			await writeFile(join(context, 'Containerfile'), runtimeContainerfile({...ports, assets: !!assets}))
+			await run('podman', ['build', '-f', join(context, 'Containerfile'), '-t', tag, context], {env: engineEnv, timeout: 30 * 60_000})
+		} finally {
+			await rm(context, {recursive: true, force: true})
+		}
+		return tag
+	}
+	async function waitInstalled(id) {
+		const end = Date.now() + 60_000
+		for (;;) {
+			const app = state.apps.find((a) => a.id === id)
+			if (app && app.state !== 'installing' && !busy.has(id)) {
+				if (app.state === 'error') throw new RpcError('BAD_GATEWAY', app.error || 'It didn’t install')
+				return app
+			}
+			if (Date.now() > end) throw new RpcError('BAD_GATEWAY', 'Installing took too long')
+			await new Promise((r) => setTimeout(r, 15))
+		}
+	}
+	async function publish(input, ctx) {
+		await ready
+		assertOwner(ctx?.auth)
+		const id = String(input?.appId ?? '')
+		if (!APP_ID.test(id)) throw new RpcError('BAD_REQUEST', 'Use a short lowercase id, such as field-service')
+		const name = String(input?.name ?? '').trim().slice(0, 80)
+		if (!name) throw new RpcError('BAD_REQUEST', 'Give the app a name')
+		const installed = state.apps.find((a) => a.id === id)
+		if (installed && installed.store !== PUBLISHED_STORE) throw new RpcError('CONFLICT', `${installed.name} is already installed from another store`)
+		// The port inside the app is the one other containers call. A later publish keeps it.
+		let previousWeb = null
+		if (installed) {
+			try {
+				const prev = YAML.parse(await readFile(join(storeDir(PUBLISHED_STORE), id, 'omarchy-app.yml'), 'utf8'))
+				const n = Number(prev?.web?.port)
+				if (Number.isInteger(n) && n >= 1 && n <= 65535) previousWeb = n
+			} catch { /* the listing is rewritten below */ }
+		}
+		const containerPort = input?.containerPort === undefined ? (previousWeb ?? 7860) : Number(input.containerPort)
+		if (!Number.isInteger(containerPort) || containerPort < 1 || containerPort > 65535) throw new RpcError('BAD_REQUEST', 'The app’s own port has to be from 1 to 65535')
+		if (installed && previousWeb !== null && containerPort !== previousWeb) throw new RpcError('PRECONDITION_FAILED', 'Unpublish it before changing the port inside the app')
+		const publicPort = input?.port === undefined ? (installed?.port ?? containerPort) : Number(input.port)
+		if (!Number.isInteger(publicPort) || publicPort < 1024 || publicPort > 65535 || RESERVED(publicPort)) throw new RpcError('BAD_REQUEST', 'Pick a port from 1024 up that this server doesn’t keep for itself')
+		if (installed && publicPort !== installed.port) throw new RpcError('PRECONDITION_FAILED', 'Unpublish it before changing its port')
+		const version = String(input?.version ?? installed?.version ?? '1').replace(/[^A-Za-z0-9_.-]/g, '').slice(0, 40) || '1'
+		let image = typeof input?.image === 'string' ? input.image.trim() : ''
+		const binary = input?.binary
+		if (binary && image) throw new RpcError('BAD_REQUEST', 'Pass a binary or an image, not both')
+		if (!binary && !image) throw new RpcError('BAD_REQUEST', 'Pass an image or a binary to publish')
+		let mcp = null
+		if (input?.mcp) {
+			mcp = parseMcp({...input.mcp, service: 'web'})
+			if (!mcp) throw new RpcError('BAD_REQUEST', 'MCP needs a port, a path starting with /, and transport http or sse')
+		}
+		// A binary gets a token and a second port. The web port stays behind sign-in. The API port
+		// is the one on the LAN and on the shared network, and it accepts only the token.
+		let apiHost = null
+		let apiContainerPort = null
+		let childPort = null
+		let apiToken = null
+		let assets = null
+		if (binary) {
+			const taken = new Set([publicPort])
+			for (const other of state.apps) {
+				if (other.id === id) continue
+				if (other.port) taken.add(other.port)
+				if (other.viewPort) taken.add(other.viewPort)
+				for (const p of other.openPorts ?? []) taken.add(p)
+			}
+			const previousApi = installed?.openPorts?.[0]
+			const avoidHost = new Set(taken)
+			if (mcp?.port) avoidHost.add(mcp.port)
+			apiHost = input?.apiPort === undefined ? (previousApi ?? nextHostPort(publicPort, avoidHost)) : Number(input.apiPort)
+			if (!Number.isInteger(apiHost) || apiHost < 1024 || apiHost > 65535 || RESERVED(apiHost)) throw new RpcError('BAD_REQUEST', 'Pick an API port from 1024 up that this server doesn’t keep for itself')
+			if (apiHost === publicPort) throw new RpcError('BAD_REQUEST', 'The job API needs its own port')
+			if (mcp?.port && apiHost === mcp.port) throw new RpcError('BAD_REQUEST', 'The job API can’t use the MCP port')
+			if (installed && previousApi !== undefined && apiHost !== previousApi) throw new RpcError('PRECONDITION_FAILED', 'Unpublish it before changing its API port')
+			if ((!installed || previousApi !== apiHost) && (taken.has(apiHost) || !(await portFree(apiHost)))) throw new RpcError('CONFLICT', `Port ${apiHost} is already in use`)
+			const avoid = new Set([containerPort])
+			if (mcp?.port) avoid.add(mcp.port)
+			apiContainerPort = bumpPort(containerPort >= 65535 ? 1 : containerPort + 1, avoid)
+			childPort = bumpPort(17860, new Set([...avoid, apiContainerPort]))
+			if (!apiContainerPort || !childPort) throw new RpcError('BAD_REQUEST', 'No free port inside the app')
+			apiToken = installed?.defaultPassword || randomBytes(32).toString('base64url')
+			if (input?.assets) assets = await assertAssets(input.assets)
+			image = await buildRuntimeImage(id, version, await assertBinary(binary), {webPort: containerPort, apiPort: apiContainerPort, childPort}, assets)
+		} else if (!IMAGE_REF.test(image) || image.includes('..')) throw new RpcError('BAD_REQUEST', 'That image name can’t be published')
+		const stores = await registry()
+		if (stores.some((s) => s.url !== PUBLISHED_STORE && s.apps.some((a) => a.id === id))) throw new RpcError('CONFLICT', `${id} is already in another store`)
+		const dir = storeDir(PUBLISHED_STORE)
+		const appDirListing = join(dir, id)
+		await mkdir(dir, {recursive: true, mode: 0o700})
+		await writeFile(join(dir, 'omarchy-app-store.yml'), 'id: published\nname: Published on this server\n')
+		await mkdir(appDirListing, {recursive: true})
+		const envId = id.toUpperCase().replace(/[^A-Z0-9]/g, '_')
+		const callPort = apiContainerPort ?? containerPort
+		const internalUrl = `http://${id}_web_1:${callPort}`
+		const listing = {
+			manifestVersion: 1,
+			id,
+			name,
+			tagline: String(input?.tagline ?? name).slice(0, 140),
+			category: typeof input?.category === 'string' && /^[a-z0-9-]{1,32}$/.test(input.category) ? input.category : 'developer',
+			version,
+			port: publicPort,
+			shared: true,
+			web: {service: 'web', port: containerPort},
+			developer: 'Published on this server',
+			...(apiToken ? {defaultPassword: apiToken} : {}),
+			...(apiHost ? {openPorts: [apiHost]} : {}),
+			description: String(input?.description ?? (apiToken
+				? `Published from an app on this server. Programs on this server call ${internalUrl} with the API token. On the local network that same token is required on port ${apiHost}. The web page stays behind sign-in.`
+				: `Published from an app on this server. Other apps on the shared network call ${internalUrl}.`)).slice(0, 2000),
+			...(mcp ? {mcp} : {}),
+		}
+		await writeFile(join(appDirListing, 'omarchy-app.yml'), YAML.stringify(listing))
+		const service = apiToken
+			? {
+				image,
+				restart: 'unless-stopped',
+				environment: {
+					WEB_PORT: String(containerPort),
+					API_PORT: String(apiContainerPort),
+					CHILD_PORT: String(childPort),
+					PORT: String(childPort),
+					OMARCHY_API_TOKEN: apiToken,
+					APP_GATEWAY_KEY: deriveEntropy(`app-${id}-gateway`),
+				},
+				ports: [`${containerPort}:${containerPort}`, `0.0.0.0:${apiHost}:${apiContainerPort}`],
+			}
+			: {
+				image,
+				restart: 'unless-stopped',
+				environment: {PORT: String(containerPort)},
+				ports: [`${containerPort}:${containerPort}`],
+			}
+		if (image.startsWith('localhost/')) service.pull_policy = 'never'
+		await writeFile(join(appDirListing, 'docker-compose.yml'), YAML.stringify({services: {web: service}}))
+		const exportsText = apiToken
+			? `export APP_${envId}_URL=${internalUrl}\nexport APP_${envId}_HOST=${id}_web_1\nexport APP_${envId}_PORT=${callPort}\nexport APP_${envId}_LAN_PORT=${apiHost}\nexport APP_${envId}_TOKEN='${apiToken}'\n`
+			: `export APP_${envId}_URL=${internalUrl}\nexport APP_${envId}_HOST=${id}_web_1\nexport APP_${envId}_PORT=${containerPort}\n`
+		await writeFile(join(appDirListing, 'exports.sh'), exportsText)
+		// update() keeps a password already on the app and does not copy one from the listing.
+		if (installed && apiToken && !installed.defaultPassword) installed.defaultPassword = apiToken
+		dropRegistry()
+		if (installed) await update({appId: id})
+		else {
+			await install({appId: id, grant: []})
+			await waitInstalled(id)
+		}
+		return {appId: id, name, image, version, store: PUBLISHED_STORE, url: internalUrl, port: publicPort, ...(apiToken ? {apiPort: apiHost, apiToken} : {}), updated: !!installed}
+	}
+	async function unpublish(input, ctx) {
+		await ready
+		assertOwner(ctx?.auth)
+		const id = String(input?.appId ?? '')
+		if (!APP_ID.test(id)) throw new RpcError('BAD_REQUEST', 'Use a short lowercase id, such as field-service')
+		const installed = state.apps.find((a) => a.id === id)
+		const listing = join(storeDir(PUBLISHED_STORE), id)
+		if (installed && installed.store !== PUBLISHED_STORE) throw new RpcError('PRECONDITION_FAILED', `${installed.name} did not come from the published store`)
+		if (!installed && !(await exists(listing))) throw new RpcError('NOT_FOUND', 'That app isn’t published')
+		if (installed) await uninstall({appId: id})
+		await rm(listing, {recursive: true, force: true})
+		dropRegistry()
+		return true
 	}
 
 	return {
 		ready,
 		usage,
+		refreshUsage,
+		mcpTargets,
 		shellFor,
 		checkSession,
 		issueSession,
@@ -1481,18 +3098,192 @@ export function createApps({dataDir, home = os.homedir(), webPort = 7780, run = 
 				for (const a of [...state.apps]) await uninstall({appId: a.id}).catch(() => {})
 				if (state.apps.length === before) break
 			}
+			// An app that failed to uninstall may still need Tor. Otherwise the proxy stops here too,
+			// including when a reset finds no apps left and the container is still up.
+			await stopTorIfIdle(null)
 			state.passGen = {}
 			await save()
 			return state.apps.length
 		},
 		close: () => {
+			publishServer?.close()
 			systemApps?.close()
 			secure.close()
 			for (const id of [...gateways.keys()]) closeGateway(id)
 		},
+		// For the Unraid importer: where its listings go, and installing one of them with the access its
+		// listing asks for (the owner reviewed each app before the import started). Folders My Own Data Center
+		// never gives an app stay refused.
+		importedStoreDir: storeDir(IMPORTED_STORE),
+		publishedStoreDir: storeDir(PUBLISHED_STORE),
+		publishSock,
+		// The publish token only authenticates apps.publish and apps.unpublish. Any other procedure
+		// still needs a real sign-in, so a studio container can't uninstall the rest of the server.
+		authenticatePublish,
+		appDirFor: (id) => appDir(id),
+		// An app whose install failed is not "here": it can be tried again.
+		installed: (id) => state.apps.some((a) => a.id === id && a.state !== 'error'),
+		// Removes a failed install (as a new install would) so an importer can copy data into a clean folder.
+		async clearFailed(id) {
+			await ready
+			if (state.apps.some((a) => a.id === id && a.state === 'error')) await uninstall({appId: id})
+		},
+		async installImported(id) {
+			dropRegistry()
+			const plan = await installPlan(id)
+			const grant = new Set()
+			for (const a of plan) for (const p of await permissionsOf({...a, folderIds: [], folders: {}})) grant.add(p.id)
+			if (grant.has('refused')) throw new RpcError('FORBIDDEN', 'It uses folders this server never gives an app')
+			await install({appId: id, grant: [...grant]})
+		},
+		importState(id) {
+			const a = state.apps.find((x) => x.id === id)
+			if (!a) return {done: true, error: 'It wasn’t installed'}
+			return {done: a.state !== 'installing' && !busy.has(id), error: a.state === 'error' ? a.error || 'It didn’t install' : null}
+		},
+		// For backups: installed container apps, where their files are, and whether each is running.
+		async backupTargets() {
+			await ready
+			const live = await liveStates().catch(() => new Map())
+			return state.apps
+				.filter((a) => !a.system && a.state !== 'installing' && a.state !== 'error')
+				.map((a) => ({id: a.id, name: a.name, dir: appDir(a.id), running: (live.get(a.id) ?? a.state) === 'running'}))
+		},
+		// Stop or start an app around a backup or restore (the same path as its Stop and Start buttons).
+		pauseForBackup: (id) => lifecycle(['stop'], 'stopping')({appId: id}),
+		resumeAfterBackup: (id) => lifecycle(['up', '-d'], 'starting')({appId: id}),
+		async usbBindings() {
+			await ready
+			const live = await liveStates().catch(() => new Map())
+			return state.apps.map((a) => ({
+				kind: 'app',
+				id: a.id,
+				name: a.name,
+				devices: a.usbDevices ?? [],
+				running: (live.get(a.id) ?? a.state) === 'running',
+				liveIds: Array.isArray(a.usbApplied) && a.usbApplied.length && (a.usbDevices ?? []).every((d) => a.usbApplied.includes(d.id)) && a.usbApplied.length === (a.usbDevices ?? []).length ? a.usbApplied : [],
+			}))
+		},
+		async bindUsb(id, rec) {
+			await ready
+			const app = findInstalled(id)
+			if (app.system) throw new RpcError('PRECONDITION_FAILED', `${app.name} runs on the server itself, not in a container.`)
+			if (!(app.usbDevices ?? []).some((d) => d.id === rec.id)) app.usbDevices = [...(app.usbDevices ?? []), rec]
+			await save()
+			return app
+		},
+		async unbindUsb(id, deviceId) {
+			await ready
+			const app = findInstalled(id)
+			app.usbDevices = (app.usbDevices ?? []).filter((d) => d.id !== deviceId)
+			await save()
+			return app
+		},
+		async resyncOidcClients() {
+			await ready
+			for (const app of state.apps) {
+				if (!app.oidc?.enabled || app.system || app.state === 'error' || busy.has(app.id)) continue
+				const spec = await resolveSpecForApp(app).catch(() => null)
+				if (!spec) continue
+				const path = oidcFile(app.id)
+				const before = await readFile(path, 'utf8').catch(() => '')
+				await writeOidcOverlay(app, spec).catch(() => {})
+				const after = await readFile(path, 'utf8').catch(() => '')
+				if (before !== after && !busy.has(app.id) && (await liveState(app).catch(() => 'stopped')) === 'running') {
+					await compose(app, 'up', '-d').catch((e) => console.error(`[omarchyd] oidc resync ${app.id}:`, e.message))
+				}
+			}
+		},
 		procedures: {
 			'apps.list': {kind: 'query', run: list},
 			'apps.install': {kind: 'mutation', run: install},
+			'apps.oidcStatus': {
+				kind: 'query',
+				run: async (input) => {
+					await ready
+					const app = findInstalled(String(input?.appId ?? ''))
+					if (app.system || !oidc) return {supported: false, enabled: false}
+					const spec = await resolveSpecForApp(app)
+					if (!spec) return {supported: false, enabled: false}
+					const managed = await oidc.getAppClient(app.id)
+					const issuerUrl = await effectiveIssuerForApp()
+					return {
+						supported: true,
+						mode: spec.mode,
+						enabled: Boolean(app.oidc?.enabled && managed),
+						note: spec.note || '',
+						issuerUrl,
+						discoveryUrl: issuerUrl ? `${issuerUrl}/.well-known/openid-configuration` : '',
+						clientId: managed?.client.id ?? null,
+						clientSecret: null,
+						redirectUris: managed?.client.redirectUris ?? [],
+					}
+				},
+			},
+			'apps.setOidc': {
+				kind: 'mutation',
+				run: async (input) => {
+					await ready
+					const app = findInstalled(String(input?.appId ?? ''))
+					if (app.system) throw new RpcError('PRECONDITION_FAILED', `${app.name} doesn’t run in a container.`)
+					if (!oidc) throw new RpcError('PRECONDITION_FAILED', 'OIDC provider isn’t available on this server')
+					if (busy.has(app.id)) throw new RpcError('CONFLICT', `${app.name} is busy`)
+					const spec = await resolveSpecForApp(app)
+					if (!spec) throw new RpcError('PRECONDITION_FAILED', `${app.name} doesn’t have a My Own Data Center SSO integration`)
+					const enable = !!input?.enabled
+					const issuerHint = typeof input?.issuerUrl === 'string' ? input.issuerUrl.trim() : ''
+					const prevOidc = app.oidc ? {...app.oidc} : undefined
+					const prevOverlay = await readFile(oidcFile(app.id)).catch(() => null)
+					let createdFreshClient = false
+					let revealedSecret = null
+					busy.set(app.id, {state: 'restarting'})
+					try {
+						const wasRunning = (await liveState(app)) === 'running'
+						if (enable) {
+							const res = await writeOidcOverlay(app, spec, {issuerHint, forceEnabled: true})
+							createdFreshClient = Boolean(res?.created)
+							revealedSecret = res?.clientSecret ?? null
+							app.oidc = {enabled: true, mode: spec.mode}
+						} else {
+							delete app.oidc
+							oidcRuntimeVars.delete(app.id)
+							await rm(oidcFile(app.id), {force: true}).catch(() => {})
+							await oidc.removeAppClient(app.id)
+						}
+						await save()
+						if (wasRunning && (await exists(join(appDir(app.id), 'compose.omarchy.yml')))) {
+							await compose(app, 'up', '-d', '--force-recreate')
+							markStarted(app.id)
+						}
+					} catch (error) {
+						if (enable) {
+							if (prevOidc) app.oidc = prevOidc
+							else delete app.oidc
+							oidcRuntimeVars.delete(app.id)
+							if (prevOverlay) await writeAtomic(oidcFile(app.id), prevOverlay, {mode: 0o600}).catch(() => {})
+							else await rm(oidcFile(app.id), {force: true}).catch(() => {})
+							if (createdFreshClient) await oidc.removeAppClient(app.id).catch(() => {})
+							await save().catch(() => {})
+						}
+						throw error
+					} finally {
+						busy.delete(app.id)
+					}
+					const managed = enable ? await oidc.getAppClient(app.id) : null
+					const issuerUrl = await effectiveIssuerForApp(issuerHint)
+					return {
+						supported: true,
+						mode: spec.mode,
+						enabled: enable,
+						note: spec.note || '',
+						issuerUrl,
+						discoveryUrl: issuerUrl ? `${issuerUrl}/.well-known/openid-configuration` : '',
+						clientId: managed?.client.id ?? null,
+						clientSecret: enable ? revealedSecret : null,
+						redirectUris: managed?.client.redirectUris ?? [],
+					}
+				},
+			},
 			'apps.installReview': {
 				kind: 'query',
 				run: async (input) => {
@@ -1500,13 +3291,30 @@ export function createApps({dataDir, home = os.homedir(), webPort = 7780, run = 
 					const also = plan.slice(0, -1).map((a) => ({id: a.id, name: a.name, icon: a.icon}))
 					// Extra access, per app in the plan (shown for you to allow before installing).
 					const access = []
-					for (const a of plan) for (const p of await permissionsOf(a)) access.push({...p, appId: a.id, appName: a.name})
+					for (const a of plan) {
+						const chosen = folderChoices(a.folders)
+						const folderIds = chosen.map((f) => f.id)
+						const folders = Object.fromEntries(chosen.map((f) => [f.id, join(home, f.suggest || f.id)]))
+						for (const p of await permissionsOf({...a, folderIds, folders})) access.push({...p, appId: a.id, appName: a.name})
+					}
 					// System apps that need a one-time step from you first (see system-apps.mjs).
 					const setup = []
 					for (const a of plan) if (a.system && systemApps?.setup) { const s = await systemApps.setup(a.id); if (s) setup.push({...s, appId: a.id, appName: a.name}) }
 					// Folders it lets you place: inside the app, or a folder of yours (suggested under your home).
 					const folders = plan.flatMap((a) => (a.folders ?? []).map((f) => ({...f, appId: a.id, appName: a.name, suggest: f.suggest ? join(home, f.suggest) : null})))
-					return {requiredFolders: [], gpuAccess: false, alsoInstalls: also, permissions: access, setup, folders, home}
+					const target = plan.at(-1)
+					const oidcSpec = oidc && target && !target.system ? resolveAppOidcSpec(target.id, target.manifestOidc) : null
+					const oidcStatus = oidcSpec ? await oidc.procedures['oidc.status'].run().catch(() => null) : null
+					const oidcInfo = oidcSpec
+						? {
+								supported: true,
+								mode: oidcSpec.mode,
+								note: oidcSpec.note || '',
+								issuerUrl: oidcStatus?.issuerUrl || '',
+								defaultOn: oidcSpec.mode === 'auto',
+							}
+						: null
+					return {requiredFolders: [], gpuAccess: false, alsoInstalls: also, permissions: access, setup, folders, home, ...(oidcInfo ? {oidc: oidcInfo} : {})}
 				},
 			},
 			'apps.uninstall': {kind: 'mutation', run: uninstall},
@@ -1514,6 +3322,8 @@ export function createApps({dataDir, home = os.homedir(), webPort = 7780, run = 
 			'apps.stop': {kind: 'mutation', run: lifecycle(['stop'], 'stopping')},
 			'apps.restart': {kind: 'mutation', run: lifecycle(['restart'], 'restarting')},
 			'apps.update': {kind: 'mutation', run: update},
+			'apps.publish': {kind: 'mutation', run: publish},
+			'apps.unpublish': {kind: 'mutation', run: unpublish},
 			'apps.updates': {kind: 'query', run: updates},
 			'apps.logs': {
 				kind: 'query',
@@ -1550,35 +3360,61 @@ export function createApps({dataDir, home = os.homedir(), webPort = 7780, run = 
 					return {ticket: t, port, path: app.path ?? ''}
 				},
 			},
-			'appStore.registry': {kind: 'query', run: async () => (await registry()).map(({url, meta, apps}) => ({url, meta, apps: apps.map(({folder, ...a}) => a)}))},
+			'appStore.registry': {kind: 'query', run: async () => (await registry()).map(({url, meta, apps}) => ({url, meta, apps: apps.map(toList)}))},
+			'appStore.app': {
+				kind: 'query',
+				run: async (input) => {
+					const src = await findInRegistry(String(input?.appId ?? ''))
+					if (!src) throw new RpcError('NOT_FOUND', 'That app isn’t in your stores')
+					const a = toDetail(src)
+					if (!Array.isArray(a.permissions)) a.permissions = (await permissionsOf(src)).map((p) => p.id)
+					return a
+				},
+			},
 			// "Check for new apps": download every store's latest listings now instead of waiting for the hourly check.
 			'appStore.refresh': {kind: 'mutation', run: async () => ((await registry({refresh: true})).reduce((n, s) => n + s.apps.length, 0))},
-			'appStore.repositories': {kind: 'query', run: async () => (await ready, state.stores.map(({url, meta, name}) => ({url, meta: meta ?? {id: url, name: name ?? url.split('/').pop()}})))},
+			'appStore.repositories': {
+				kind: 'query',
+				run: async () => {
+					await ready
+					const localDefault = defaultStores.find((d) => /^file:\/\//.test(d.url))
+					const localNorm = localDefault ? normalize(localDefault.url).toLowerCase() : null
+					return state.stores.map(({url, meta, name, localDefault: isLocal}) => ({
+						url,
+						meta: meta ?? {id: url, name: name ?? url.split('/').pop()},
+						...(isLocal || (localNorm && url.toLowerCase() === localNorm) ? {replaces: DEFAULT_STORES[0].url} : {}),
+					}))
+				},
+			},
 			'appStore.addRepository': {
 				kind: 'mutation',
 				run: async (input) => {
 					await ready
-					const url = normalize(input?.url)
+					const localDefault = defaultStores.find((d) => /^file:\/\//.test(d.url))
+					let url = normalize(input?.url)
+					if (localDefault && isGithubAppStore(url)) url = normalize(localDefault.url)
 					checkUrl(url)
-					if (state.stores.some((s) => s.url.toLowerCase() === url.toLowerCase())) throw new RpcError('CONFLICT', 'That store is already added')
-					try {
-						await rm(storeDir(url), {recursive: true, force: true})
-						await syncStore(url)
-					} catch {
-						await rm(storeDir(url), {recursive: true, force: true})
-						throw new RpcError('BAD_REQUEST', 'Couldn’t download that store. Check the address and that the repository is public.')
-					}
-					let loaded
-					try {
-						loaded = await loadStore(url)
-					} catch (e) {
-						await rm(storeDir(url), {recursive: true, force: true})
-						throw e
-					}
-					state.stores.push({url, meta: loaded.meta, syncedAt: Date.now()})
-					registryCache = null
-					await save()
-					return true
+					return lock(`store:${url.toLowerCase()}`, async () => {
+						if (state.stores.some((s) => s.url.toLowerCase() === url.toLowerCase())) throw new RpcError('CONFLICT', 'That store is already added')
+						try {
+							await rm(storeDir(url), {recursive: true, force: true})
+							await syncStore(url)
+						} catch {
+							await rm(storeDir(url), {recursive: true, force: true})
+							throw new RpcError('BAD_REQUEST', 'Couldn’t download that store. Check the address and that the repository is public.')
+						}
+						let loaded
+						try {
+							loaded = await loadStore(url)
+						} catch (e) {
+							await rm(storeDir(url), {recursive: true, force: true})
+							throw e
+						}
+						state.stores.push({url, meta: loaded.meta, syncedAt: Date.now(), ...(localDefault && url.toLowerCase() === normalize(localDefault.url).toLowerCase() ? {localDefault: true} : {})})
+						dropRegistry()
+						await save()
+						return true
+					})
 				},
 			},
 			'appStore.removeRepository': {
@@ -1590,7 +3426,7 @@ export function createApps({dataDir, home = os.homedir(), webPort = 7780, run = 
 					if (!s) throw new RpcError('NOT_FOUND', 'That store isn’t added')
 					state.stores = state.stores.filter((x) => x !== s)
 					await rm(storeDir(s.url), {recursive: true, force: true})
-					registryCache = null
+					dropRegistry()
 					await save()
 					return true
 				},

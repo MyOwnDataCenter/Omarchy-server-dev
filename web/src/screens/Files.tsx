@@ -1,7 +1,11 @@
 // Files: the server as a NAS. Browse, preview, upload, download, organise, share on the network.
 import {
-  Fragment,
+  lazy,
+  memo,
+  Suspense,
+  useCallback,
   useEffect,
+  useId,
   useMemo,
   useRef,
   useState,
@@ -17,18 +21,40 @@ import {
   type FileEntry,
   type Listing,
   type SmbShare,
-  diskPct,
+  diskAll,
 } from "../api";
-import { useBootstrap, useDisk, useUser } from "../data";
+import { useBootstrap, useDisk, useMachines, useUser } from "../data";
+import { ComputerFolder } from "../fleet/ComputerFolder";
+import { FittingCrumbs } from "../fleet/FittingCrumbs";
+import { computerPlacePath, filePlaces, filesParent, parseComputerPlace, parseGuestPlace, scopeRoot, SERVER_FILES, withinScope, type FilesScope } from "../fleet/filePlaces";
+import { fileClipInput } from "../clips/view";
+import { NuEntries, type NuItem } from "../fleet/NuEntries";
+import { queryProblem, useBrowserOnline } from "../connection";
 import { Icon, type IconName } from "../icons";
-import { Sheet, SheetHeader, bytes, haptic, useConfirm, usePortalRoot, useToast } from "../ui";
+import { Card, CardHead, Sheet, SheetHeader, bytes, haptic, scrollPhoneToTop, useConfirm, usePortalRoot, useToast } from "../ui";
 import { SearchField } from "./Apps";
 import { useDesktop } from "../desktop/Desktop";
-import { FileViewer } from "./viewer/FileViewer";
+import { canQuickTransfer, QuickTransferSheet, type TransferTarget } from "./QuickTransfer";
 import { openTerminalWith } from "../terminalEvent";
+import { safeLocal, safeSession } from "../safeStorage";
+import { MachineTrees, TreeChildren, type TreeActions, type TreeMachine } from "../fleet/FileTree";
+import { actionsForItems, asFileSearch, batchToast, copyTextOrToast, FILES_LIST_PAGE, filesListMoreLeft, filesPathToStore, nice, offersDownload, readStoredFilesPath, searchMatchNote, selectionAfterQuery, viewerAfterPathChange, type BatchKind } from "./filesRules";
+import { canSubmitNamePrompt, collectUploadDirs, type DirectoryHandleLike, emptyFolderUploadHint, type FavoriteItem, favoritePath, fileKindLabel, filesSearching, filterUnsyncedPhotos, photosAlreadyThere, folderPickerRoots, handleFileDragEnter, handleFileDragOver, handleFileDrop, isServedFilePlace, pickDirectoryFromWindow, readDirectoryHandle, readDroppedEntries, reduceUploadMkdir, sharePasswordAction, sharePasswordLabel, shouldActivateRowOnKey, showFolderEmpty, UPLOAD_REFRESH_KEYS, uploadRelBlocked, type UploadBatch, type UploadMkdirState } from "../filesHelpers";
+
+const FileViewer = lazy(() =>
+  import("./viewer/FileViewer").then((m) => ({ default: m.FileViewer })),
+);
 
 // ---- helpers --------------------------------------------------------------------
 const isDir = (f: FileEntry) => f.type === "directory";
+function folderOf(filePath: string): string {
+  const i = filePath.lastIndexOf("/");
+  if (i <= 0) return "/Home";
+  return filePath.slice(0, i);
+}
+// A pipe or socket is not a file. serveFile refuses it; the row must not offer Download or View.
+const offersFile = (f: FileEntry) =>
+  (f.operations as readonly string[]).includes("download");
 const enc = encodeURIComponent;
 export const viewUrl = (path: string) => `/api/files/view?path=${enc(path)}`;
 export const downloadUrl = (paths: string[]) =>
@@ -41,6 +67,50 @@ const parentOf = (p: string) => p.slice(0, p.lastIndexOf("/")) || "/";
 const baseName = (p: string) => p.slice(p.lastIndexOf("/") + 1);
 const ext = (name: string) =>
   name.includes(".") ? name.slice(name.lastIndexOf(".") + 1).toLowerCase() : "";
+
+function Shelf({title, empty, rows}: {title: string; empty: string; rows: {key: string; name: string; sub: string; favorite: boolean; onOpenLocation: () => void; onOpen?: () => void; onFavorite: () => void}[]}) {
+  return (
+    <details className="nu-recent">
+      <summary>
+        <Icon name="chevron" size={16} className="chev" />
+        {title}
+      </summary>
+      <div className="nu-recent-body">
+        {rows.length === 0 ? (
+          <p className="quiet">{empty}</p>
+        ) : (
+          <ul>
+            {rows.map((row) => (
+              <li key={row.key}>
+                <div className="nu-recent-row">
+                  <div className="nu-recent-meta">
+                    <b>{row.name}</b>
+                    <span>{row.sub}</span>
+                  </div>
+                  <div className="nu-recent-actions">
+                    <button type="button" aria-pressed={row.favorite} aria-label={row.favorite ? `Unfavorite ${row.name}` : `Favorite ${row.name}`} onClick={row.onFavorite}>
+                      <Icon name={row.favorite ? "star-filled" : "star"} size={16} />
+                    </button>
+                    <button type="button" onClick={row.onOpenLocation}>
+                      <Icon name="folder" size={16} />
+                      Open Location
+                    </button>
+                    {row.onOpen && (
+                      <button type="button" onClick={row.onOpen}>
+                        <Icon name="file" size={16} />
+                        Open
+                      </button>
+                    )}
+                  </div>
+                </div>
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+    </details>
+  );
+}
 
 type Kind =
   | "folder"
@@ -133,14 +203,6 @@ const ago = (t: number) => {
         : "numeric",
   });
 };
-const nice = (msg: string) =>
-  ({
-    "[destination-already-exists]": "Something with that name is already there",
-    "[does-not-exist]": "That item no longer exists",
-    "[subdir-of-self]": "A folder can’t go inside itself",
-    "[operation-not-allowed]": "That isn’t allowed here",
-  })[msg] ?? msg.replace(/^\[|\]$/g, "").replace(/-/g, " ");
-
 const PLACE_NAMES: Record<string, string> = {
   "/Home": "Home",
   "/Apps": "App data",
@@ -153,6 +215,12 @@ const PLACE_NAMES: Record<string, string> = {
 // Photos synced from your phone or computer live here (a normal folder in Home).
 const PHOTOS = "/Home/Photos";
 const titleOf = (path: string) => PLACE_NAMES[path] ?? baseName(path);
+const pickerTitle = (dir: string, places: {path: string; name: string}[]) => {
+  const place = places.find((p) => dir === p.path || dir.startsWith(`${p.path}/`));
+  if (place && dir === place.path) return place.name;
+  if (dir.startsWith("::")) return baseName(dir) || place?.name || "Folder";
+  return titleOf(dir);
+};
 
 function FileIcon({ f, size = 44 }: { f: FileEntry; size?: number }) {
   const [failed, setFailed] = useState(false);
@@ -183,15 +251,15 @@ function FileIcon({ f, size = 44 }: { f: FileEntry; size?: number }) {
 }
 
 // ---- data ---------------------------------------------------------------------------
-function useListing(path: string | null, sort: "name" | "modified" | "size") {
+function useListing(path: string | null, sort: "name" | "modified" | "size", limit?: number) {
   return useQuery({
-    queryKey: ["files.list", path, sort],
+    queryKey: ["files.list", path, sort, limit ?? 0],
     queryFn: () =>
       query<Listing>("files.list", {
         path,
         sortBy: sort,
         sortOrder: sort === "name" ? "ascending" : "descending",
-        limit: 2000,
+        ...(limit ? { limit } : {}),
       }),
     enabled: !!path && !path.startsWith("::"),
     refetchInterval: 15_000,
@@ -213,7 +281,11 @@ function useFileAction() {
       qc.invalidateQueries({ queryKey: ["files.list"] });
       qc.invalidateQueries({ queryKey: ["files.favorites"] });
       qc.invalidateQueries({ queryKey: ["files.recents"] });
+      qc.invalidateQueries({ queryKey: ["files.fleetRecents"] });
+      qc.invalidateQueries({ queryKey: ["swarm.files.list"] });
+      qc.invalidateQueries({ queryKey: ["swarm.files.recents"] });
       qc.invalidateQueries({ queryKey: ["files.shares"] });
+      qc.invalidateQueries({ queryKey: ["files.search"] });
     }
   };
 }
@@ -230,13 +302,81 @@ type Upload = {
 // An upload item: a file plus, for folder uploads, its path inside the dropped/picked folder.
 export type UploadItem = { file: File; rel?: string };
 
-function uploadOne(
+// Big files go up in pieces, so no single request is large: a Cloudflare Tunnel refuses one over
+// 100 MB (and other proxies have limits of their own), and a dropped connection costs one piece,
+// not the whole file. See uploadChunk in omarchyd/files.mjs.
+const UPLOAD_CHUNK = 8 * 1024 * 1024;
+
+type ChunkReply = { status: number; body: { received?: number; path?: string; error?: { code?: string; message?: string } } | null };
+function sendChunk(url: string, piece: Blob, onProgress: (loaded: number) => void): Promise<ChunkReply | null> {
+  return new Promise((resolve) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", url);
+    xhr.setRequestHeader("x-omarchy-server", "1");
+    xhr.setRequestHeader("content-type", "application/octet-stream");
+    xhr.upload.onprogress = (e) => onProgress(e.loaded);
+    xhr.onload = () => {
+      let body = null;
+      try {
+        body = JSON.parse(xhr.responseText);
+      } catch {
+        /* not JSON */
+      }
+      resolve({ status: xhr.status, body });
+    };
+    // No answer at all (the connection dropped): tried again.
+    xhr.onerror = () => resolve(null);
+    xhr.ontimeout = () => resolve(null);
+    xhr.timeout = 10 * 60 * 1000;
+    xhr.send(piece);
+  });
+}
+
+async function uploadInPieces(file: File, target: string, onProgress: (loaded: number) => void): Promise<void> {
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+  const id = Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+  const total = file.size;
+  let offset = 0;
+  let failures = 0;
+  let resumes = 0;
+  for (;;) {
+    const piece = file.slice(offset, Math.min(offset + UPLOAD_CHUNK, total));
+    const url = `/api/files/upload-chunk?path=${enc(target)}&collision=keep-both&id=${id}&offset=${offset}&total=${total}`;
+    const start = offset;
+    const r = await sendChunk(url, piece, (loaded) => onProgress(start + loaded));
+    if (r && r.status >= 200 && r.status < 300) {
+      offset = r.body?.received ?? offset + piece.size;
+      failures = 0;
+      onProgress(offset);
+      if (r.body?.path || offset >= total) return;
+      continue;
+    }
+    // The server has a different amount than this piece assumed: carry on from what it has.
+    if (r?.status === 409 && typeof r.body?.received === "number" && resumes < 20) {
+      offset = r.body.received;
+      resumes += 1;
+      continue;
+    }
+    // A real answer that isn't worth repeating (no space, not allowed, a name clash).
+    if (r && r.status >= 400 && r.status < 500 && r.status !== 408 && r.status !== 429) {
+      throw new Error(r.body?.error?.message ?? `Upload failed (${r.status})`);
+    }
+    if (r?.status === 507) throw new Error(r.body?.error?.message ?? "Not enough free space on your server");
+    failures += 1;
+    if (failures > 5) throw new Error(r ? (r.body?.error?.message ?? `Upload failed (${r.status})`) : "Connection lost");
+    await new Promise((res) => setTimeout(res, 1000 * failures));
+  }
+}
+
+export function uploadOne(
   item: UploadItem,
   dir: string,
   onProgress: (loaded: number) => void,
 ): Promise<void> {
+  const target = `${dir}/${item.rel ?? item.file.name}`;
+  if (item.file.size > UPLOAD_CHUNK) return uploadInPieces(item.file, target, onProgress);
   return new Promise((resolve, reject) => {
-    const target = `${dir}/${item.rel ?? item.file.name}`;
     const xhr = new XMLHttpRequest();
     xhr.open("POST", `/api/files/upload?path=${enc(target)}&collision=keep-both`);
     xhr.setRequestHeader("x-omarchy-server", "1");
@@ -260,36 +400,52 @@ function uploadOne(
 function useUploads(onDone: () => void) {
   const [uploads, setUploads] = useState<Upload[]>([]);
   const toast = useToast();
-  const start = async (input: FileList | File[] | UploadItem[], dir: string) => {
-    const items: UploadItem[] = Array.from(input as ArrayLike<File | UploadItem>).map((x) =>
+  const start = async (input: FileList | File[] | UploadItem[] | UploadBatch, dir: string) => {
+    const raw = "dirs" in input ? input.files : input;
+    const extraDirs = "dirs" in input ? input.dirs : [];
+    const items: UploadItem[] = Array.from(raw as ArrayLike<File | UploadItem>).map((x) =>
       x instanceof File
         ? { file: x, rel: (x as File & { webkitRelativePath?: string }).webkitRelativePath || undefined }
         : x,
     );
-    if (!items.length) return;
+    const dirs = collectUploadDirs(items, extraDirs);
+    if (!items.length && !dirs.length) return;
     haptic(8);
     const ids = items.map(() => Math.random());
-    setUploads((u) => [
-      ...u,
-      ...items.map((it, i) => ({
-        id: ids[i],
-        name: it.rel ?? it.file.name,
-        loaded: 0,
-        total: it.file.size,
-        state: "uploading" as const,
-      })),
-    ]);
+    if (items.length) {
+      setUploads((u) => [
+        ...u,
+        ...items.map((it, i) => ({
+          id: ids[i],
+          name: it.rel ?? it.file.name,
+          loaded: 0,
+          total: it.file.size,
+          state: "uploading" as const,
+        })),
+      ]);
+    }
     // Folder uploads: make the folders first (parents before children). One that already
-    // exists is fine: files land inside it, and name clashes keep both copies.
-    const dirs = [
-      ...new Set(
-        items.flatMap((it) => {
-          const parts = (it.rel ?? "").split("/").slice(0, -1);
-          return parts.map((_, i) => parts.slice(0, i + 1).join("/"));
-        }),
-      ),
-    ].sort((x, y) => x.split("/").length - y.split("/").length);
-    for (const d of dirs) await mutate("files.createDirectory", { path: `${dir}/${d}` }).catch(() => {});
+    // exists is fine. Any other mkdir error is shown once; files under that folder are not
+    // uploaded, so a permission error is not reported again as "no longer exists".
+    let mkdirState: UploadMkdirState = { failed: [], shown: false };
+    for (const d of dirs) {
+      if (mkdirState.failed.some((f) => d === f || d.startsWith(`${f}/`))) continue;
+      let message: string | null = null;
+      try {
+        await mutate("files.createDirectory", { path: `${dir}/${d}` });
+      } catch (e) {
+        message = (e as Error).message;
+      }
+      const step = reduceUploadMkdir(mkdirState, d, message);
+      mkdirState = { failed: step.failed, shown: step.shown };
+      if (step.toast) toast(`${d}: ${nice(step.toast)}`, true);
+    }
+    const dirFailed = mkdirState.failed.length > 0;
+    if (!items.length) {
+      onDone();
+      if (!dirFailed) toast(dirs.length === 1 ? "Folder created" : `${dirs.length} folders created`);
+      return;
+    }
     // Three at a time, so a folder of hundreds of files doesn't swamp the connection.
     let next = 0;
     let failed = 0;
@@ -297,6 +453,10 @@ function useUploads(onDone: () => void) {
       while (next < items.length) {
         const i = next++;
         const it = items[i];
+        if (uploadRelBlocked(it.rel, mkdirState.failed)) {
+          setUploads((u) => u.map((x) => (x.id === ids[i] ? { ...x, state: "error", error: "Skipped" } : x)));
+          continue;
+        }
         try {
           await uploadOne(it, dir, (loaded) =>
             setUploads((u) => u.map((x) => (x.id === ids[i] ? { ...x, loaded } : x))),
@@ -319,28 +479,12 @@ function useUploads(onDone: () => void) {
 }
 
 // Files and folders dropped from the computer. Folders are walked so their structure is kept.
-async function droppedItems(dt: DataTransfer): Promise<UploadItem[]> {
+async function droppedItems(dt: DataTransfer): Promise<UploadBatch> {
   const entries = [...dt.items]
     .map((i) => (i.kind === "file" ? (i as DataTransferItem & { webkitGetAsEntry?: () => FileSystemEntry | null }).webkitGetAsEntry?.() : null))
     .filter(Boolean) as FileSystemEntry[];
-  if (!entries.length) return [...dt.files].map((file) => ({ file }));
-  const out: UploadItem[] = [];
-  const walk = async (entry: FileSystemEntry, prefix: string): Promise<void> => {
-    if (entry.isFile) {
-      const file = await new Promise<File>((res, rej) => (entry as FileSystemFileEntry).file(res, rej));
-      out.push({ file, rel: prefix ? `${prefix}/${file.name}` : undefined });
-    } else if (entry.isDirectory) {
-      const reader = (entry as FileSystemDirectoryEntry).createReader();
-      const path = prefix ? `${prefix}/${entry.name}` : entry.name;
-      for (;;) {
-        const batch = await new Promise<FileSystemEntry[]>((res, rej) => reader.readEntries(res, rej));
-        if (!batch.length) break;
-        for (const child of batch) await walk(child, path);
-      }
-    }
-  };
-  for (const e of entries) await walk(e, "");
-  return out;
+  if (!entries.length) return { files: [...dt.files].map((file) => ({ file })), dirs: [] };
+  return readDroppedEntries(entries);
 }
 
 // ---- screen -----------------------------------------------------------------------------
@@ -352,7 +496,7 @@ type Place = {
   sub?: string;
 };
 
-export function Files({ initialPath }: { initialPath?: string } = {}) {
+export function Files({ initialPath, windowId, scope }: { initialPath?: string; windowId?: string; scope?: FilesScope } = {}) {
   const portalRoot = usePortalRoot();
   const boot = useBootstrap();
   const user = useUser();
@@ -361,14 +505,19 @@ export function Files({ initialPath }: { initialPath?: string } = {}) {
   const confirm = useConfirm();
   const act = useFileAction();
   const disk = useDisk();
-  const [path, setPath] = useState<string | null>(() =>
-    initialPath ?? sessionStorage.getItem("omarchy-server:files-path"),
-  );
+  const storageId = windowId ?? (scope ? `machine:${scope.kind === "computer" ? scope.id : "server"}` : undefined);
+  const [nav, setNav] = useState(() => {
+    const start = withinScope(scope, readStoredFilesPath(storageId, initialPath ?? (scope ? scopeRoot(scope) : undefined), (key) => safeSession.get(key)));
+    return {entries: [start] as (string | null)[], index: 0};
+  });
+  const path = nav.entries[nav.index] ?? null;
+  const [listLimit, setListLimit] = useState(FILES_LIST_PAGE);
   const [sort, setSort] = useState<"name" | "modified" | "size">("name");
   const [grid, setGrid] = useState(
-    () => localStorage.getItem("omarchy-server:files-grid") === "1",
+    () => safeLocal.get("omarchy-server:files-grid") === "1",
   );
   const [q, setQ] = useState("");
+  const searching = filesSearching(q);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [open, setOpen] = useState<FileEntry | null>(null);
   // The full-window viewer: the files you can step through, and where you started.
@@ -383,74 +532,196 @@ export function Files({ initialPath }: { initialPath?: string } = {}) {
   } | null>(null);
   // The folder whose network sharing is open (share it, or see and change how it's shared).
   const [shareFor, setShareFor] = useState<{ path: string; name: string } | null>(null);
+  // Quick transfer (desktop layout): a QR code for a phone, and the right-click menu on empty space.
+  const deskMode = !!useDesktop();
+  const [transfer, setTransfer] = useState<TransferTarget | null>(null);
+  const [blankMenu, setBlankMenu] = useState<{ x: number; y: number } | null>(null);
   const fileInput = useRef<HTMLInputElement>(null);
   const folderInput = useRef<HTMLInputElement>(null);
   const photoInput = useRef<HTMLInputElement>(null);
   const [dropping, setDropping] = useState(false);
   const dragDepth = useRef(0);
-  const refresh = () => qc.invalidateQueries({ queryKey: ["files.list"] });
+  const rowApi = useRef({
+    activate: (_f: FileEntry) => {},
+    download: (_paths: string[]) => {},
+    more: (_f: FileEntry) => {},
+    menu: (_f: FileEntry) => {},
+    long: (_f: FileEntry) => {},
+  });
+  const onRowActivate = useCallback((f: FileEntry) => rowApi.current.activate(f), []);
+  const onRowDownload = useCallback((f: FileEntry) => rowApi.current.download([f.path]), []);
+  const onRowMore = useCallback((f: FileEntry) => rowApi.current.more(f), []);
+  const onRowMenu = useCallback((f: FileEntry) => rowApi.current.menu(f), []);
+  const onRowLong = useCallback((f: FileEntry) => rowApi.current.long(f), []);
+  const [openFolders, setOpenFolders] = useState<Set<string>>(() => new Set());
+  const toggleFolder = useCallback((f: FileEntry) => {
+    haptic(5);
+    setOpenFolders((cur) => {
+      const next = new Set(cur);
+      if (next.has(f.path)) next.delete(f.path);
+      else next.add(f.path);
+      return next;
+    });
+  }, []);
+  const onRowEnter = useCallback((f: FileEntry) => rowApi.current.activate(f), []);
+  const refresh = () => {
+    for (const key of UPLOAD_REFRESH_KEYS) qc.invalidateQueries({ queryKey: [...key] });
+    qc.invalidateQueries({ queryKey: ["files.search"] });
+  };
   const { uploads, start: upload, clear: clearUploads } = useUploads(refresh);
 
   useEffect(() => {
-    if (path) sessionStorage.setItem("omarchy-server:files-path", path);
-    else sessionStorage.removeItem("omarchy-server:files-path");
+    const stored = filesPathToStore(storageId, path);
+    if (stored.value === null) safeSession.remove(stored.key);
+    else safeSession.set(stored.key, stored.value);
     setSelected(new Set());
-  }, [path]);
+    setOpenFolders(new Set());
+    setListLimit(FILES_LIST_PAGE);
+  }, [path, storageId]);
+  // A new search hides the previous rows, so a selection from that folder must not stay live.
+  // The same query (a folder refresh) keeps the selection.
+  const seenQuery = useRef(q);
+  useEffect(() => {
+    const previous = seenQuery.current;
+    seenQuery.current = q;
+    setSelected((current) => selectionAfterQuery(current, previous, q));
+  }, [q]);
 
-  const listing = useListing(path, sort);
+  const listing = useListing(path, sort, listLimit);
+  const searchPath =
+    path && (path === "/Home" || path === "/Trash" || path.startsWith("/Home/") || path.startsWith("/Trash/"))
+      ? path
+      : "/Home";
+  const owner = user.data != null && user.data.role !== "member";
   const recents = useQuery({
     queryKey: ["files.recents"],
     queryFn: () => query<FileEntry[]>("files.recents"),
-    enabled: path === null || path === "::recents",
+    enabled: scope?.kind === "server" || (!scope && !owner),
+  });
+  const fleetRecents = useQuery({
+    queryKey: ["files.fleetRecents"],
+    queryFn: () => query<FileEntry[]>("files.fleetRecents"),
+    enabled: !scope && owner,
+  });
+  const computerRecents = useQuery({
+    queryKey: ["swarm.files.recents", scope?.kind === "computer" ? scope.id : ""],
+    queryFn: () => query<{files: {name: string; path: string; size: number; mtime: number; dir: boolean}[]}>("swarm.files.recents", {id: scope?.kind === "computer" ? scope.id : ""}),
+    enabled: scope?.kind === "computer" && owner,
   });
   const favorites = useQuery({
     queryKey: ["files.favorites"],
-    queryFn: () => query<string[]>("files.favorites"),
+    queryFn: () => query<FavoriteItem[]>("files.favorites"),
   });
+  const machines = useMachines();
+  const swarm = useQuery({
+    queryKey: ["swarm.list"],
+    queryFn: () => query<{ id: string; name: string; online: boolean; guestOf?: string; allowed?: { files?: boolean }; on?: { files?: boolean } }[]>("swarm.list"),
+    enabled: owner,
+    refetchInterval: 3000,
+  });
+  const computerFiles = filePlaces(
+    (swarm.data ?? [])
+      .filter((a) => !a.guestOf)
+      .map((a) => ({
+      id: a.id,
+      name: a.name,
+      online: a.online,
+      filesGranted: !!(a.allowed?.files && a.on?.files),
+    })),
+    (machines.data ?? []).filter((m) => m.id !== "desktop").map((m) => {
+      const agent = (swarm.data ?? []).find((a) => a.guestOf === m.id);
+      const granted = !!(agent?.online && agent.allowed?.files && agent.on?.files);
+      return {id: m.id, name: m.name, state: m.state, agentId: agent?.id, filesGranted: granted && m.state === "running"};
+    }),
+  );
   const shares = useQuery({
     queryKey: ["files.shares"],
     queryFn: () => query<SmbShare[]>("files.shares"),
     retry: false,
+    enabled: owner,
   });
   const search = useQuery({
-    queryKey: ["files.search", q],
+    queryKey: ["files.search", q, searchPath],
     queryFn: () =>
-      query<FileEntry[]>("files.search", { query: q, maxResults: 100 }),
-    enabled: q.trim().length >= 2,
+      query<FileEntry[] | { files: FileEntry[]; truncated?: boolean }>("files.search", {
+        query: q,
+        maxResults: 100,
+        path: searchPath,
+      }),
+    enabled: searching,
     staleTime: 10_000,
   });
-  const favSet = useMemo(() => new Set(favorites.data ?? []), [favorites.data]);
+  const found = asFileSearch(search.data);
+  const favSet = useMemo(() => new Set((favorites.data ?? []).map(favoritePath)), [favorites.data]);
   const shareMap = useMemo(
     () => new Map((shares.data ?? []).map((s) => [s.path, s])),
     [shares.data],
   );
 
-  const go = (p: string | null) => {
+  const go = (p: string | null, how: "push" | "replace" = "push") => {
+    const next = withinScope(scope, p);
     haptic(5);
     setQ("");
-    setPath(p);
-    window.scrollTo({ top: 0 });
+    scrollPhoneToTop();
+    setNav((n) => {
+      if (how === "replace") {
+        const entries = n.entries.slice(0, n.index);
+        entries.push(next);
+        return {entries, index: entries.length - 1};
+      }
+      const base = n.entries.slice(0, n.index + 1);
+      if (base[base.length - 1] === next) return n;
+      return {entries: [...base, next], index: base.length};
+    });
   };
   const up = () => {
     if (!path) return;
-    if (
-      path.startsWith("::") ||
-      Object.hasOwn(PLACE_NAMES, path) ||
-      path.split("/").length <= 2
-    )
-      return go(null);
-    go(parentOf(path));
+    const parent = withinScope(scope, filesParent(path));
+    if (parent === path) return;
+    // No history yet, so Back walks up. Replacing keeps the next Back moving upward.
+    go(parent, "replace");
+  };
+  const back = () => {
+    if (nav.index > 0) {
+      haptic(5);
+      setQ("");
+      scrollPhoneToTop();
+      setNav((n) => ({...n, index: n.index > 0 ? n.index - 1 : 0}));
+      return;
+    }
+    up();
+  };
+  const forward = () => {
+    if (nav.index >= nav.entries.length - 1) return;
+    haptic(5);
+    setQ("");
+    scrollPhoneToTop();
+    setNav((n) => ({...n, index: Math.min(n.entries.length - 1, n.index + 1)}));
   };
   const inTrash = !!path && (path === "/Trash" || path.startsWith("/Trash/"));
   const selecting = selected.size > 0;
-  // Where uploads go: the folder you're in (if Omarchy Server says it's writable), or Home from the start page.
+  // Where uploads go: the folder you're in (if My Own Data Center says it's writable), or Home from the start page.
   const writableHere =
     !!path && !path.startsWith("::") && !inTrash && listing.data?.operations?.includes("writable") !== false && !listing.error;
-  const uploadDir = path === null ? "/Home" : writableHere ? path : null;
+  const uploadDir = path === SERVER_FILES ? "/Home" : writableHere ? path : null;
   const canUpload = !!uploadDir;
+  const uploadHint = !searching && !inTrash && !!path && !path.startsWith("::") ? emptyFolderUploadHint(canUpload) : null;
   const finePointer = typeof matchMedia !== "undefined" && matchMedia("(pointer: fine)").matches;
   // iPhone/iPad Safari can't pick a whole folder; computers can.
-  const canPickFolder = finePointer && "webkitdirectory" in HTMLInputElement.prototype;
+  const canPickFolder = finePointer && ("showDirectoryPicker" in window || "webkitdirectory" in HTMLInputElement.prototype);
+  const pickFolder = async () => {
+    if (!uploadDir) return;
+    const win = window as Window & { showDirectoryPicker?: () => Promise<DirectoryHandleLike> };
+    if (!win.showDirectoryPicker) return folderInput.current?.click();
+    try {
+      const handle = await pickDirectoryFromWindow(win);
+      if (!handle) return;
+      const batch = await readDirectoryHandle(handle);
+      if (batch.files.length || batch.dirs.length) upload(batch, uploadDir);
+    } catch (e) {
+      if ((e as Error).name !== "AbortError") toast((e as Error).message, true);
+    }
+  };
   const toggle = (f: FileEntry) => {
     haptic(6);
     setSelected((s) => {
@@ -465,6 +736,7 @@ export function Files({ initialPath }: { initialPath?: string } = {}) {
     if (isDir(f)) return go(f.path);
     haptic(6);
     if (inTrash || f.path.startsWith("/Trash/")) return setOpen(f);
+    if (!offersFile(f)) return setOpen(f);
     viewFile(f);
   };
   const viewFile = (f: FileEntry) => {
@@ -483,34 +755,107 @@ export function Files({ initialPath }: { initialPath?: string } = {}) {
     { path: "/Network", label: "Network", icon: "server", color: "#0ea5e9" },
     { path: "/Trash", label: "Trash", icon: "trash", color: "#71717a" },
   ];
+  const computerHere = path ? parseComputerPlace(path) : null;
+  const guestHere = path ? parseGuestPlace(path) : null;
+  const computerLabel = (id: string) => {
+    const agent = swarm.data?.find((a) => a.id === id);
+    if (!agent) return "Computer";
+    if (agent.guestOf) return machines.data?.find((m) => m.id === agent.guestOf)?.name ?? agent.name;
+    return agent.name;
+  };
+  const computerName = computerHere ? computerLabel(computerHere.id) : "";
+  const guestName = guestHere ? (machines.data?.find((m) => m.id === guestHere.id)?.name ?? "Virtual machine") : "";
+  const computerKnown = computerHere ? swarm.data?.find((a) => a.id === computerHere.id) : undefined;
+  const computerBrowsable = !computerHere
+    ? false
+    : computerKnown
+      ? !!(computerKnown.online && computerKnown.allowed?.files && computerKnown.on?.files)
+      : !swarm.isFetched;
+
+  const recentQuery = scope?.kind === "computer" ? computerRecents : !scope && owner ? fleetRecents : recents;
+  const recentSource: FileEntry[] = (
+    scope?.kind === "computer"
+      ? (computerRecents.data?.files ?? []).flatMap((row) => {
+          const next = computerPlacePath(scope.id, row.path);
+          if (!next) return [];
+          const entry: FileEntry = {
+            name: row.name,
+            path: next,
+            type: row.dir ? "directory" : "application/octet-stream",
+            size: row.size,
+            modified: row.mtime,
+            operations: ["favorite", "copy", "move"],
+          };
+          return [entry];
+        })
+      : !scope && owner
+        ? (fleetRecents.data ?? [])
+        : (recents.data ?? [])
+  ).filter((f) => {
+    if (scope?.kind === "computer") return f.path.startsWith(`::computer/${scope.id}/`);
+    if (scope?.kind === "server") return !f.path.startsWith("::");
+    return true;
+  });
 
   // Items shown in the current view.
-  const items: FileEntry[] =
-    q.trim().length >= 2
-      ? (search.data ?? [])
+  const items: FileEntry[] = searching
+      ? found.files
       : path === "::recents"
-        ? (recents.data ?? [])
+        ? recentSource
         : path === "::favorites"
           ? (favorites.data ?? []).map(
               (p) =>
-                ({
+                (typeof p === "string" ? {
                   name: baseName(p) || p,
                   path: p,
                   type: "directory",
                   modified: 0,
                   operations: ["favorite"],
-                }) as FileEntry,
+                } : p) as FileEntry,
             )
           : (listing.data?.files ?? []);
-  const loading =
-    q.trim().length >= 2
+  const folderListing = !!path && !path.startsWith("::") && !searching;
+  const activeQ = searching
+      ? search
+      : path === "::recents"
+        ? recentQuery
+        : path === "::favorites"
+          ? favorites
+          : listing;
+  const browserOnline = useBrowserOnline();
+  const fileProblem = path !== null || searching ? queryProblem(activeQ, browserOnline) : null;
+  const showEmpty = showFolderEmpty({
+    error: folderListing ? listing.error : activeQ.error,
+    count: items.length,
+    suppress: fileProblem != null && activeQ.data == null,
+  });
+  const loading = searching
       ? search.isLoading
       : path === "::recents"
-        ? recents.isLoading
+        ? recentQuery.isLoading
         : path && !path.startsWith("::")
           ? listing.isLoading
           : false;
 
+  const finishBatch = async (
+    paths: string[],
+    kind: BatchKind,
+    run: (p: string) => Promise<unknown>,
+  ) => {
+    let succeeded = 0;
+    for (const p of paths) {
+      try {
+        await run(p);
+        succeeded++;
+      } catch {
+        // useFileAction already showed this call's error.
+      }
+    }
+    const message = batchToast(succeeded, paths.length - succeeded, kind);
+    if (message) toast(message);
+    setSelected(new Set());
+    setOpen(null);
+  };
   const trashItems = async (paths: string[]) => {
     const ok = await confirm({
       title:
@@ -523,15 +868,10 @@ export function Files({ initialPath }: { initialPath?: string } = {}) {
       icon: "trash",
     });
     if (!ok) return;
-    for (const p of paths)
-      await act("files.trash", { path: p }).catch(() => {});
-    toast(
-      paths.length === 1
-        ? "Moved to Trash"
-        : `${paths.length} items moved to Trash`,
-    );
-    setSelected(new Set());
-    setOpen(null);
+    await finishBatch(paths, "trash", async (p) => {
+      await act("files.trash", { path: p });
+      setViewing((v) => viewerAfterPathChange(v, p, null));
+    });
   };
   const deleteForever = async (paths: string[]) => {
     const ok = await confirm({
@@ -545,20 +885,15 @@ export function Files({ initialPath }: { initialPath?: string } = {}) {
       icon: "trash",
     });
     if (!ok) return;
-    for (const p of paths)
-      await act("files.delete", { path: p }).catch(() => {});
-    toast("Deleted");
-    setSelected(new Set());
-    setOpen(null);
+    await finishBatch(paths, "delete", async (p) => {
+      await act("files.delete", { path: p });
+      setViewing((v) => viewerAfterPathChange(v, p, null));
+    });
   };
   const restore = async (paths: string[]) => {
-    for (const p of paths)
-      await act("files.restore", { path: p, collision: "keep-both" }).catch(
-        () => {},
-      );
-    toast(paths.length === 1 ? "Restored" : `${paths.length} items restored`);
-    setSelected(new Set());
-    setOpen(null);
+    await finishBatch(paths, "restore", (p) =>
+      act("files.restore", { path: p, collision: "keep-both" }),
+    );
   };
   const emptyTrash = async () => {
     if (
@@ -593,221 +928,330 @@ export function Files({ initialPath }: { initialPath?: string } = {}) {
     setOpen(null);
     setShareFor({ path: f.path, name: f.name });
   };
-  const used = disk.data ? diskPct(disk.data) / 100 : 0;
+  const used = disk.data ? (diskAll(disk.data).total > 0 ? diskAll(disk.data).used / diskAll(disk.data).total : 0) : 0;
 
-  const Header = (
-    <div className="files-head">
-      {path !== null ? (
-        <button className="round-btn" aria-label="Back" onClick={up}>
-          <Icon name="back" size={20} />
-        </button>
-      ) : null}
-      <div style={{ flex: 1, minWidth: 0 }}>
-        <h1 className="title" style={{ margin: 0 }}>
-          {path === null
-            ? "Files"
-            : path === "::recents"
-              ? "Recents"
-              : path === "::favorites"
-                ? "Favorites"
-                : titleOf(path)}
-        </h1>
-        {path && !path.startsWith("::") && path.split("/").length > 2 && (
-          <div className="crumbs">
-            {path
-              .split("/")
-              .filter(Boolean)
-              .slice(0, -1)
-              .map((seg, i, arr) => {
-                const p = `/${path
-                  .split("/")
-                  .filter(Boolean)
-                  .slice(0, i + 1)
-                  .join("/")}`;
-                return (
-                  <button key={p} onClick={() => go(p)}>
-                    {titleOf(p)}
-                    {i < arr.length - 1 && <Icon name="chevron" size={12} />}
-                  </button>
-                );
-              })}
-          </div>
-        )}
-      </div>
-      {path && path.startsWith("/Home/") && (
+  // The machine Files runs on is called the host server here, next to its computers and VMs.
+  const serverName = "Host server";
+  const heading =
+    path === null
+      ? "Files"
+      : guestHere
+        ? guestName
+        : computerHere
+          ? computerHere.rel.split("/").filter(Boolean).pop() || computerName
+          : path === SERVER_FILES
+          ? serverName
+          : path === "::recents"
+            ? "Recents"
+            : path === "::favorites"
+              ? "Favorites"
+              : titleOf(path);
+  const crumbs: {name: string; path: string | null}[] = [];
+  const pushComputer = (id: string, label: string, rel: string) => {
+    const root = computerPlacePath(id);
+    if (root) crumbs.push({name: label, path: root});
+    const parts = rel.split("/").filter(Boolean);
+    for (let i = 0; i < parts.length; i++) {
+      const next = computerPlacePath(id, parts.slice(0, i + 1).join("/"));
+      if (next) crumbs.push({name: parts[i], path: next});
+    }
+  };
+  const pushServer = (from: string | null) => {
+    crumbs.push({name: serverName, path: SERVER_FILES});
+    if (!from || from === SERVER_FILES || parseComputerPlace(from)) return;
+    if (from === "::recents" || from === "::favorites") {
+      crumbs.push({name: heading, path: from});
+      return;
+    }
+    if (from.startsWith("::")) return;
+    const parts = from.split("/").filter(Boolean);
+    for (let i = 0; i < parts.length; i++) {
+      const p = `/${parts.slice(0, i + 1).join("/")}`;
+      crumbs.push({name: titleOf(p), path: p});
+    }
+  };
+  if (scope?.kind === "computer") pushComputer(scope.id, scope.name, computerHere?.id === scope.id ? computerHere.rel : "");
+  else if (scope?.kind === "server") pushServer(path);
+  else {
+    crumbs.push({name: "Files", path: null});
+    if (path && guestHere) crumbs.push({name: guestName, path});
+    else if (path && computerHere) pushComputer(computerHere.id, computerName, computerHere.rel);
+    else if (path) pushServer(path);
+  }
+  const parentPath = path ? withinScope(scope, filesParent(path)) : null;
+  const canBack = nav.index > 0 || (!!path && parentPath !== path);
+  const canForward = nav.index < nav.entries.length - 1;
+  const onServer = !!path && !computerHere && !guestHere;
+  const machineRoot = path === null && !searching;
+  const serverPlacesView = path === SERVER_FILES && !searching;
+  const setFileMode = (next: boolean) => {
+    haptic(5);
+    safeLocal.set("omarchy-server:files-grid", next ? "1" : "0");
+    setGrid(next);
+  };
+  const rootItems: NuItem[] = [
+    {key: "server", name: serverName, modified: boot.server?.device || "Entrypoint", icon: "server", onOpen: () => go(SERVER_FILES)},
+    ...(owner ? [] : computerFiles.places.map((p) => ({key: `${p.kind}:${p.id}`, name: p.name, icon: p.kind === "guest" ? ("machine" as const) : ("devices" as const), onOpen: () => go(p.path)}))),
+  ];
+  // Connected computers and the virtual machines running on this server, each a tree of its files.
+  const agentsAll = swarm.data ?? [];
+  const treeMachines: TreeMachine[] = [
+    ...agentsAll
+      .filter((a) => !a.guestOf)
+      .map((a) => {
+        const filesOn = !!(a.allowed?.files && a.on?.files);
+        return {
+          key: `computer:${a.id}`,
+          name: a.name,
+          kind: "computer" as const,
+          agentId: a.id,
+          ready: a.online && filesOn,
+          note: !a.online ? "Offline" : !a.allowed?.files ? "Files isn’t allowed" : !a.on?.files ? "Files is off · Machines" : "Home folder",
+        };
+      }),
+    ...(machines.data ?? [])
+      .filter((m) => m.id !== "desktop" && m.state === "running")
+      .map((m) => {
+        const agent = agentsAll.find((a) => a.guestOf === m.id);
+        const filesOn = !!(agent?.allowed?.files && agent?.on?.files);
+        return {
+          key: `vm:${m.id}`,
+          name: m.name,
+          kind: "vm" as const,
+          agentId: agent?.id,
+          ready: !!agent?.online && filesOn,
+          note: !agent ? "Install the connector to browse" : !agent.online ? "Connector offline" : !filesOn ? "Files is off · Machines" : "Virtual machine",
+        };
+      }),
+  ];
+  const treeActions: TreeActions = {
+    onOpenFolder: (source, p) => {
+      if (source.kind === "server") return go(p);
+      const next = computerPlacePath(source.id, p);
+      if (next) go(next);
+    },
+    onOpenFile: (source, node) => {
+      if (source.kind === "server") return node.entry ? openShown(node.entry) : undefined;
+      const next = computerPlacePath(source.id, node.path.split("/").slice(0, -1).join("/"));
+      if (next) go(next);
+    },
+  };
+  const placeLabel = (filePath: string) => {
+    const computer = parseComputerPlace(filePath);
+    if (computer) return computerLabel(computer.id);
+    const guest = parseGuestPlace(filePath);
+    if (guest) return machines.data?.find((m) => m.id === guest.id)?.name ?? "Virtual machine";
+    return serverName;
+  };
+  const openLocation = (filePath: string) => {
+    if (parseComputerPlace(filePath) || parseGuestPlace(filePath)) return go(filesParent(filePath));
+    go(folderOf(filePath));
+  };
+  const openShown = (f: FileEntry) => {
+    if (f.path.startsWith("::")) return;
+    if (isDir(f)) return go(f.path);
+    if (offersFile(f) && !f.path.startsWith("/Trash/")) return viewFile(f);
+    setOpen(f);
+  };
+  const shelfRow = (f: FileEntry) => ({
+    key: f.path,
+    name: f.name,
+    sub: `${f.size != null ? bytes(f.size) : "–"} · ${placeLabel(f.path)}`,
+    favorite: favSet.has(f.path),
+    onOpenLocation: () => openLocation(f.path),
+    onOpen: f.path.startsWith("::") ? undefined : () => openShown(f),
+    onFavorite: () => toggleFavorite(f.path),
+  });
+  const recentRows = recentSource.map(shelfRow);
+  const favoriteRows = (favorites.data ?? [])
+    .map((item) => (typeof item === "string" ? ({name: baseName(item) || item, path: item, type: "directory", modified: 0, operations: ["favorite"]} as FileEntry) : item))
+    .filter((f) => {
+      if (scope?.kind === "computer") return f.path.startsWith(`::computer/${scope.id}/`);
+      if (scope?.kind === "server") return !f.path.startsWith("::");
+      return true;
+    })
+    .map(shelfRow);
+  const placeItems: NuItem[] = places
+    .filter((p) => isServedFilePlace(p.path))
+    .map((p) => ({
+      key: p.path,
+      name: p.label,
+      icon: p.icon,
+      onOpen: () =>
+        p.path === PHOTOS
+          ? mutate("files.createDirectory", {path: PHOTOS})
+              .catch(() => {})
+              .finally(() => go(PHOTOS))
+          : go(p.path),
+    }));
+  const bar = (
+    <div className="nu-bar">
+      <h1 className="sr-only">{heading}</h1>
+      <button type="button" className="nu-nav" aria-label="Back" onClick={back} disabled={!canBack}>
+        <Icon name="back" size={16} />
+      </button>
+      <button type="button" className="nu-nav" aria-label="Forward" onClick={forward} disabled={!canForward}>
+        <Icon name="chevron" size={16} />
+      </button>
+      <FittingCrumbs crumbs={crumbs} onOpen={(next) => go(next)} />
+      {owner && path && path.startsWith("/Home/") && (
         <button
-          className="round-btn"
-          aria-label="Share this folder on your network"
-          title="Share on network"
+          className="nu-nav"
+          aria-label="Share this folder on your home LAN"
+          title="Share on your home LAN"
           aria-pressed={shareMap.has(path)}
-          onClick={() => (haptic(5), setShareFor({ path, name: titleOf(path) }))}
+          onClick={() => (haptic(5), setShareFor({path, name: titleOf(path)}))}
         >
-          <Icon name="folder-share" size={19} />
+          <Icon name="folder-share" size={16} />
         </button>
       )}
       {path && !path.startsWith("::") && (
-        <>
-          <button
-            className="round-btn"
-            aria-label={grid ? "List view" : "Grid view"}
-            onClick={() => {
-              haptic(5);
-              setGrid((g) => {
-                localStorage.setItem("omarchy-server:files-grid", g ? "0" : "1");
-                return !g;
-              });
-            }}
-          >
-            <Icon name={grid ? "list" : "grid"} size={19} />
-          </button>
-          <button
-            className="round-btn"
-            aria-label={`Sort by ${sort === "name" ? "date" : sort === "modified" ? "size" : "name"}`}
-            onClick={() => {
-              haptic(5);
-              const next =
-                sort === "name"
-                  ? "modified"
-                  : sort === "modified"
-                    ? "size"
-                    : "name";
-              setSort(next);
-              toast(`Sorted by ${next === "modified" ? "date" : next}`);
-            }}
-          >
-            <Icon name="sort" size={19} />
-          </button>
-        </>
+        <button
+          type="button"
+          className="nu-nav"
+          aria-label={`Sort by ${sort === "name" ? "date" : sort === "modified" ? "size" : "name"}`}
+          onClick={() => {
+            haptic(5);
+            const next = sort === "name" ? "modified" : sort === "modified" ? "size" : "name";
+            setSort(next);
+            toast(`Sorted by ${next === "modified" ? "date" : next}`);
+          }}
+        >
+          <Icon name="sort" size={16} />
+        </button>
       )}
+      <div className="nu-modes" role="group" aria-label="View">
+        <button type="button" aria-label="List" aria-pressed={!grid} onClick={() => setFileMode(false)}>
+          <Icon name="list" size={16} />
+        </button>
+        <button type="button" aria-label="Grid" aria-pressed={grid} onClick={() => setFileMode(true)}>
+          <Icon name="grid" size={16} />
+        </button>
+      </div>
     </div>
   );
 
-  const longPress = useLongPress(
-    (f) => {
-      if (!f.operations.length) return;
-      haptic(15);
-      setSelected((s) => new Set(s).add(f.path));
-    },
-    // Right-click: the same actions as tapping a file (for a folder: open, share on network, …).
-    (f) => setOpen(f),
-  );
-  const Row = ({ f }: { f: FileEntry }) => {
-    const press = longPress(f);
-    const sel = selected.has(f.path);
-    const shared = shareMap.has(f.path);
-    const sub = isDir(f)
-      ? f.modified
-        ? `Folder · ${ago(f.modified)}`
-        : "Folder"
-      : `${bytes(f.size)} · ${ago(f.modified)}`;
-    if (grid)
-      return (
-        <button
-          className={`file-tile${sel ? " sel" : ""}`}
-          onClick={() => activate(f)}
-          {...press}
-        >
-          <span className="tile-art">
-            <FileIcon f={f} size={isDir(f) ? 64 : 92} />
-            {selecting && (
-              <Icon
-                name={sel ? "checked" : "unchecked"}
-                size={22}
-                className="tile-check"
-              />
-            )}
-          </span>
-          <span className="name">{f.name}</span>
-          <span className="sub">{isDir(f) ? "Folder" : bytes(f.size)}</span>
-        </button>
-      );
-    return (
-      <div
-        className={`row file-row${sel ? " sel" : ""}`}
-        role="button"
-        tabIndex={0}
-        onClick={() => activate(f)}
-        onKeyDown={(e) => e.key === "Enter" && activate(f)}
-        {...press}
-      >
-        {selecting && (
-          <Icon
-            name={sel ? "checked" : "unchecked"}
-            size={24}
-            className={`check${sel ? " on" : ""}`}
-          />
-        )}
-        <FileIcon f={f} />
-        <span className="main">
-          <b>
-            {f.name}
-            {favSet.has(f.path) && (
-              <Icon name="star-filled" size={13} className="fav" />
-            )}
-            {shared && (
-              <Icon name="folder-share" size={14} className="shared" />
-            )}
-          </b>
-          <span>{q ? parentOf(f.path) : sub}</span>
-        </span>
-        {!selecting && !inTrash && !f.path.startsWith("/Trash/") && (
-          <button
-            className="icon-btn row-dl"
-            style={{ alignSelf: "center" }}
-            aria-label={isDir(f) ? `Download ${f.name} as a zip` : `Download ${f.name}`}
-            title={isDir(f) ? "Download as zip" : "Download"}
-            onClick={(e) => {
-              e.stopPropagation();
-              download([f.path]);
-            }}
-          >
-            <Icon name="download" size={18} />
-          </button>
-        )}
-        {!selecting && (
-          <button
-            className="icon-btn"
-            style={{ alignSelf: "center", background: "transparent" }}
-            aria-label={`More for ${f.name}`}
-            onClick={(e) => {
-              e.stopPropagation();
-              haptic(6);
-              setOpen(f);
-            }}
-          >
-            <Icon name="dots" size={18} />
-          </button>
-        )}
-      </div>
-    );
+  rowApi.current.activate = activate;
+  rowApi.current.download = download;
+  rowApi.current.more = (f) => {
+    haptic(6);
+    setOpen(f);
   };
+  rowApi.current.menu = (f) => setOpen(f);
+  rowApi.current.long = (f) => {
+    if (!f.operations.length) return;
+    haptic(15);
+    setSelected((s) => new Set(s).add(f.path));
+  };
+  const showParent = searching;
+  // In the list view a folder opens in place, as a tree; its arrow (or the sidebar) goes into it.
+  const treeRows = !grid && !selecting && !searching && !inTrash && !!path && !path.startsWith("::");
+  const renderRow = (f: FileEntry) =>
+    treeRows && isDir(f) ? (
+      <div key={f.path} className={`file-tree-row${openFolders.has(f.path) ? " open" : ""}`}>
+        <FileRow
+          f={f}
+          grid={false}
+          selected={false}
+          selecting={false}
+          favorite={favSet.has(f.path)}
+          shared={shareMap.has(f.path)}
+          inTrash={false}
+          showParent={showParent}
+          activate={toggleFolder}
+          onMore={onRowMore}
+          onDownload={onRowDownload}
+          onFavorite={(f) => toggleFavorite(f.path)}
+          onLong={onRowLong}
+          onMenu={onRowMenu}
+          onEnter={onRowEnter}
+        />
+        {openFolders.has(f.path) && <TreeChildren source={{ kind: "server" }} path={f.path} depth={1} actions={treeActions} />}
+      </div>
+    ) : (
+    <FileRow
+      key={f.path}
+      f={f}
+      grid={grid}
+      selected={selected.has(f.path)}
+      selecting={selecting}
+      favorite={favSet.has(f.path)}
+      shared={shareMap.has(f.path)}
+      inTrash={inTrash}
+      showParent={showParent}
+      activate={onRowActivate}
+      onMore={onRowMore}
+      onDownload={onRowDownload}
+      onFavorite={(f) => toggleFavorite(f.path)}
+      onLong={onRowLong}
+      onMenu={onRowMenu}
+    />
+  );
 
   const onDragEnter = (e: React.DragEvent) => {
-    if (!canUpload || !e.dataTransfer.types.includes("Files")) return;
-    e.preventDefault();
+    if (!handleFileDragEnter(e, canUpload)) return;
     dragDepth.current++;
     setDropping(true);
   };
   const onDragOver = (e: React.DragEvent) => {
-    if (!canUpload || !e.dataTransfer.types.includes("Files")) return;
-    e.preventDefault();
-    e.dataTransfer.dropEffect = "copy";
+    handleFileDragOver(e, canUpload);
   };
   const onDragLeave = () => {
     dragDepth.current = Math.max(0, dragDepth.current - 1);
     if (!dragDepth.current) setDropping(false);
   };
   const onDrop = async (e: React.DragEvent) => {
-    if (!canUpload || !uploadDir) return;
-    e.preventDefault();
+    const allowed = handleFileDrop(e, canUpload && !!uploadDir);
     dragDepth.current = 0;
     setDropping(false);
-    const items = await droppedItems(e.dataTransfer).catch(() => [] as UploadItem[]);
-    if (items.length) upload(items, uploadDir);
+    if (!allowed || !uploadDir) return;
+    const batch = await droppedItems(e.dataTransfer).catch((): UploadBatch => ({ files: [], dirs: [] }));
+    if (batch.files.length || batch.dirs.length) upload(batch, uploadDir);
+  };
+  // Ordinary Copy fills the book. The destination picker still opens from the Copy action.
+  // A keyboard copy only fills the book. Success stays quiet; a refusal is the toast.
+  const rememberClip = (paths: string[], cut = false) => {
+    const places = paths.map((item) => parseComputerPlace(item));
+    const head = places[0];
+    const sameComputer = !!head && places.every((item) => item && item.rel && item.id === head.id);
+    const input = sameComputer
+      ? fileClipInput("swarm", head.id, places.map((item) => item!.rel), cut)
+      : places.some(Boolean)
+        ? null
+        : fileClipInput("server", undefined, paths, cut);
+    if (!input) return false;
+    mutate("clips.addFile", input)
+      .then(() => qc.invalidateQueries({ queryKey: ["clips.list"] }))
+      .catch((err: Error) => toast(err.message, true));
+    return true;
+  };
+  const onClipKey = (e: React.KeyboardEvent) => {
+    if (e.altKey || e.repeat || !(e.ctrlKey || e.metaKey)) return;
+    const key = e.key.toLowerCase();
+    if (key !== "c" && key !== "x") return;
+    const target = e.target;
+    if (target instanceof HTMLElement && target.closest("input, textarea, [contenteditable=true]")) return;
+    const paths = selected.size ? [...selected] : open ? [open.path] : [];
+    if (!paths.length || !rememberClip(paths, key === "x")) return;
+    e.preventDefault();
   };
 
   return (
-    <div className="stagger files-root" onDragEnter={onDragEnter} onDragOver={onDragOver} onDragLeave={onDragLeave} onDrop={onDrop}>
+    <div
+      className={`stagger files-root nu${scope ? " nu-embedded" : ""}`}
+      onKeyDown={onClipKey}
+      onDragEnter={onDragEnter}
+      onDragOver={onDragOver}
+      onDragLeave={onDragLeave}
+      onDrop={onDrop}
+      onContextMenu={(e) => {
+        // A row's own right-click has already been handled; this is empty space in the folder.
+        if (e.defaultPrevented || !deskMode || inTrash || !path || !canQuickTransfer(path)) return;
+        if ((e.target as HTMLElement).closest("input, textarea, [contenteditable=true]")) return;
+        e.preventDefault();
+        setBlankMenu({ x: e.clientX, y: e.clientY });
+      }}
+    >
       <input
         ref={fileInput}
         type="file"
@@ -824,13 +1268,19 @@ export function Files({ initialPath }: { initialPath?: string } = {}) {
         accept="image/*,video/*"
         multiple
         hidden
-        onChange={(e) => {
+        onChange={async (e) => {
           const picked = e.target.files ? [...e.target.files] : [];
           e.target.value = "";
           if (!picked.length) return;
-          // Sync: upload only what isn't in Photos yet (same name and size).
-          const have = new Set((listing.data?.files ?? []).map((f) => `${f.name}:${f.size}`));
-          const fresh = picked.filter((f) => !have.has(`${f.name}:${f.size}`));
+          // Sync: upload only what isn't in Photos yet (same name or keep-both copy, and size).
+          // The listing on screen is one page, so a big Photos folder is read in full first.
+          let existing: FileEntry[];
+          try {
+            existing = await photosAlreadyThere(listing.data, () => query<Listing>("files.list", { path: PHOTOS, sortBy: "name", sortOrder: "ascending" }));
+          } catch (err) {
+            return toast(nice((err as Error).message), true);
+          }
+          const fresh = filterUnsyncedPhotos(picked, existing);
           const skipped = picked.length - fresh.length;
           if (!fresh.length) return toast(`All ${picked.length} already synced`);
           if (skipped) toast(`${fresh.length} new · ${skipped} already synced`);
@@ -848,13 +1298,13 @@ export function Files({ initialPath }: { initialPath?: string } = {}) {
           (e.target.value = "")
         )}
       />
-      {Header}
+      {bar}
       <SearchField
         value={q}
         onChange={setQ}
         placeholder={path === null ? "Search all files" : `Search files`}
       />
-      {canUpload && !q && !selecting && (
+      {canUpload && !searching && !selecting && (
         <div className="files-actions">
           {path === PHOTOS && (
             <button className="btn primary" onClick={() => photoInput.current?.click()} disabled={listing.isLoading}>
@@ -864,15 +1314,15 @@ export function Files({ initialPath }: { initialPath?: string } = {}) {
           )}
           <button className={`btn${path === PHOTOS ? "" : " primary"}`} onClick={() => fileInput.current?.click()}>
             <Icon name="upload" size={18} />
-            {path === null ? "Upload to Home" : "Upload"}
+            {path === SERVER_FILES ? "Upload to Home" : "Upload"}
           </button>
           {canPickFolder && (
-            <button className="btn" onClick={() => folderInput.current?.click()}>
+            <button className="btn" onClick={pickFolder}>
               <Icon name="folder-share" size={18} />
               Upload folder
             </button>
           )}
-          {path !== null && (
+          {path && !path.startsWith("::") && (
             <button className="btn" onClick={() => setPrompt({ kind: "folder" })}>
               <Icon name="folder-plus" size={18} />
               New folder
@@ -882,37 +1332,58 @@ export function Files({ initialPath }: { initialPath?: string } = {}) {
         </div>
       )}
 
-      {path === null && !q && (
+      <div className="nu-body">
+        {!scope && <aside className="nu-side" aria-label="Places">
+          <h3>Places</h3>
+          <button type="button" className="nu-place" aria-current={path === null ? "page" : undefined} onClick={() => go(null)}>
+            <span className="dot" />
+            Files
+          </button>
+          <button type="button" className="nu-place" aria-current={onServer ? "page" : undefined} onClick={() => go(SERVER_FILES)}>
+            <span className="dot" />
+            {serverName}
+          </button>
+          {computerFiles.places.map((p) => (
+            <button
+              key={`${p.kind}:${p.id}`}
+              type="button"
+              className="nu-place"
+              aria-current={p.kind === "guest" ? (guestHere?.id === p.id ? "page" : undefined) : computerHere?.id === p.id ? "page" : undefined}
+              onClick={() => go(p.path)}
+            >
+              <span className="dot" />
+              {p.name}
+            </button>
+          ))}
+        </aside>}
+        <div className="nu-main">
+      <Shelf title="Favorites" empty={favorites.isLoading ? "Loading…" : "No favorites yet."} rows={favoriteRows} />
+      <Shelf title="Recent" empty={recentQuery.isLoading ? "Loading…" : "No recent files."} rows={recentRows} />
+      {machineRoot && (
         <>
-          <div className="places">
-            {places.map((p) => (
-              <button
-                key={p.path}
-                className="glass place press"
-                onClick={() =>
-                  p.path === PHOTOS
-                    ? mutate("files.createDirectory", { path: PHOTOS })
-                        .catch(() => {})
-                        .finally(() => go(PHOTOS))
-                    : go(p.path)
-                }
-              >
-                <span className="place-ico" style={{ background: p.color }}>
-                  <Icon name={p.icon} size={21} />
-                </span>
-                <b>{p.label}</b>
-              </button>
-            ))}
+          <NuEntries items={rootItems} grid={grid} />
+          <div className="nu-status">
+            {rootItems.length} item{rootItems.length === 1 ? "" : "s"}
           </div>
+          {owner && <MachineTrees machines={treeMachines} actions={treeActions} />}
+        </>
+      )}
+
+      {serverPlacesView && (
+        <>
+          <NuEntries items={placeItems} grid={grid} />
           {disk.data && (
-            <div className="glass card storage-card">
-              <div className="card-head" style={{ marginBottom: 10 }}>
-                <strong>Storage</strong>
-                <span>
-                  {bytes(disk.data.available, 0)} free of{" "}
-                  {bytes(disk.data.size, 0)}
-                </span>
-              </div>
+            <Card className="storage-card">
+              <CardHead
+                title="Storage"
+                extra={
+                  <>
+                    {bytes(diskAll(disk.data).available, 0)} free of{" "}
+                    {bytes(diskAll(disk.data).total, 0)}
+                  </>
+                }
+                style={{ marginBottom: 10 }}
+              />
               <span className="progress" style={{ height: 8 }}>
                 <i
                   style={{
@@ -926,8 +1397,18 @@ export function Files({ initialPath }: { initialPath?: string } = {}) {
                   }}
                 />
               </span>
-            </div>
+              {(disk.data.drives ?? []).map((d) => (
+                <button key={d.folder} type="button" className="storage-drive" onClick={() => go(d.folder)}>
+                  <Icon name="disk" size={16} />
+                  <span className="name">{d.name}</span>
+                  <span className="muted">
+                    {bytes(d.available, 0)} free of {bytes(d.size, 0)}
+                  </span>
+                </button>
+              ))}
+            </Card>
           )}
+          {owner && <MachineTrees machines={treeMachines} actions={treeActions} />}
           {(shares.data?.length ?? 0) > 0 && (
             <section>
               <div className="section-head">
@@ -958,7 +1439,9 @@ export function Files({ initialPath }: { initialPath?: string } = {}) {
                     <span className="main">
                       <b>{s.name}</b>
                       <span className="mono">
-                        smb://{boot.server?.host}/{s.sharename}
+                        {s.available === false
+                          ? "Unavailable · this folder is gone"
+                          : `smb://${boot.server?.host}/${s.sharename}`}
                       </span>
                     </span>
                     <Icon name="chevron" size={18} className="chev" />
@@ -967,28 +1450,58 @@ export function Files({ initialPath }: { initialPath?: string } = {}) {
               </div>
             </section>
           )}
-          {(recents.data?.length ?? 0) > 0 && (
-            <section>
-              <div className="section-head">
-                <h2>Recent</h2>
-                <button className="link-btn" onClick={() => go("::recents")}>
-                  See all
-                </button>
-              </div>
-              <div
-                className="glass group"
-                style={{ "--inset": "74px" } as CSSProperties}
-              >
-                {recents.data!.slice(0, 5).map((f) => (
-                  <Fragment key={f.path}>{Row({ f })}</Fragment>
-                ))}
-              </div>
-            </section>
-          )}
+          <div className="nu-status">
+            {placeItems.length} item{placeItems.length === 1 ? "" : "s"}
+          </div>
         </>
       )}
 
-      {(path !== null || q) && (
+      {guestHere && (
+        <div className="glass empty">
+          <b>Empty folder</b>
+        </div>
+      )}
+
+      {computerHere && !computerBrowsable && (
+        <div className="glass empty">
+          <b>Empty folder</b>
+        </div>
+      )}
+
+      {computerHere && computerBrowsable && (
+        <ComputerFolder
+          id={computerHere.id}
+          rel={computerHere.rel}
+          grid={grid}
+          favoriteOf={(rel) => {
+            const next = computerPlacePath(computerHere.id, rel)
+            return !!next && favSet.has(next)
+          }}
+          onToggleFavorite={(rel) => {
+            const next = computerPlacePath(computerHere.id, rel)
+            if (next) toggleFavorite(next)
+          }}
+          onOpen={(rel) => {
+            const next = computerPlacePath(computerHere.id, rel)
+            if (next) go(next)
+          }}
+          onMove={(rel) => {
+            const next = computerPlacePath(computerHere.id, rel);
+            if (next) setPicker({mode: "move", paths: [next]});
+          }}
+          onCopy={(rel) => {
+            const next = computerPlacePath(computerHere.id, rel);
+            if (next) setPicker({mode: "copy", paths: [next]});
+            const input = fileClipInput("swarm", computerHere.id, [rel]);
+            if (!input) return;
+            mutate("clips.addFile", input)
+              .then(() => qc.invalidateQueries({ queryKey: ["clips.list"] }))
+              .catch((err: Error) => toast(err.message, true));
+          }}
+        />
+      )}
+
+      {(path !== null || searching) && !computerHere && !guestHere && !serverPlacesView && (
         <>
           {inTrash && (listing.data?.files.length ?? 0) > 0 && !selecting && (
             <button
@@ -1000,14 +1513,14 @@ export function Files({ initialPath }: { initialPath?: string } = {}) {
               Empty Trash
             </button>
           )}
-          {listing.error && !q && (
-            <div className="error">
+          {fileProblem && (
+            <div className="error" role="alert">
               <Icon name="alert" size={18} />
-              {nice((listing.error as Error).message)}
+              {activeQ.error ? nice((activeQ.error as Error).message) : fileProblem}
             </div>
           )}
           {loading ? (
-            <div className="glass group">
+            <div className="glass group screen-list">
               {Array.from({ length: 6 }, (_, i) => (
                 <div key={i} className="row static">
                   <div
@@ -1027,61 +1540,63 @@ export function Files({ initialPath }: { initialPath?: string } = {}) {
                 </div>
               ))}
             </div>
-          ) : items.length === 0 ? (
+          ) : showEmpty ? (
             <div className="glass empty">
               <span className="big">
                 <Icon
                   name={
-                    q
+                    searching
                       ? "search"
                       : inTrash
                         ? "trash"
-                        : path === "::favorites"
-                          ? "star"
-                          : "folder"
+                        : path === "::recents"
+                          ? "history"
+                          : path === "::favorites"
+                            ? "star"
+                            : "folder"
                   }
                   size={30}
                 />
               </span>
               <b>
-                {q
+                {searching
                   ? "No matches"
                   : inTrash
                     ? "Trash is empty"
-                    : path === "::favorites"
-                      ? "No favorites yet"
-                      : "This folder is empty"}
+                    : path === "::recents"
+                      ? "No recent files yet"
+                      : path === "::favorites"
+                        ? "No favorites yet"
+                        : "This folder is empty"}
               </b>
-              {!q && !inTrash && path && !path.startsWith("::") && (
-                <span>Tap + to upload photos or files.</span>
-              )}
+              {uploadHint && <span>{uploadHint}</span>}
             </div>
-          ) : grid && !q ? (
-            <div className="file-grid">
-              {items.map((f) => (
-                <Fragment key={f.path}>{Row({ f })}</Fragment>
-              ))}
+          ) : items.length === 0 ? null : grid && !searching ? (
+            <div className="file-grid screen-list glass">
+              {items.map((f) => renderRow(f))}
             </div>
           ) : (
             <div
-              className="glass group"
+              className="glass group screen-list"
               style={
                 { "--inset": selecting ? "110px" : "74px" } as CSSProperties
               }
             >
-              {items.map((f) => (
-                <Fragment key={f.path}>{Row({ f })}</Fragment>
-              ))}
+              {items.map((f) => renderRow(f))}
             </div>
           )}
-          {listing.data?.truncatedAt ? (
-            <p className="footer-note">
-              Showing the first {listing.data.truncatedAt.toLocaleString()}{" "}
-              items.
-            </p>
+          {showParent && searchMatchNote(found.files.length, found.truncated) ? (
+            <p className="footer-note">{searchMatchNote(found.files.length, found.truncated)}</p>
+          ) : null}
+          {folderListing && listing.data?.hasMore ? (
+            <button className="btn" style={{ marginTop: 12 }} onClick={() => setListLimit((n) => n + FILES_LIST_PAGE)}>
+              Show more ({filesListMoreLeft(listing.data.totalFiles, listing.data.files.length).toLocaleString()} left)
+            </button>
           ) : null}
         </>
       )}
+        </div>
+      </div>
 
       {createPortal(
         <>
@@ -1097,9 +1612,10 @@ export function Files({ initialPath }: { initialPath?: string } = {}) {
 
           {/* Selection bar */}
           {selecting && (
-            <div className="select-bar">
+            <div className="select-bar" onKeyDown={onClipKey}>
               <button
                 className="sb-cancel"
+                aria-label={`Cancel selection, ${selected.size} selected`}
                 onClick={() => setSelected(new Set())}
               >
                 <Icon name="close" size={18} stroke={2.2} />
@@ -1121,10 +1637,17 @@ export function Files({ initialPath }: { initialPath?: string } = {}) {
                 </>
               ) : (
                 <>
-                  <button onClick={() => download([...selected])}>
-                    <Icon name="download" size={21} />
-                    Download
-                  </button>
+                  {offersDownload(
+                    [...selected].map((p) => {
+                      const hit = items.find((it) => it.path === p);
+                      return { directory: !hit || isDir(hit) || !offersFile(hit) };
+                    }),
+                  ) && (
+                    <button onClick={() => download([...selected])}>
+                      <Icon name="download" size={21} />
+                      Download
+                    </button>
+                  )}
                   <button
                     onClick={() =>
                       setPicker({ mode: "move", paths: [...selected] })
@@ -1134,9 +1657,11 @@ export function Files({ initialPath }: { initialPath?: string } = {}) {
                     Move
                   </button>
                   <button
-                    onClick={() =>
-                      setPicker({ mode: "copy", paths: [...selected] })
-                    }
+                    onClick={() => {
+                      const paths = [...selected];
+                      setPicker({ mode: "copy", paths });
+                      rememberClip(paths);
+                    }}
                   >
                     <Icon name="copy" size={21} />
                     Copy
@@ -1162,17 +1687,27 @@ export function Files({ initialPath }: { initialPath?: string } = {}) {
 
 
       {viewing && (
-        <FileViewer
-          files={viewing.files}
-          index={viewing.index}
-          onClose={() => setViewing(null)}
-          onInfo={(f) => setOpen(f)}
-          onDownload={(f) => download([f.path])}
-          onChanged={() => {
-            qc.invalidateQueries({ queryKey: ["files.list"] });
-            qc.invalidateQueries({ queryKey: ["files.recents"] });
-          }}
-        />
+        <Suspense
+          fallback={
+            <main className="screen center">
+              <span className="spinner" role="status" aria-label="Loading" />
+            </main>
+          }
+        >
+          <FileViewer
+            files={viewing.files}
+            index={viewing.index}
+            onClose={() => setViewing(null)}
+            onInfo={(f) => setOpen(f)}
+            onDownload={(f) => download([f.path])}
+            isFavorite={(f) => favSet.has(f.path)}
+            onFavorite={(f) => toggleFavorite(f.path)}
+            onChanged={() => {
+              qc.invalidateQueries({ queryKey: ["files.list"] });
+              qc.invalidateQueries({ queryKey: ["files.recents"] });
+            }}
+          />
+        </Suspense>
       )}
 
       {open && (
@@ -1182,15 +1717,23 @@ export function Files({ initialPath }: { initialPath?: string } = {}) {
           inTrash={inTrash || open.path.startsWith("/Trash/")}
           favorite={favSet.has(open.path)}
           shared={shareMap.get(open.path)}
+          canShare={owner}
           onClose={() => setOpen(null)}
+          onSelect={() => (setOpen(null), rowApi.current.long(open))}
           onOpenFolder={() => (setOpen(null), go(open.path))}
           onDownload={() => download([open.path])}
           onRename={() => setPrompt({ kind: "rename", entry: open })}
           onMove={() => setPicker({ mode: "move", paths: [open.path] })}
-          onCopy={() => setPicker({ mode: "copy", paths: [open.path] })}
+          onCopy={() => {
+            setPicker({ mode: "copy", paths: [open.path] });
+            rememberClip([open.path]);
+          }}
           onFavorite={() => toggleFavorite(open.path)}
           onShare={() => toggleShare(open)}
           onShareInfo={(s) => (setOpen(null), setShareFor({ path: s.path, name: s.name }))}
+          quickTransfer={deskMode && canQuickTransfer(open.path)}
+          onQrShare={() => (setOpen(null), setTransfer({ kind: "download", path: open.path, name: open.name, size: open.size }))}
+          onQrUpload={() => (setOpen(null), setTransfer({ kind: "upload", path: open.path, name: open.name }))}
           onTrash={() => trashItems([open.path])}
           onRestore={() => restore([open.path])}
           onDelete={() => deleteForever([open.path])}
@@ -1203,6 +1746,7 @@ export function Files({ initialPath }: { initialPath?: string } = {}) {
           initial={prompt.kind === "rename" ? prompt.entry!.name : "New folder"}
           submit={prompt.kind === "folder" ? "Create" : "Rename"}
           selectStem={prompt.kind === "rename" && !isDir(prompt.entry!)}
+          requireChange={prompt.kind === "rename"}
           onClose={() => setPrompt(null)}
           onSubmit={async (name) => {
             if (prompt.kind === "folder")
@@ -1212,11 +1756,13 @@ export function Files({ initialPath }: { initialPath?: string } = {}) {
                 "Folder created",
               );
             else {
-              await act(
+              const from = prompt.entry!.path;
+              const next = await act(
                 "files.rename",
-                { path: prompt.entry!.path, newName: name },
+                { path: from, newName: name },
                 "Renamed",
               );
+              setViewing((v) => viewerAfterPathChange(v, from, typeof next === "string" ? next : null));
               setOpen(null);
             }
             setPrompt(null);
@@ -1228,26 +1774,35 @@ export function Files({ initialPath }: { initialPath?: string } = {}) {
         <FolderPicker
           mode={picker.mode}
           count={picker.paths.length}
-          start={path && !path.startsWith("::") && !inTrash ? path : "/Home"}
+          start={path && !inTrash && (path.startsWith("::computer/") || !path.startsWith("::")) ? path : "/Home"}
+          places={computerFiles.places.map((p) => ({path: p.path, name: p.name}))}
           exclude={picker.paths}
           onClose={() => setPicker(null)}
           onPick={async (dir) => {
+            const cross = picker.paths.some((p) => p.startsWith("::computer/")) || dir.startsWith("::computer/");
             const verb = picker.mode === "move" ? "files.move" : "files.copy";
             let ok = 0;
             for (const p of picker.paths) {
-              if (parentOf(p) === dir && picker.mode === "move") continue;
-              await act(verb, {
-                path: p,
-                toDirectory: dir,
-                collision: "keep-both",
-              }).then(
-                () => ok++,
-                () => {},
-              );
+              const fromParent = p.startsWith("::") ? filesParent(p) : parentOf(p);
+              if (fromParent === dir && picker.mode === "move") continue;
+              try {
+                const next = cross
+                  ? await act("files.transfer", {path: p, toDirectory: dir, mode: picker.mode})
+                  : await act(verb, {
+                      path: p,
+                      toDirectory: dir,
+                      collision: "keep-both",
+                    });
+                if (picker.mode === "move")
+                  setViewing((v) => viewerAfterPathChange(v, p, typeof next === "string" ? next : null));
+                ok++;
+              } catch {
+                // useFileAction already showed this call's error.
+              }
             }
             if (ok)
               toast(
-                `${ok === 1 ? "1 item" : `${ok} items`} ${picker.mode === "move" ? "moved" : "copied"} to ${titleOf(dir)}`,
+                `${ok === 1 ? "1 item" : `${ok} items`} ${picker.mode === "move" ? "moved" : "copied"} to ${pickerTitle(dir, computerFiles.places)}`,
               );
             setPicker(null);
             setSelected(new Set());
@@ -1256,6 +1811,24 @@ export function Files({ initialPath }: { initialPath?: string } = {}) {
         />
       )}
 
+      {transfer && <QuickTransferSheet target={transfer} onClose={() => setTransfer(null)} />}
+      {blankMenu && (
+        <>
+          <div className="qt-menu-scrim" onPointerDown={() => setBlankMenu(null)} onContextMenu={(e) => (e.preventDefault(), setBlankMenu(null))} />
+          <div className="qt-menu glass" role="menu" style={{ left: Math.min(blankMenu.x, window.innerWidth - 240), top: Math.min(blankMenu.y, window.innerHeight - 60) }}>
+            <button
+              role="menuitem"
+              onClick={() => {
+                setBlankMenu(null);
+                if (path) setTransfer({ kind: "upload", path, name: path.split("/").pop() || "Home" });
+              }}
+            >
+              <Icon name="upload" size={18} />
+              Upload here from a phone (QR code)
+            </button>
+          </div>
+        </>
+      )}
       {shareFor && (
         <ShareSheet
           path={shareFor.path}
@@ -1314,13 +1887,182 @@ function useLongPress(onLong: (f: FileEntry) => void, onMenu?: (f: FileEntry) =>
   });
 }
 
+const FileRow = memo(function FileRow({
+  f,
+  grid,
+  selected,
+  selecting,
+  favorite,
+  shared,
+  inTrash,
+  showParent,
+  activate,
+  onMore,
+  onDownload,
+  onFavorite,
+  onLong,
+  onMenu,
+  onEnter,
+}: {
+  onEnter?: (f: FileEntry) => void;
+  f: FileEntry;
+  grid: boolean;
+  selected: boolean;
+  selecting: boolean;
+  favorite: boolean;
+  shared: boolean;
+  inTrash: boolean;
+  showParent: boolean;
+  activate: (f: FileEntry) => void;
+  onMore: (f: FileEntry) => void;
+  onDownload: (f: FileEntry) => void;
+  onFavorite: (f: FileEntry) => void;
+  onLong: (f: FileEntry) => void;
+  onMenu: (f: FileEntry) => void;
+}) {
+  const press = useLongPress(onLong, onMenu);
+  const sub = isDir(f)
+    ? f.modified
+      ? `Folder · ${ago(f.modified)}`
+      : "Folder"
+    : `${bytes(f.size)} · ${ago(f.modified)}`;
+  const canFavorite = !selecting && !inTrash && !f.path.startsWith("/Trash/") && (f.operations.includes("favorite") || favorite);
+  const favoriteBtn = canFavorite ? (
+    <button
+      type="button"
+      className="icon-btn tile-fav"
+      aria-pressed={favorite}
+      aria-label={favorite ? `Unfavorite ${f.name}` : `Favorite ${f.name}`}
+      title={favorite ? "Unfavorite" : "Favorite"}
+      onPointerDown={(e) => e.stopPropagation()}
+      onClick={(e) => {
+        e.stopPropagation();
+        onFavorite(f);
+      }}
+    >
+      <Icon name={favorite ? "star-filled" : "star"} size={16} />
+    </button>
+  ) : null;
+  if (grid)
+    return (
+      <div
+        className={`file-tile${selected ? " sel" : ""}`}
+        role="button"
+        tabIndex={0}
+        aria-pressed={selecting ? selected : undefined}
+        onClick={() => activate(f)}
+        onKeyDown={(e) => {
+          if (!shouldActivateRowOnKey(e)) return;
+          e.preventDefault();
+          activate(f);
+        }}
+        {...press(f)}
+      >
+        <span className="tile-art">
+          <FileIcon f={f} size={isDir(f) ? 64 : 92} />
+          {selecting && <Icon name={selected ? "checked" : "unchecked"} size={22} className="tile-check" />}
+          {favoriteBtn}
+        </span>
+        <span className="name">{f.name}</span>
+        <span className="sub">{isDir(f) ? "Folder" : bytes(f.size)}</span>
+      </div>
+    );
+  return (
+    <div
+      className={`row file-row${selected ? " sel" : ""}`}
+      role="button"
+      tabIndex={0}
+      aria-pressed={selecting ? selected : undefined}
+      onClick={() => activate(f)}
+      onKeyDown={(e) => {
+          if (!shouldActivateRowOnKey(e)) return;
+          e.preventDefault();
+          activate(f);
+        }}
+      {...press(f)}
+    >
+      {selecting && <Icon name={selected ? "checked" : "unchecked"} size={24} className={`check${selected ? " on" : ""}`} />}
+      <FileIcon f={f} />
+      {onEnter && <Icon name="chevron" size={16} className="file-tree-chev" />}
+      <span className="main">
+        <b>
+          {f.name}
+          {favorite && <Icon name="star-filled" size={13} className="fav" />}
+          {shared && <Icon name="folder-share" size={14} className="shared" />}
+        </b>
+        <span>{showParent ? parentOf(f.path) : sub}</span>
+      </span>
+      {!selecting && !inTrash && !f.path.startsWith("/Trash/") && offersDownload([{ directory: isDir(f) }]) && offersFile(f) && (
+        <button
+          className="icon-btn row-dl"
+          style={{ alignSelf: "center" }}
+          aria-label={`Download ${f.name}`}
+          title="Download"
+          onClick={(e) => {
+            e.stopPropagation();
+            onDownload(f);
+          }}
+        >
+          <Icon name="download" size={18} />
+        </button>
+      )}
+      {!selecting && !inTrash && !f.path.startsWith("/Trash/") && (f.operations.includes("favorite") || favorite) && (
+        <button
+          className="icon-btn"
+          style={{ alignSelf: "center", background: "transparent" }}
+          aria-pressed={favorite}
+          aria-label={favorite ? `Unfavorite ${f.name}` : `Favorite ${f.name}`}
+          title={favorite ? "Unfavorite" : "Favorite"}
+          onPointerDown={(e) => e.stopPropagation()}
+          onClick={(e) => {
+            e.stopPropagation();
+            onFavorite(f);
+          }}
+        >
+          <Icon name={favorite ? "star-filled" : "star"} size={18} />
+        </button>
+      )}
+      {!selecting && (
+        <button
+          className="icon-btn"
+          style={{ alignSelf: "center", background: "transparent" }}
+          aria-label={`More for ${f.name}`}
+          onClick={(e) => {
+            e.stopPropagation();
+            onMore(f);
+          }}
+        >
+          <Icon name="dots" size={18} />
+        </button>
+      )}
+      {onEnter && (
+        <button
+          className="icon-btn"
+          style={{ alignSelf: "center", background: "transparent" }}
+          aria-label={`Go into ${f.name}`}
+          title="Go into folder"
+          onPointerDown={(e) => e.stopPropagation()}
+          onClick={(e) => {
+            e.stopPropagation();
+            onEnter(f);
+          }}
+        >
+          <Icon name="back" size={18} style={{ transform: "rotate(180deg)" }} />
+        </button>
+      )}
+    </div>
+  );
+});
+
 // ---- item sheet with preview ---------------------------------------------------------------
 function ItemSheet(p: {
   f: FileEntry;
   inTrash: boolean;
   favorite: boolean;
   shared?: SmbShare;
+  canShare?: boolean;
   onClose: () => void;
+  onSelect: () => void;
   onOpenFolder: () => void;
   onView?: () => void;
   onDownload: () => void;
@@ -1333,6 +2075,9 @@ function ItemSheet(p: {
   onTrash: () => void;
   onRestore: () => void;
   onDelete: () => void;
+  quickTransfer?: boolean;
+  onQrShare?: () => void;
+  onQrUpload?: () => void;
 }) {
   const desk = useDesktop();
   const { f } = p;
@@ -1389,18 +2134,46 @@ function ItemSheet(p: {
       ]
     : [
         {
+          id: "download-zip",
+          label: "Download zip",
+          icon: "download",
+          onClick: p.onDownload,
+          show: isDir(f),
+        },
+        {
           id: "share-out",
-          label: isDir(f) ? "Download zip" : "Share",
-          icon: isDir(f) ? "download" : "share",
-          onClick: isDir(f) ? p.onDownload : shareOut,
-          show: true,
+          label: "Share",
+          icon: "share",
+          onClick: shareOut,
+          show: !isDir(f),
         },
         {
           id: "download",
           label: "Download",
           icon: "download",
           onClick: p.onDownload,
-          show: !isDir(f),
+          show: offersFile(f),
+        },
+        {
+          id: "qr-share",
+          label: "Share via QR code",
+          icon: "share",
+          onClick: () => p.onQrShare?.(),
+          show: !!p.quickTransfer && !isDir(f) && offersFile(f),
+        },
+        {
+          id: "qr-upload",
+          label: "Upload from phone",
+          icon: "upload",
+          onClick: () => p.onQrUpload?.(),
+          show: !!p.quickTransfer && isDir(f) && can("writable"),
+        },
+        {
+          id: "select",
+          label: "Select",
+          icon: "checked",
+          onClick: p.onSelect,
+          show: f.operations.length > 0,
         },
         {
           id: "rename",
@@ -1435,7 +2208,7 @@ function ItemSheet(p: {
           label: p.shared ? "Unshare" : "Network share",
           icon: "folder-share",
           onClick: p.onShare,
-          show: isDir(f) && (can("share") || !!p.shared),
+          show: !!p.canShare && isDir(f) && (can("share") || !!p.shared),
         },
         {
           id: "desk",
@@ -1448,7 +2221,10 @@ function ItemSheet(p: {
           show: !!desk && isDir(f),
         },
       ];
-  const shown = actions.filter((a) => a.show);
+  const shown = actionsForItems(
+    actions.filter((a) => a.show),
+    [{ directory: isDir(f) }],
+  );
   return (
     <Sheet open onClose={p.onClose} label={f.name}>
       <SheetHeader
@@ -1457,7 +2233,7 @@ function ItemSheet(p: {
         subtitle={isDir(f) ? "Folder" : `${bytes(f.size)} · ${ago(f.modified)}`}
         onClose={p.onClose}
       />
-      {!p.inTrash && !isDir(f) && <Preview f={f} kind={k} />}
+      {!p.inTrash && offersFile(f) && <Preview f={f} kind={k} />}
       {!isDir(f) && !p.inTrash && p.onView && (
         <div className="primary-row">
           <button className="btn primary" onClick={p.onView}>
@@ -1474,14 +2250,14 @@ function ItemSheet(p: {
           </button>
         </div>
       )}
-      {p.shared && (
+      {p.canShare && p.shared && (
         <button
           className="glass card press share-chip"
           onClick={() => p.onShareInfo(p.shared!)}
         >
           <Icon name="folder-share" size={20} />
           <span>
-            Shared as <b>{p.shared.sharename}</b> on your network
+            Shared as <b>{p.shared.sharename}</b> on your home LAN
           </span>
           <Icon name="chevron" size={16} className="muted" />
         </button>
@@ -1511,7 +2287,7 @@ function ItemSheet(p: {
         {!isDir(f) && (
           <div className="row static">
             <span className="k">Kind</span>
-            <span className="v">{f.type.split("/").pop()}</span>
+            <span className="v">{fileKindLabel(f)}</span>
           </div>
         )}
         {f.modified ? (
@@ -1608,6 +2384,7 @@ function NamePrompt({
   initial,
   submit,
   selectStem,
+  requireChange,
   onClose,
   onSubmit,
 }: {
@@ -1615,6 +2392,7 @@ function NamePrompt({
   initial: string;
   submit: string;
   selectStem?: boolean;
+  requireChange?: boolean;
   onClose: () => void;
   onSubmit: (name: string) => Promise<void>;
 }) {
@@ -1628,15 +2406,14 @@ function NamePrompt({
     const dot = initial.lastIndexOf(".");
     el.setSelectionRange(0, selectStem && dot > 0 ? dot : initial.length);
   }, [initial, selectStem]);
-  const valid =
-    name.trim() !== "" && !name.includes("/") && name !== "." && name !== "..";
+  const canSubmit = canSubmitNamePrompt({ name, initial, requireChange, busy });
   return (
     <Sheet open onClose={onClose} label={title}>
       <SheetHeader title={title} onClose={onClose} />
       <form
         onSubmit={async (e) => {
           e.preventDefault();
-          if (!valid) return;
+          if (!canSubmit) return;
           setBusy(true);
           await onSubmit(name.trim()).catch(() => {});
           setBusy(false);
@@ -1658,7 +2435,7 @@ function NamePrompt({
         </div>
         <button
           className="btn primary block"
-          disabled={!valid || busy || name === initial}
+          disabled={!canSubmit}
         >
           {busy && <span className="spinner" />}
           {submit}
@@ -1673,6 +2450,7 @@ function FolderPicker({
   mode,
   count,
   start,
+  places,
   exclude,
   onClose,
   onPick,
@@ -1680,18 +2458,38 @@ function FolderPicker({
   mode: "move" | "copy";
   count: number;
   start: string;
+  places: {path: string; name: string}[];
   exclude: string[];
   onClose: () => void;
   onPick: (dir: string) => Promise<void>;
 }) {
   const [dir, setDir] = useState(start);
   const [busy, setBusy] = useState(false);
-  const listing = useListing(dir, "name");
-  const folders = (listing.data?.files ?? []).filter(
-    (f) => isDir(f) && !exclude.includes(f.path),
-  );
+  const here = parseComputerPlace(dir);
+  const listing = useListing(here ? null : dir, "name");
+  const computerList = useQuery({
+    queryKey: ["swarm.files.list", here?.id ?? "", here?.rel ?? ""],
+    queryFn: () => query<{entries: {name: string; dir: boolean}[]}>("swarm.files.list", {id: here?.id, path: here?.rel ?? ""}),
+    enabled: !!here,
+  });
+  const serverFolders = (listing.data?.files ?? [])
+    .filter((f) => isDir(f) && !exclude.includes(f.path))
+    .map((f) => ({path: f.path, name: f.name}));
+  const computerFolders = (computerList.data?.entries ?? []).flatMap((entry) => {
+    if (!entry.dir || !here) return [];
+    const next = computerPlacePath(here.id, here.rel ? `${here.rel}/${entry.name}` : entry.name);
+    if (!next || exclude.includes(next)) return [];
+    return [{path: next, name: entry.name}];
+  });
+  const folders = here ? computerFolders : serverFolders;
+  const loading = here ? computerList.isLoading : listing.isLoading;
+  const failed = here ? computerList.error : listing.error;
   const blocked = exclude.some((p) => dir === p || dir.startsWith(`${p}/`));
-  const roots = ["/Home", "/External", "/Network"];
+  const upTo = here ? filesParent(dir) : dir.split("/").filter(Boolean).length > 1 ? parentOf(dir) : null;
+  const roots = [
+    ...folderPickerRoots().map((path) => ({path, name: titleOf(path)})),
+    ...places.filter((place) => isServedFilePlace(place.path)),
+  ];
   return (
     <Sheet
       open
@@ -1701,17 +2499,18 @@ function FolderPicker({
     >
       <SheetHeader
         title={`${mode === "move" ? "Move" : "Copy"} ${count === 1 ? "1 item" : `${count} items`}`}
-        subtitle={`to ${dir}`}
+        subtitle={`to ${pickerTitle(dir, places)}`}
         onClose={onClose}
       />
       <div className="chips" style={{ marginBottom: 10 }}>
         {roots.map((r) => (
           <button
-            key={r}
-            className={`chip${dir === r || dir.startsWith(`${r}/`) ? " on" : ""}`}
-            onClick={() => setDir(r)}
+            key={r.path}
+            className={`chip${dir === r.path || dir.startsWith(`${r.path}/`) ? " on" : ""}`}
+            aria-pressed={dir === r.path || dir.startsWith(`${r.path}/`)}
+            onClick={() => setDir(r.path)}
           >
-            {titleOf(r)}
+            {r.name}
           </button>
         ))}
       </div>
@@ -1727,11 +2526,11 @@ function FolderPicker({
           className="glass group"
           style={{ borderRadius: 18, "--inset": "62px" } as CSSProperties}
         >
-          {dir.split("/").length > 2 && (
+          {upTo && (
             <button
               className="row"
               style={{ minHeight: 54 }}
-              onClick={() => setDir(parentOf(dir))}
+              onClick={() => setDir(upTo)}
             >
               <span
                 className="row-ico"
@@ -1740,11 +2539,11 @@ function FolderPicker({
                 <Icon name="back" size={18} />
               </span>
               <span className="main">
-                <b style={{ fontWeight: 550 }}>{titleOf(parentOf(dir))}</b>
+                <b style={{ fontWeight: 550 }}>{pickerTitle(upTo, places)}</b>
               </span>
             </button>
           )}
-          {listing.isLoading && (
+          {loading && (
             <div className="row static">
               <span className="spinner" />
             </div>
@@ -1768,7 +2567,7 @@ function FolderPicker({
               <Icon name="chevron" size={18} className="chev" />
             </button>
           ))}
-          {!listing.isLoading && folders.length === 0 && (
+          {!loading && folders.length === 0 && (
             <div className="row static muted">No folders here</div>
           )}
         </div>
@@ -1776,7 +2575,7 @@ function FolderPicker({
       <button
         className="btn primary block"
         style={{ marginTop: 14 }}
-        disabled={busy || blocked || !!listing.error}
+        disabled={busy || blocked || !!failed}
         onClick={async () => {
           setBusy(true);
           await onPick(dir);
@@ -1852,9 +2651,36 @@ function UploadPanel({
 }
 
 // ---- SMB share info ----------------------------------------------------------------------------------
-// Share a folder on your network (Samba), or see and change how it's shared. Other computers open
+// Share a folder on your home LAN (Samba), or see and change how it's shared. Other computers open
 // it at smb://<server>/<name>; with a password, they sign in with your server account's user name
 // and your share password.
+/** Module-level radio choice so re-renders keep focus on the active access option. */
+function ShareAccessChoice({
+  name,
+  on,
+  title,
+  note,
+  onPick,
+  disabled,
+}: {
+  name: string;
+  on: boolean;
+  title: string;
+  note: string;
+  onPick: () => void;
+  disabled?: boolean;
+}) {
+  return (
+    <label style={{ display: "flex", gap: 10, alignItems: "flex-start", padding: "8px 2px", fontSize: 14.5, opacity: disabled ? 0.55 : 1 }}>
+      <input type="radio" name={name} checked={on} disabled={disabled} onChange={onPick} />
+      <span>
+        {title}
+        <small className="muted" style={{ display: "block" }}>{note}</small>
+      </span>
+    </label>
+  );
+}
+
 export function ShareSheet({
   path,
   name,
@@ -1871,6 +2697,7 @@ export function ShareSheet({
   const toast = useToast();
   const qc = useQueryClient();
   const confirm = useConfirm();
+  const accessRadioName = useId();
   const shares = useQuery({ queryKey: ["files.shares"], queryFn: () => query<SmbShare[]>("files.shares") });
   const options = useQuery({
     queryKey: ["files.shareOptions"],
@@ -1903,28 +2730,22 @@ export function ShareSheet({
     onError: (e) => toast((e as Error).message, true),
   });
   const copy = (v: string, what: string) =>
-    navigator.clipboard?.writeText(v).then(
+    copyTextOrToast(
+      navigator.clipboard?.writeText ? (text) => navigator.clipboard.writeText(text) : undefined,
+      v,
       () => toast(`${what} copied`),
       () => toast(v),
     );
   const noPasswordOk = options.data?.noPassword === true;
-  const Choice = ({ on, title, note, onPick, disabled }: { on: boolean; title: string; note: string; onPick: () => void; disabled?: boolean }) => (
-    <label style={{ display: "flex", gap: 10, alignItems: "flex-start", padding: "8px 2px", fontSize: 14.5, opacity: disabled ? 0.55 : 1 }}>
-      <input type="radio" checked={on} disabled={disabled} onChange={onPick} />
-      <span>
-        {title}
-        <small className="muted" style={{ display: "block" }}>{note}</small>
-      </span>
-    </label>
-  );
   const passwordChoices = (current: boolean, pick: (v: boolean) => void) => (
     <div className="glass card" style={{ borderRadius: 18, marginBottom: 12 }}>
       <b style={{ fontSize: 14 }}>Who can open it</b>
-      <Choice on={current} title="Password needed" note={`Sign in as ${username ?? "your server user"} with your share password.`} onPick={() => pick(true)} />
-      <Choice
+      <ShareAccessChoice name={accessRadioName} on={current} title="Password needed" note={`Sign in as ${username ?? "your server user"} with your share password.`} onPick={() => pick(true)} />
+      <ShareAccessChoice
+        name={accessRadioName}
         on={!current}
         title="No password"
-        note={noPasswordOk ? "Anyone on your network can open it. Only for folders you don’t mind anyone at home seeing." : "Needs Omarchy Server’s installer to run once more on this server."}
+        note={noPasswordOk ? "Anyone on your home LAN can open it. Writes are not saved as you. Only for folders you don’t mind anyone at home seeing." : "Needs the installer to run once more on this server."}
         onPick={() => pick(false)}
         disabled={!noPasswordOk}
       />
@@ -1954,7 +2775,13 @@ export function ShareSheet({
           </span>
         }
         title={share?.name ?? name}
-        subtitle={share ? "Shared on your network" : "Share this folder with computers on your network"}
+        subtitle={
+          share
+            ? share.available === false
+              ? "This folder is no longer there"
+              : "Shared on your home LAN"
+            : "Share this folder with computers on your home LAN"
+        }
         onClose={onClose}
       />
       {samba && !samba.ok && (
@@ -2013,9 +2840,23 @@ export function ShareSheet({
               </button>
             )}
             {share.password && (
-              <button className="row" style={{ minHeight: 56 }} onClick={() => (pw.data ? copy(pw.data, "Password") : setReveal(true))}>
+              <button
+                className="row"
+                style={{ minHeight: 56 }}
+                onClick={() => {
+                  const action = sharePasswordAction({ data: pw.data, reveal, isFetching: pw.isFetching });
+                  if (action === "copy") copy(pw.data!, "Password");
+                  else if (action === "refetch") void pw.refetch();
+                  else if (action === "reveal") setReveal(true);
+                }}
+              >
                 <span className="k">Password</span>
-                <span className="v mono" style={{ fontSize: 12.5 }}>{pw.data ?? (pw.isFetching ? "…" : "Tap to show")}</span>
+                <span
+                  className={!pw.data && pw.error && !pw.isFetching ? "v" : "v mono"}
+                  style={{ fontSize: 12.5, ...(!pw.data && pw.error && !pw.isFetching ? { color: "var(--red)" } : {}) }}
+                >
+                  {sharePasswordLabel({ data: pw.data, isFetching: pw.isFetching, error: pw.error })}
+                </span>
               </button>
             )}
           </div>
@@ -2062,3 +2903,4 @@ export function ShareSheet({
     </Sheet>
   );
 }
+

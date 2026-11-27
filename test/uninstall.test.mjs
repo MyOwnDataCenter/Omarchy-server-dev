@@ -97,6 +97,49 @@ const filesKept = async (box) => {
 	assert.equal(await exists(join(box.home, 'Documents/mine.txt')), true, 'your files are never touched')
 }
 
+// Root files the helper wrote. A successful uninstall logs their removal and does not tell the
+// user they were left behind. `sudo` only records the command, so smb.conf itself is not rewritten here.
+const rootLeftovers = [
+	['udev sleep rule', /sudo rm -f[^\n]*\/etc\/udev\/rules\.d\/69-omarchy-server-sleep\.rules/],
+	['udev usb rule', /sudo rm -f[^\n]*\/etc\/udev\/rules\.d\/69-omarchy-server-usb\.rules/],
+	['udev reload', /sudo udevadm control --reload/],
+	['port sysctl file', /sudo rm -f \/etc\/sysctl\.d\/60-omarchy-server-ports\.conf/],
+	['sysctl reload', /sudo sysctl --system/],
+	['shares conf', /sudo rm -f \/etc\/samba\/omarchy-server-shares\.conf/],
+	['445', /sudo ufw delete allow 445\/tcp\n/],
+	['445 lan 10', /sudo ufw delete allow from 10\.0\.0\.0\/8 to any port 445 proto tcp\n/],
+	['445 lan 172', /sudo ufw delete allow from 172\.16\.0\.0\/12 to any port 445 proto tcp\n/],
+	['445 lan 192', /sudo ufw delete allow from 192\.168\.0\.0\/16 to any port 445 proto tcp\n/],
+]
+const notLeftBehind = (out) => {
+	assert.doesNotMatch(out, /69-omarchy-server-(?:sleep|usb)\.rules/)
+	assert.doesNotMatch(out, /60-omarchy-server-ports\.conf/)
+	assert.doesNotMatch(out, /omarchy-server-shares\.conf/)
+	assert.doesNotMatch(out, /SMB shares/)
+}
+
+test('uninstall removes udev rules, the port sysctl file and Samba shares', async () => {
+	for (const args of [['-y'], ['--purge', '-y']]) {
+		const box = await install(`root-${args.includes('--purge') ? 'purge' : 'keep'}`)
+		const r = run(box, args)
+		assert.equal(r.status, 0, r.out)
+		const c = await calls(box)
+		for (const [name, pattern] of rootLeftovers) assert.match(c, pattern, name)
+		notLeftBehind(r.out)
+	}
+})
+
+test('when sudo cannot run, the commands to remove udev rules, the sysctl file and Samba shares are printed', async () => {
+	for (const args of [['-y'], ['--purge', '-y']]) {
+		const box = await install(`root-nosudo-${args.includes('--purge') ? 'purge' : 'keep'}`)
+		const r = run(box, args, {FAKE_SUDO_FAILS: '1'})
+		assert.equal(r.status, 1, r.out)
+		for (const [name, pattern] of rootLeftovers) assert.match(r.out, pattern, name)
+		assert.match(r.out, /include = \/etc\/samba\/omarchy-server-shares\.conf/)
+		assert.ok(!(await calls(box)).includes('sudo '), 'sudo was never run')
+	}
+})
+
 test('uninstall removes the program and keeps the account, the apps’ data and your files', async () => {
 	const box = await install('keep')
 	const r = run(box, ['-y'])
@@ -188,7 +231,7 @@ test('--purge deletes everything Omarchy Server keeps, but never your files', as
 	const box = await install('purge')
 	const r = run(box, ['--purge', '-y'])
 	assert.equal(r.status, 0, r.out)
-	assert.match(r.out, /Omarchy Server and its data are gone/)
+	assert.match(r.out, /My Own Data Center and its data are gone/)
 	assert.equal(await exists(join(box.base, 'omarchyd/accounts.json')), false)
 	assert.equal(await exists(join(box.base, 'omarchyd/apps/installed/demo/data/notes.txt')), false)
 	assert.equal((await readdir(join(box.home, '.local/share'))).includes('omarchy-server'), false, 'the whole data folder is gone')
@@ -204,6 +247,103 @@ test('without a terminal and without -y it asks nothing and does nothing', async
 	assert.match(r.out, /no terminal to ask in/i)
 	assert.equal(await exists(join(box.base, 'app/bin/omarchy-server')), true)
 	assert.equal(await calls(box), '')
+})
+
+test('#551: root cleanup is issued even when stopping the user service would kill the script', async () => {
+	const box = await install('killed-by-stop')
+	await writeFile(
+		join(box.bin, 'systemctl'),
+		`#!/bin/sh
+echo "systemctl $*" >>"$FAKE_LOG"
+case " $* " in
+  *" disable --now "*omarchyd.service*)
+    kill -TERM "$PPID" 2>/dev/null || true
+    ;;
+esac
+exit 0
+`,
+	)
+	const r = run(box, ['-y'])
+	const c = await calls(box)
+	const stopAt = c.search(/systemctl --user disable --now omarchyd\.service/)
+	assert.ok(stopAt >= 0, `stop was not recorded\n${c}\n${r.out}`)
+	const before = c.slice(0, stopAt)
+	assert.match(before, /sudo rm -f \/etc\/sudoers\.d\/omarchy-server/, 'sudoers removed before the service stop')
+	assert.match(before, /sudo rm -rf \/usr\/local\/libexec\/omarchy-server/)
+	assert.match(before, /sudo ufw delete allow 7780\/tcp/)
+	assert.match(before, /sudo rm -f \/etc\/udev\/rules\.d\/69-omarchy-server-sleep\.rules/)
+	assert.match(before, /sudo rm -f \/etc\/sysctl\.d\/60-omarchy-server-ports\.conf/)
+	assert.equal(await exists(join(box.base, 'app/bin/omarchy-server')), false, 'the program is removed before the stop')
+	assert.equal(await exists(join(box.units, 'omarchyd.service')), false, 'the unit file is removed before the stop')
+	assert.equal(await exists(join(box.home, '.local/bin/omarchy-server')), false)
+})
+
+test('#758: when the low-ports sysctl file existed, uninstall restores the kernel default', async () => {
+	const box = await install('sysctl-was')
+	const conf = join(root, '60-omarchy-server-ports.conf')
+	await write(conf, 'net.ipv4.ip_unprivileged_port_start = 53\n')
+	const r = run(box, ['-y'], {OMARCHY_SERVER_PORTS_CONF: conf})
+	assert.equal(r.status, 0, r.out)
+	const c = await calls(box)
+	const rmAt = c.indexOf(`sudo rm -f ${conf}`)
+	const wAt = c.indexOf('sudo sysctl -w net.ipv4.ip_unprivileged_port_start=1024')
+	assert.ok(rmAt >= 0, c)
+	assert.ok(wAt > rmAt, c)
+
+	const absent = await install('sysctl-absent')
+	const missing = join(root, 'no-such-ports.conf')
+	const r2 = run(absent, ['-y'], {OMARCHY_SERVER_PORTS_CONF: missing})
+	assert.equal(r2.status, 0, r2.out)
+	assert.doesNotMatch(await calls(absent), /ip_unprivileged_port_start=1024/)
+})
+
+test('#758: the manual sudo list restores the unprivileged port start', async () => {
+	const box = await install('sysctl-manual')
+	const r = run(box, ['-y'], {FAKE_SUDO_FAILS: '1'})
+	assert.equal(r.status, 1, r.out)
+	assert.match(r.out, /sudo sysctl -w net\.ipv4\.ip_unprivileged_port_start=1024/)
+})
+
+test('#757: smb.service is stopped only when smb.conf is managed by Omarchy Server', async () => {
+	const managed = await install('smb-managed')
+	const managedConf = join(root, 'smb-managed.conf')
+	await write(managedConf, '# Managed by Omarchy Server\n[global]\n')
+	const r1 = run(managed, ['-y'], {OMARCHY_SERVER_SMB_CONF: managedConf})
+	assert.equal(r1.status, 0, r1.out)
+	assert.match(await calls(managed), /sudo systemctl disable --now smb\.service/)
+	assert.doesNotMatch(r1.out, /Samba was not touched/)
+
+	const own = await install('smb-own')
+	const ownConf = join(root, 'smb-own.conf')
+	await write(ownConf, '# a file the owner keeps\n[global]\n   workgroup = HOME\n')
+	const r2 = run(own, ['-y'], {OMARCHY_SERVER_SMB_CONF: ownConf})
+	assert.equal(r2.status, 0, r2.out)
+	assert.doesNotMatch(await calls(own), /disable --now smb\.service/)
+	assert.match(r2.out, /Samba was not touched/)
+
+	const none = await install('smb-none')
+	const missing = join(root, 'smb-missing.conf')
+	const r3 = run(none, ['-y'], {OMARCHY_SERVER_SMB_CONF: missing})
+	assert.equal(r3.status, 0, r3.out)
+	assert.doesNotMatch(await calls(none), /disable --now smb\.service/)
+	assert.match(r3.out, /Samba was not touched/)
+})
+
+test('#757: the manual sudo list disables Samba only for the managed smb.conf', async () => {
+	const managed = await install('smb-manual-managed')
+	const managedConf = join(root, 'smb-manual-managed.conf')
+	await write(managedConf, '# Managed by Omarchy Server\n')
+	const listed = run(managed, ['-y'], {FAKE_SUDO_FAILS: '1', OMARCHY_SERVER_SMB_CONF: managedConf})
+	assert.equal(listed.status, 1, listed.out)
+	assert.match(listed.out, /sudo systemctl disable --now smb\.service/)
+
+	const own = await install('smb-manual-own')
+	const ownConf = join(root, 'smb-manual-own.conf')
+	await write(ownConf, '# owner\n')
+	const left = run(own, ['-y'], {FAKE_SUDO_FAILS: '1', OMARCHY_SERVER_SMB_CONF: ownConf})
+	assert.equal(left.status, 1, left.out)
+	assert.match(left.out, /Samba was not touched/)
+	assert.doesNotMatch(left.out, /disable --now smb\.service/)
 })
 
 test('an unknown option is refused, and help lists the command', async () => {

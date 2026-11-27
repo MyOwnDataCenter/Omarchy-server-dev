@@ -10,6 +10,16 @@ export function takeLine(value, chunk) {
 			const next = ch === '\r' && chunk[i + 1] === '\n' ? i + 2 : i + 1
 			return {done: true, value, rest: chunk.slice(next)}
 		}
+		// Arrow, Home, and Delete arrive as ESC [ … or ESC O … . Dropping only the ESC
+		// byte leaves the rest ("[D", "[3~") in the hidden password.
+		if (ch === '\u001b') {
+			const intro = chunk[i + 1]
+			if (intro === '[' || intro === 'O') {
+				i += 2
+				while (i < chunk.length && chunk[i] !== '~' && !(chunk[i] >= 'A' && chunk[i] <= 'Z') && !(chunk[i] >= 'a' && chunk[i] <= 'z')) i++
+			}
+			continue
+		}
 		if (ch === '\u007f' || ch === '\b') value = [...value].slice(0, -1).join('')
 		else if (ch >= ' ' || ch > '\u007f') value += ch
 	}

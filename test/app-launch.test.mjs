@@ -1,6 +1,7 @@
 // Opening an app: is its web page usable right now? One server-side answer (readinessOf) that every
 // Open button follows, so a running app with a dead web port isn't waited on for three minutes.
 import assert from 'node:assert/strict'
+import {gitArgv} from './git-nosign.mjs'
 import {execFileSync} from 'node:child_process'
 import {mkdir, mkdtemp, rm, writeFile} from 'node:fs/promises'
 import http from 'node:http'
@@ -41,7 +42,7 @@ describe('readinessOf', () => {
 describe('apps.probe', () => {
 	let root, d, auth, port, tlsFiles
 	const up = new Set()
-	const git = (args, cwd) => execFileSync('git', args, {cwd, stdio: 'pipe'}).toString()
+	const git = (args, cwd) => execFileSync('git', gitArgv(args), {cwd, stdio: 'pipe'}).toString()
 	const run = async (cmd, args, opts = {}) => {
 		if (cmd === 'git') return git(args, opts.cwd)
 		if (cmd === 'docker-compose') {

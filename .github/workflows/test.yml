@@ -22,6 +22,8 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm run build
-      # For the local swarm's desktop test (a virtual X screen shared by x11vnc).
-      - run: sudo apt-get update -qq && sudo apt-get install -y -qq xvfb x11vnc
+      # The swarm computers' root helper (connector/helper.py) can format disks: its checks are tested here.
+      - run: python3 -m unittest discover -s connector -p 'test_*.py'
+      # For the local swarm's desktop test (xvfb/x11vnc) and native VA-API capture engine compile gate.
+      - run: sudo DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=3 -o Acquire::http::Timeout=20 update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=3 -o Acquire::http::Timeout=20 install -y -qq --no-install-recommends -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" xvfb x11vnc pkg-config libgbm-dev libdrm-dev libva-dev libavcodec-dev libavfilter-dev libavutil-dev
       - run: npm test

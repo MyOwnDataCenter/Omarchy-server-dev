@@ -1,6 +1,7 @@
 // The app list stays quick and current while apps install: one podman check for all apps,
 // shared between polls, and never held up while podman is busy downloading an image.
 import assert from 'node:assert/strict'
+import {gitArgv} from './git-nosign.mjs'
 import {execFileSync} from 'node:child_process'
 import {mkdir, mkdtemp, rm, stat, symlink, writeFile} from 'node:fs/promises'
 import http from 'node:http'
@@ -15,7 +16,7 @@ describe('the app list while apps install', () => {
 	let root, home, data, d, auth, appPort, calls, upstream, store
 	let psCalls = 0, composePs = 0, psHang = null
 	const running = new Set()
-	const git = (args, cwd) => execFileSync('git', args, {cwd, stdio: 'pipe'}).toString()
+	const git = (args, cwd) => execFileSync('git', gitArgv(args), {cwd, stdio: 'pipe'}).toString()
 	const run = async (cmd, args, opts = {}) => {
 		if (cmd === 'git') return git(args, opts.cwd)
 		if (cmd === 'docker-compose') {

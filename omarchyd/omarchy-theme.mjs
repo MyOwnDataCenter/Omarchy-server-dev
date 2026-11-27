@@ -13,19 +13,21 @@ const EXTRA = require('./omarchy-extra-themes.json')
 
 const TYPES = {'.png': 'image/png', '.webp': 'image/webp', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg'}
 const idOf = (path) => createHash('sha256').update(path).digest('hex').slice(0, 16)
-const HEX = /^#?([0-9a-f]{6})$/i
 const SLUG = /^[a-z0-9_][a-z0-9._+-]{0,80}$/
 
 // "tokyo-night" -> "Tokyo Night" (as omarchy-theme-list shows it)
 export const themeLabel = (name) => String(name).replace(/[-_]+/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase())
+const extraName = new Map(EXTRA.themes.map((t) => [t.slug, t.name]))
+// Community themes keep the name from the extra-themes list; themeLabel is only for anything else.
+export const themeDisplayName = (slug) => extraName.get(slug) ?? themeLabel(slug)
 
 // Colours from a theme folder: colors.toml (current Omarchy) or alacritty.toml (older themes).
 export function parseThemeColors(text) {
 	const out = {}
 	const pick = (key, section) => {
 		const scope = section ? (new RegExp(`\\[${section.replace('.', '\\.')}\\]([\\s\\S]*?)(?:\\n\\[|$)`).exec(text)?.[1] ?? '') : text
-		const m = new RegExp(`^\\s*${key}\\s*=\\s*["']?(#?[0-9a-fA-F]{6})["']?`, 'm').exec(scope)
-		return m && HEX.test(m[1]) ? `#${HEX.exec(m[1])[1].toLowerCase()}` : null
+		const m = new RegExp(`^\\s*${key}\\s*=\\s*["']?(?:#|0[xX])?([0-9a-fA-F]{6})["']?`, 'm').exec(scope)
+		return m ? `#${m[1].toLowerCase()}` : null
 	}
 	out.background = pick('background', 'colors.primary') ?? pick('background') ?? pick('color0')
 	out.foreground = pick('foreground', 'colors.primary') ?? pick('foreground') ?? pick('color7')
@@ -33,7 +35,7 @@ export function parseThemeColors(text) {
 	// Top-level red/green/… (colors.toml), [colors.normal] (alacritty.toml) or color1…4.
 	const tone = (name, n) => pick(name, 'colors.normal') ?? pick(name) ?? pick(`color${n}`)
 	out.dots = [tone('blue', 4), tone('green', 2), tone('yellow', 3), tone('red', 1)].filter(Boolean)
-	// The whole palette, so Omarchy Server's own icons and colours can follow the desktop's theme.
+	// The whole palette, so My Own Data Center's own icons and colours can follow the desktop's theme.
 	const palette = {red: tone('red', 1), green: tone('green', 2), yellow: tone('yellow', 3), blue: tone('blue', 4), magenta: tone('magenta', 5), cyan: tone('cyan', 6), black: tone('black', 0), brightBlack: pick('black', 'colors.bright') ?? pick('color8')}
 	if (Object.values(palette).some(Boolean)) out.palette = Object.fromEntries(Object.entries(palette).filter(([, v]) => v))
 	return out
@@ -109,15 +111,19 @@ export function createOmarchyTheme({home, run = null, env = process.env, systemS
 		const next = new Map()
 		const groups = [...themes]
 			.sort(([a], [b]) => (a === current ? -1 : b === current ? 1 : a.localeCompare(b)))
-			.map(([name, files]) => ({
-				theme: name,
-				label: themeLabel(name),
-				items: [...files.keys()].map((real) => {
+			.map(([name, files]) => {
+				const seen = new Set()
+				const items = []
+				for (const real of files.keys()) {
 					const id = idOf(real)
 					next.set(id, real)
-					return {id, name: basename(real).replace(/\.[^.]+$/, '')}
-				}),
-			}))
+					const label = basename(real).replace(/\.[^.]+$/, '')
+					if (seen.has(label)) continue
+					seen.add(label)
+					items.push({id, name: label})
+				}
+				return {theme: name, label: themeLabel(name), items}
+			})
 		if (currentBg && TYPES[extname(currentBg).toLowerCase()]) next.set(idOf(currentBg), currentBg)
 		index = next
 		return {theme: current, label: current ? themeLabel(current) : null, current: currentBg ? idOf(currentBg) : null, colors: await colors(), groups}
@@ -142,7 +148,7 @@ export function createOmarchyTheme({home, run = null, env = process.env, systemS
 		const installed = []
 		for (const [slug, {dir, user}] of [...dirs].sort(([a], [b]) => a.localeCompare(b))) {
 			const preview = (await exists(join(dir, 'preview.png'))) || (await images(join(dir, 'backgrounds'))).length > 0
-			installed.push({slug, name: themeLabel(slug), user, current: slug === current, colors: await colorsIn(dir), preview, ...(jobs.has(slug) ? {job: jobs.get(slug)} : {})})
+			installed.push({slug, name: themeDisplayName(slug), user, current: slug === current, colors: await colorsIn(dir), preview, ...(jobs.has(slug) ? {job: jobs.get(slug)} : {})})
 		}
 		const more = EXTRA.themes
 			.filter((t) => !dirs.has(t.slug))
@@ -198,7 +204,8 @@ export function createOmarchyTheme({home, run = null, env = process.env, systemS
 			() => jobs.delete(slug),
 			(e) => {
 				jobs.set(slug, {state: 'error', error: e.message})
-				setTimeout(() => jobs.get(slug)?.state === 'error' && jobs.delete(slug), 5 * 60_000)
+				// Keep the error on the theme list briefly, without holding the process open.
+				setTimeout(() => jobs.get(slug)?.state === 'error' && jobs.delete(slug), 5 * 60_000).unref()
 			},
 		)
 	}
@@ -207,6 +214,27 @@ export function createOmarchyTheme({home, run = null, env = process.env, systemS
 		if (!SLUG.test(String(slug)) || !(await themeDirs()).has(slug)) throw Object.assign(new Error('That theme isn’t installed'), {code: 'NOT_FOUND'})
 		if (jobs.get(slug)?.state === 'switching') return true
 		job(slug, 'switching', inTurn('omarchy-theme-set', [slug]))
+		return true
+	}
+	async function backgrounds(input = {}) {
+		const all = await list()
+		const theme = String(input?.theme ?? '').trim()
+		if (!theme || !SLUG.test(theme)) return all
+		return {...all, groups: all.groups.filter((g) => g.theme === theme)}
+	}
+	async function setBackground(id, theme) {
+		const hex = String(id ?? '')
+		if (!/^[0-9a-f]{16}$/.test(hex)) throw Object.assign(new Error('That background isn’t here'), {code: 'NOT_FOUND'})
+		if (!index.has(hex)) await list()
+		const path = index.get(hex)
+		if (!path) throw Object.assign(new Error('That background isn’t here'), {code: 'NOT_FOUND'})
+		const slug = String(theme ?? '').trim()
+		if (slug && slug !== (await currentName())) await setTheme(slug)
+		const key = `bg:${hex}`
+		if (jobs.get(key)?.state === 'switching') return true
+		const work = inTurn('omarchy-theme-bg-set', [path])
+		job(key, 'switching', work)
+		await work
 		return true
 	}
 	// Only themes from the Omarchy manual's list are installed from here.
@@ -222,6 +250,7 @@ export function createOmarchyTheme({home, run = null, env = process.env, systemS
 		if (!d?.user) throw Object.assign(new Error('Only themes you added can be removed'), {code: 'PRECONDITION_FAILED'})
 		if ((await currentName()) === slug) throw Object.assign(new Error('Switch to another theme before removing this one'), {code: 'PRECONDITION_FAILED'})
 		await inTurn('omarchy-theme-remove', [slug])
+		jobs.delete(slug)
 		return true
 	}
 
@@ -256,7 +285,7 @@ export function createOmarchyTheme({home, run = null, env = process.env, systemS
 	}
 
 	// For the plugin store: find and run Omarchy's own commands the same way (in the desktop session).
-	return {list, serve, servePreview, colors, themes, setTheme, installTheme, removeTheme, findCommand: bin, runCommand: omarchy, currentBackground: async () => {
+	return {list, backgrounds, serve, servePreview, colors, themes, setTheme, setBackground, installTheme, removeTheme, findCommand: bin, runCommand: omarchy, currentBackground: async () => {
 		const f = await stateFile('background')
 		return f ? realpath(f).catch(() => null) : null
 	}}

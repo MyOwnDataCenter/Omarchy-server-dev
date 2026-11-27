@@ -1,19 +1,21 @@
 import {useEffect, useRef, useState} from 'react'
+import {useAppTab} from './appTab'
 import {createPortal} from 'react-dom'
 
 import {mutate, type UserApp} from './api'
 import {appUrl, useBootstrap} from './data'
 import {AppFrame} from './desktop/Desktop'
+import {useDialogFocus} from './focus'
 import {Icon} from './icons'
 import {AppIcon, haptic, lockPageScroll, usePortalRoot, useToast} from './ui'
 
-// An app opened full screen inside Omarchy Server, in this same tab, the way a phone opens an app.
+// An app opened full screen inside My Own Data Center, in this same tab, the way a phone opens an app.
 // The back button (on screen, or the browser's / phone's own) returns to where you were.
 export function AppViewer({app, onClose}: {app: UserApp; onClose: () => void}) {
 	const portalRoot = usePortalRoot()
 	const boot = useBootstrap()
 	const [reloads, setReloads] = useState(0)
-	// Some apps keep a login of their own inside (set by the app, not Omarchy Server). Their
+	// Some apps keep a login of their own inside (set by the app, not My Own Data Center). Their
 	// default details are shown here so there's nothing to look up.
 	const creds = app.credentials?.defaultPassword ? app.credentials : null
 	const seenKey = `omarchy.credsSeen.${app.id}`
@@ -40,6 +42,7 @@ export function AppViewer({app, onClose}: {app: UserApp; onClose: () => void}) {
 		} catch {}
 	}
 	const url = appUrl(app, boot.server!.host)
+	const {openTab} = useAppTab()
 	const name = app.name ?? app.id
 	const closed = useRef(false)
 	const close = useRef(onClose)
@@ -59,14 +62,16 @@ export function AppViewer({app, onClose}: {app: UserApp; onClose: () => void}) {
 		mutate('apps.trackOpen', {appId: app.id}).catch(() => {})
 		return () => window.removeEventListener('popstate', onPop)
 	}, [app.id])
+	const dialogRef = useRef<HTMLDivElement>(null)
 	const back = () => {
 		haptic(6)
 		if (!closed.current && history.state?.omarchyApp === app.id) history.back()
 		else onClose()
 	}
+	useDialogFocus(true, dialogRef, back)
 
 	return createPortal(
-		<div className="console app-viewer" role="dialog" aria-modal aria-label={name}>
+		<div ref={dialogRef} className="console app-viewer" role="dialog" aria-modal="true" aria-label={name} tabIndex={-1}>
 			<header className="console-bar">
 				<button className="round-btn" aria-label="Back" onClick={back}>
 					<Icon name="back" size={20} />
@@ -85,21 +90,21 @@ export function AppViewer({app, onClose}: {app: UserApp; onClose: () => void}) {
 					<Icon name="restart" size={19} />
 				</button>
 				{url && (
-					<a className="round-btn" aria-label="Open in a browser tab" title="Open in a browser tab" href={url} target="_blank" rel="noopener noreferrer">
+					<button className="round-btn" aria-label="Open in a browser tab" title="Open in a browser tab" onClick={() => openTab(app)}>
 						<Icon name="open" size={19} />
-					</a>
+					</button>
 				)}
 			</header>
 			{creds && showCreds && (
 				<div className="app-creds">
-					<span className="app-creds-note">{name} has its own login inside:</span>
+					<span className="app-creds-note">{creds.label === 'API token' ? 'Other programs call this job API with this token.' : `${name} has its own login inside:`}</span>
 					{creds.defaultUsername && (
 						<button className="app-creds-chip" onClick={() => copy(creds.defaultUsername!, 'Username')}>
 							<Icon name="user" size={15} />
 							{creds.defaultUsername}
 						</button>
 					)}
-					<button className="app-creds-chip" onClick={() => copy(creds.defaultPassword!, 'Password')}>
+					<button className="app-creds-chip" onClick={() => copy(creds.defaultPassword!, creds.label || 'Password')}>
 						<Icon name="key" size={15} />
 						{creds.defaultPassword}
 					</button>

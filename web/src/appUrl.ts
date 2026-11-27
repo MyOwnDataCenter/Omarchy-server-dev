@@ -1,8 +1,8 @@
 // The address an app opens at. Kept free of imports so it can be tested on its own.
 export type UrlApp = {port?: number | null; viewPort?: number | null; internalPort?: number | null; path?: string | null; requiresHttps?: boolean}
 
-// Most apps sit behind Omarchy Server's gateway on their port, which answers http:// and https://
-// alike (Omarchy Server's own certificate). https is used when this page is https (a page on https
+// Most apps sit behind My Own Data Center's gateway on their port, which answers http:// and https://
+// alike (My Own Data Center's own certificate). https is used when this page is https (a page on https
 // can't show an http one) or when the app needs a secure page.
 //
 // An app that holds its own port (host network, e.g. Home Assistant on 8123) speaks only its own

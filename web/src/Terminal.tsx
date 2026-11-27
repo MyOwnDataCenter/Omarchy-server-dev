@@ -1,18 +1,26 @@
 // Full-screen terminal: a shell on the server, or inside one app's container.
-// omarchyd streams a PTY over a WebSocket (bridged by the Touch server). Its size is
-// fixed when the shell starts, so on rotate we resize the font, not the shell.
-import {useEffect, useRef, useState} from 'react'
+// omarchyd streams a PTY over a WebSocket (bridged by the Touch server). The terminal fills its
+// window: when the window (or the phone's keyboard) changes its size, the shell is resized to
+// match, so programs reflow and full-screen ones redraw, the way a native terminal does.
+import {useContext, useEffect, useRef, useState} from 'react'
 import {createPortal} from 'react-dom'
 import {Terminal as XTerm} from '@xterm/xterm'
 import '@xterm/xterm/css/xterm.css'
 
+import {clipText} from './clips'
+import {isClipTarget, markClipTarget, unmarkClipTarget} from './clipPasteTarget'
+import {BootstrapContext} from './data'
 import {Icon} from './icons'
-import {AppIcon, haptic, lockPageScroll, useConfirm, usePortalRoot, useToast} from './ui'
+import {overlayBackUsesHistory, popstateClosesOverlay} from './overlayHistory'
+import {terminalCloseOutcome} from './terminalClose'
+import {forwardTerminalInput, ignoreOpeningFocus} from './terminalInput'
+import {isTerminalReply, pasteInto, terminalPasteDecision} from './terminalPaste'
+import {SEQ, applyTerminalModifiers} from './terminalKeys'
+import {AppIcon, haptic, useConfirm, usePortalRoot, useScreenLock, useToast} from './ui'
 
 // closed: the shell ended. lost: the connection dropped (the shell is still running on the server).
 type State = 'connecting' | 'connected' | 'closed' | 'lost' | 'error'
 const BASE_FONT = 13
-const SEQ = {esc: '\x1b', tab: '\t', up: '\x1b[A', down: '\x1b[B', right: '\x1b[C', left: '\x1b[D', home: '\x1b[H', end: '\x1b[F', ctrlC: '\x03'}
 
 // Keep a fixed-position screen inside the area the phone keyboard leaves visible.
 export function useVisualViewport(ref: React.RefObject<HTMLElement>, enabled = true) {
@@ -38,42 +46,6 @@ export function useVisualViewport(ref: React.RefObject<HTMLElement>, enabled = t
 	}, [ref, enabled])
 }
 
-// Make a full-screen overlay behave like its own window on iPhone: freeze the page underneath
-// (iOS ignores overflow:hidden on body and will scroll it to "reveal" a focused input), and
-// stop drags outside the real scroll areas from panning the page while the keyboard is up.
-export function useScreenLock(ref: React.RefObject<HTMLElement>, guardTouch = true, enabled = true) {
-	useEffect(() => {
-		if (!enabled) return
-		const html = document.documentElement
-		const b = document.body.style
-		const y = window.scrollY
-		Object.assign(b, {position: 'fixed', top: `-${y}px`, left: '0', right: '0', width: '100%'})
-		const release = lockPageScroll()
-		html.classList.add('screen-locked')
-		const el = ref.current
-		const scrollers = '.xterm-viewport, .console-keys, .term-paste textarea'
-		const onMove = (e: TouchEvent) => {
-			if (e.touches.length > 1) return void e.preventDefault() // no pinch-zoom of the page
-			const t = e.target as Element | null
-			if (t?.closest?.(scrollers)) return
-			e.preventDefault()
-		}
-		if (guardTouch) el?.addEventListener('touchmove', onMove, {passive: false})
-		// iOS can still pan the page after the keyboard opens; pull it back.
-		const onScroll = () => window.scrollY && window.scrollTo(0, 0)
-		window.addEventListener('scroll', onScroll)
-		return () => {
-			if (guardTouch) el?.removeEventListener('touchmove', onMove)
-			window.removeEventListener('scroll', onScroll)
-			// Back to the page's normal layout (not a saved copy, which another overlay may have changed).
-			Object.assign(b, {position: '', top: '', left: '', right: '', width: ''})
-			release()
-			html.classList.remove('screen-locked')
-			window.scrollTo(0, y)
-		}
-	}, [ref, guardTouch, enabled])
-}
-
 function cssVar(name: string, fallback: string) {
 	return getComputedStyle(document.documentElement).getPropertyValue(name).trim() || fallback
 }
@@ -81,23 +53,39 @@ function cssVar(name: string, fallback: string) {
 export function TerminalScreen({
 	app,
 	agent,
+	container,
+	overSheet = false,
 	onClose,
 	embedded,
+	inline,
 	input,
+	machine,
 }: {
 	app?: {id: string; name?: string; icon?: string}
 	// A computer in the local swarm (through its connector), instead of this server.
 	agent?: {id: string; name: string}
+	// One of this server's containers (Incus): its console (login prompt) or a root shell in it.
+	container?: {name: string; mode?: 'console' | 'shell'}
+	// Opened from a sheet (a container's page): sit above the sheet instead of behind it.
+	overSheet?: boolean
 	onClose: () => void
 	embedded?: boolean
+	/** Draw inside the open row. No full-screen portal, history entry, or screen lock. */
+	inline?: boolean
 	input?: string
+	/** The computer this shell is on. Defaults to this server, or the swarm computer when `agent` is set. */
+	machine?: string
 }) {
+	const boot = useContext(BootstrapContext)
+	const serverName = boot?.server?.device || 'This server'
+	const machineName = machine ?? agent?.name ?? container?.name ?? serverName
 	const portalRoot = usePortalRoot()
 	const root = useRef<HTMLDivElement>(null)
 	const host = useRef<HTMLDivElement>(null)
 	const termRef = useRef<XTerm>()
 	const wsRef = useRef<WebSocket>()
-	const size = useRef({cols: 80, rows: 24, cellW: 7.8, font: BASE_FONT, ready: false})
+	// This window's own size in characters (what it asks the shell for); ready once measured.
+	const size = useRef({cols: 80, rows: 24, ready: false})
 	const [state, setState] = useState<State>('connecting')
 	const [message, setMessage] = useState('')
 	const [attempt, setAttempt] = useState(0)
@@ -105,7 +93,19 @@ export function TerminalScreen({
 	const [alt, setAlt] = useState(false)
 	const [kbd, setKbd] = useState(false)
 	const [pasteBox, setPasteBox] = useState(false)
+	// Long-press on a phone: a small Paste button where the finger was.
+	const [pressPaste, setPressPaste] = useState<{x: number; y: number} | null>(null)
+	const pasteRef = useRef<() => void>(() => {})
 	const [pasteText, setPasteText] = useState('')
+	const pasteField = useRef<HTMLTextAreaElement>(null)
+	const pasteCaret = useRef<number | null>(null)
+	useEffect(() => {
+		const el = pasteField.current
+		const caret = pasteCaret.current
+		if (!el || caret == null) return
+		pasteCaret.current = null
+		el.selectionStart = el.selectionEnd = caret
+	}, [pasteText])
 	const mods = useRef({ctrl: false, alt: false})
 	// Your shell keeps running when you close this; reopening resumes it. `fresh` asks for a new one.
 	const [resumed, setResumed] = useState(false)
@@ -113,10 +113,38 @@ export function TerminalScreen({
 	const confirm = useConfirm()
 	// A command to have ready at the prompt (typed, never run: you press Enter). Only once.
 	const pending = useRef(input)
+	// When this screen appeared. The tap that opened it is still in progress then.
+	const openedAt = useRef(performance.now())
 	mods.current = {ctrl, alt}
 	const toast = useToast()
-	useVisualViewport(root, !embedded)
-	useScreenLock(root, true, !embedded)
+	useVisualViewport(root, !embedded && !inline)
+	useScreenLock(root, true, !embedded && !inline)
+	// Phone layout only. An embedded desktop window, or a row on the Terminals page, must not push its own history entry.
+	const onCloseRef = useRef(onClose)
+	onCloseRef.current = onClose
+	const overlayClosed = useRef(false)
+	useEffect(() => {
+		if (embedded || inline) return
+		overlayClosed.current = false
+		const id = 'terminal'
+		history.pushState({omarchyOverlay: id}, '', location.href)
+		const onPop = (e: PopStateEvent) => {
+			if (!popstateClosesOverlay(e.state, id)) return
+			overlayClosed.current = true
+			onCloseRef.current()
+		}
+		window.addEventListener('popstate', onPop)
+		return () => window.removeEventListener('popstate', onPop)
+	}, [embedded, inline])
+	const back = () => {
+		if (embedded || inline) {
+			onClose()
+			return
+		}
+		haptic(6)
+		if (overlayBackUsesHistory(overlayClosed.current, history.state, 'terminal')) history.back()
+		else onClose()
+	}
 
 	useEffect(() => {
 		const el = host.current
@@ -129,7 +157,7 @@ export function TerminalScreen({
 			cursorBlink: true,
 			scrollback: 5000,
 			allowProposedApi: false,
-			macOptionIsMeta: true,
+			macOptionIsMeta: false,
 			theme: {
 				background: '#0b0b0e',
 				foreground: '#e6e6ea',
@@ -163,11 +191,20 @@ export function TerminalScreen({
 			const selected = term.getSelection()
 			if (selected) {
 				e.preventDefault()
-				copyText(selected).then(() => toast('Copied'), () => toast('Couldn’t copy', true))
+				copyText(selected).then(
+					() => {
+						toast('Copied')
+						clipText(selected, 'terminal').catch((err: Error) => toast(err.message, true))
+					},
+					() => toast('Couldn’t copy', true),
+				)
 				term.clearSelection()
 				term.focus()
 				return
 			}
+			// Paste, like a terminal on the machine: straight from the clipboard where the browser
+			// allows reading it (https://). On http:// browsers never let a page read the clipboard, so
+			// their own menu opens with Paste (xterm puts its input under the pointer for that).
 			if (!window.isSecureContext || !navigator.clipboard?.readText) return
 			e.preventDefault()
 			navigator.clipboard.readText().then(
@@ -175,46 +212,175 @@ export function TerminalScreen({
 					if (text) term.paste(text)
 					term.focus()
 				},
-				() => toast('Allow clipboard access for this site to paste with a right-click', true),
+				() => pasteRef.current(),
 			)
 		}
 		el.addEventListener('contextmenu', onContextMenu)
+		// Take a clipboard paste once. Otherwise the browser also drops it into xterm's hidden
+		// field and keeps sending the last character.
+		const onPaste = (e: ClipboardEvent) => {
+			const decision = terminalPasteDecision(e.clipboardData ? e.clipboardData.getData('text/plain') : null)
+			if (!decision.prevent) return
+			e.preventDefault()
+			e.stopPropagation()
+			if (decision.text) term.paste(decision.text)
+		}
+		el.addEventListener('paste', onPaste, true)
+		// Keyboard copy and paste as on a desktop: Ctrl+V and Ctrl+Shift+V paste (the browser's own
+		// paste, which works on http:// too), Ctrl+Shift+C copies, and Ctrl+C copies when text is
+		// selected (otherwise it interrupts, as always). Without this Ctrl+V sent ^V to the shell.
+		term.attachCustomKeyEventHandler((e) => {
+			if (e.type !== 'keydown' || !matchMedia('(any-pointer: fine)').matches || e.altKey || e.metaKey) return true
+			const k = e.key.toLowerCase()
+			if (e.ctrlKey && k === 'v') return false
+			if (e.ctrlKey && k === 'c' && (e.shiftKey || term.hasSelection())) {
+				const selected = term.getSelection()
+				if (!selected) return false
+				e.preventDefault()
+				copyText(selected).then(
+					() => {
+						toast('Copied')
+						clipText(selected, 'terminal').catch((err: Error) => toast(err.message, true))
+					},
+					() => toast('Couldn’t copy', true),
+				)
+				term.clearSelection()
+				return false
+			}
+			return true
+		})
+		const onClip = (e: ClipboardEvent) => {
+			const selected = term.getSelection()
+			const target = e.target
+			if (!selected || !(target instanceof Node) || !el.contains(target)) return
+			clipText(selected, 'terminal', e.type === 'cut').catch((err: Error) => toast(err.message, true))
+		}
+		document.addEventListener('copy', onClip)
+		document.addEventListener('cut', onClip)
 
-		// Measure a cell, then size the shell to fill the screen.
-		const measure = () => {
+		// -- Size: fill the window at the normal text size --------------------------------------
+		// A character cell at the normal text size (measured at whatever size is showing now).
+		const cell = () => {
 			const dims = (term as any)._core?._renderService?.dimensions?.css?.cell
-			const cellW = dims?.width || BASE_FONT * 0.6
-			const cellH = dims?.height || BASE_FONT * 1.15 * 1.2
-			const cols = Math.max(20, Math.min(240, Math.floor((el.clientWidth - 12) / cellW)))
-			const rows = Math.max(8, Math.min(120, Math.floor((el.clientHeight - 8) / cellH)))
-			return {cols, rows, cellW, font: term.options.fontSize ?? BASE_FONT, ready: true}
+			const font = term.options.fontSize ?? BASE_FONT
+			const k = BASE_FONT / font
+			return {w: (dims?.width || font * 0.6) * k, h: (dims?.height || font * 1.15 * 1.2) * k}
+		}
+		// The room the text has: the window, less padding and (on a computer) the scrollbar.
+		const room = () => {
+			const cs = getComputedStyle(el)
+			const vp = el.querySelector<HTMLElement>('.xterm-viewport')
+			const bar = vp ? vp.offsetWidth - vp.clientWidth : 0
+			return {
+				w: el.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight) - bar,
+				h: el.clientHeight - parseFloat(cs.paddingTop) - parseFloat(cs.paddingBottom),
+			}
+		}
+		// How many columns and rows fit this window.
+		const fitSize = () => {
+			const {w, h} = room()
+			const c = cell()
+			return {cols: Math.max(20, Math.min(500, Math.floor(w / c.w))), rows: Math.max(4, Math.min(300, Math.floor(h / c.h)))}
+		}
+		// Draw the terminal at the shell's size. At this window's own size that's the normal text
+		// size; if another device viewing the same shell set its size, scale the text to fit here.
+		const show = (cols: number, rows: number) => {
+			const buf = term.buffer.active
+			const atBottom = buf.viewportY >= buf.baseY
+			if (cols !== term.cols || rows !== term.rows) term.resize(cols, rows)
+			const mine = size.current
+			let font = BASE_FONT
+			if (cols !== mine.cols || rows !== mine.rows) {
+				const {w, h} = room()
+				const c = cell()
+				font = Math.max(7, Math.min(BASE_FONT * 1.5, BASE_FONT * Math.min(w / (cols * c.w), h / (rows * c.h))))
+			}
+			// Round down to a half point, so the scaled text always fits inside the window.
+			if (Math.abs(font - (term.options.fontSize ?? BASE_FONT)) > 0.2) term.options.fontSize = Math.floor(font * 2) / 2
+			// Reading back through history stays put; at the bottom it stays at the bottom.
+			if (atBottom) term.scrollToBottom()
+		}
+		// Tell the shell this window's size (a binary frame; what's typed is text). A window being
+		// dragged changes size many times: send the last one.
+		let sizeTimer = 0
+		const sendSize = (now = false) => {
+			window.clearTimeout(sizeTimer)
+			const go = () => {
+				const ws = wsRef.current
+				if (ws?.readyState === WebSocket.OPEN) ws.send(new TextEncoder().encode(JSON.stringify({type: 'resize', cols: size.current.cols, rows: size.current.rows})))
+			}
+			if (now) go()
+			else sizeTimer = window.setTimeout(go, 90)
+		}
+		// The window changed size (or the phone's keyboard came or went): fit it, and resize the shell.
+		const refit = () => {
+			if (!size.current.ready || !el.clientWidth || !el.clientHeight) return // hidden (another workspace)
+			const next = fitSize()
+			const changed = next.cols !== size.current.cols || next.rows !== size.current.rows
+			size.current = {...size.current, ...next}
+			if (changed || next.cols !== term.cols || next.rows !== term.rows) {
+				show(next.cols, next.rows)
+				if (changed || wsRef.current?.readyState === WebSocket.OPEN) sendSize()
+			}
 		}
 
+		let replaying = 0
+		let replayNext = false
 		const send = (data: string) => {
 			const ws = wsRef.current
 			if (ws?.readyState === WebSocket.OPEN) ws.send(data)
 		}
 		term.onData((data) => {
-			let out = data
+			if (!forwardTerminalInput(data, focusReportFromUser)) return
+			// The terminal's own answers to questions found in a replayed screen (what kind of terminal,
+			// its colours, where the cursor is) would reach the shell as stray text: the extra
+			// characters that appeared when a terminal was opened again.
+			if (replaying > 0 && isTerminalReply(data)) return
+			if (data === '\x1b[I' || data === '\x1b[O') focusReportFromUser = false
+			// Drop the composition the opening tap just dumped. The on-screen keys send on their own.
+			if (ignoreOpeningFocus(coarsePointer(), performance.now() - openedAt.current)) return
+			// Typing here after another device resized this shell: take it back to this window's size.
+			// (Sent now, ahead of what's typed: the server holds the typing until the shell has resized.)
+			if (term.cols !== size.current.cols || term.rows !== size.current.rows) {
+				show(size.current.cols, size.current.rows)
+				sendSize(true)
+			}
 			const m = mods.current
-			if (m.ctrl && data.length === 1) {
-				const c = data.toUpperCase().charCodeAt(0)
-				if (c >= 64 && c <= 95) out = String.fromCharCode(c - 64)
-				setCtrl(false)
-			}
-			if (m.alt && data.length === 1) {
-				out = `\x1b${out}`
-				setAlt(false)
-			}
-			send(out)
+			const res = applyTerminalModifiers(data, m, {appCursor: term.modes.applicationCursorKeysMode, applyAppCursor: false})
+			mods.current = {ctrl: res.ctrl, alt: res.alt}
+			if (res.ctrl !== m.ctrl) setCtrl(res.ctrl)
+			if (res.alt !== m.alt) setAlt(res.alt)
+			send(res.data)
 		})
 		const ta = term.textarea
+		ta?.setAttribute('autocomplete', 'off')
 		ta?.setAttribute('autocapitalize', 'off')
 		ta?.setAttribute('autocorrect', 'off')
 		ta?.setAttribute('spellcheck', 'false')
+		const coarsePointer = () => matchMedia('(pointer: coarse)').matches
+		// Set in the capture phase, before xterm turns the focus or blur into a report.
+		// A report that arrives without this flag was produced by replaying the session.
+		let focusReportFromUser = false
+		const markFocusReport = () => {
+			if (ignoreOpeningFocus(coarsePointer(), performance.now() - openedAt.current)) return
+			focusReportFromUser = true
+			// xterm emits the report synchronously, before this microtask. If focus reporting
+			// is off, nothing is emitted and the flag must not stay set for the replay.
+			queueMicrotask(() => {
+				focusReportFromUser = false
+			})
+		}
+		ta?.addEventListener('focus', markFocusReport, true)
+		ta?.addEventListener('blur', markFocusReport, true)
+		// (Typing scrolls to the prompt by itself; tapping in to type doesn't throw away your place.)
+		// The tap that opened this screen focuses the phone's stretched field and dumps a composition.
 		const onFocus = () => {
+			if (ignoreOpeningFocus(coarsePointer(), performance.now() - openedAt.current)) {
+				if (ta) ta.value = ''
+				term.blur()
+				return
+			}
 			setKbd(true)
-			term.scrollToBottom()
 		}
 		const onBlur = () => setKbd(false)
 		ta?.addEventListener('focus', onFocus)
@@ -233,17 +399,19 @@ export function TerminalScreen({
 			term.options.fontSize = BASE_FONT
 			await new Promise((r) => requestAnimationFrame(() => r(null)))
 			if (disposed) return
-			const s = measure()
+			const s = {...fitSize(), ready: true}
 			size.current = s
 			term.resize(s.cols, s.rows)
 			term.reset()
 			const scheme = location.protocol === 'https:' ? 'wss:' : 'ws:'
-			const qs = new URLSearchParams({...(app ? {appId: app.id} : {}), ...(agent ? {agentId: agent.id} : {}), cols: String(s.cols), rows: String(s.rows), ...(fresh.current ? {fresh: '1'} : {})})
+			const qs = new URLSearchParams({...(app ? {appId: app.id} : {}), ...(agent ? {agentId: agent.id} : {}), ...(container ? {containerId: container.name, containerMode: container.mode ?? 'shell'} : {}), cols: String(s.cols), rows: String(s.rows), ...(fresh.current ? {fresh: '1'} : {})})
 			fresh.current = false
 			const ws = new WebSocket(`${scheme}//${location.host}/api/terminal?${qs}`)
 			ws.binaryType = 'arraybuffer'
 			wsRef.current = ws
+			let opened = false
 			ws.onopen = () => {
+				opened = true
 				setState('connected')
 				haptic(8)
 				if (pending.current) {
@@ -251,10 +419,23 @@ export function TerminalScreen({
 					pending.current = undefined
 					setTimeout(() => ws.readyState === WebSocket.OPEN && ws.send(text), 400)
 				}
-				term.focus() // types straight away with a hardware keyboard; phones may still need the keyboard button
+				// A hardware keyboard can type immediately. A phone waits: focusing now would
+				// catch the tap that opened this screen and insert whatever the keyboard was composing.
+				if (!coarsePointer()) {
+					if (ta) ta.value = ''
+					term.focus()
+				}
 			}
 			ws.onmessage = (e) => {
-				if (typeof e.data !== 'string') return term.write(new Uint8Array(e.data))
+				if (typeof e.data !== 'string') {
+					if (!replayNext) return term.write(new Uint8Array(e.data))
+					replayNext = false
+					replaying++
+					return term.write(new Uint8Array(e.data), () => {
+						// Answers are emitted while parsing; give a late one a moment too.
+						setTimeout(() => (replaying = Math.max(0, replaying - 1)), 250)
+					})
+				}
 				// Text frames are about the session: resumed (what was on screen follows, drawn at the
 				// size it was), and the size it's now at. Resize in order with the output around it.
 				let m: {type?: string; resumed?: boolean; cols?: number; rows?: number}
@@ -263,90 +444,186 @@ export function TerminalScreen({
 				} catch {
 					return
 				}
-				if (m.type === 'session') setResumed(!!m.resumed)
+				if (m.type === 'session') {
+					setResumed(!!m.resumed)
+					replayNext = !!m.resumed
+				}
 				if ((m.type === 'session' || m.type === 'size') && m.cols && m.rows) {
+					// In order with the output around it: a resumed screen replays at the size it was
+					// drawn, then the shell takes this window's size.
 					const {cols, rows} = m
-					term.write('', () => {
-						if (cols === term.cols && rows === term.rows) return
-						size.current = {...size.current, cols, rows}
-						term.resize(cols, rows)
-						fit()
-					})
+					term.write('', () => show(cols, rows))
 				}
 			}
 			ws.onclose = (e) => {
 				if (disposed || wsRef.current !== ws) return
-				if (e.code === 1000 && e.reason === 'Shell ended') {
-					setState('closed')
-					setMessage('The shell has ended.')
-				} else {
-					setState((st) => (st === 'connecting' ? 'error' : 'lost'))
-					// A swarm computer's shell goes through its connector and isn't kept (yet): it ended.
-					setMessage(agent ? 'The connection to it dropped. Reconnect for a new shell.' : 'Your shell is still running on the server. Reconnect to pick up where you left off.')
-				}
+				const out = terminalCloseOutcome({opened, shellEnded: e.code === 1000 && e.reason === 'Shell ended', onComputer: !!agent})
+				setState(out.state)
+				setMessage(out.message)
 			}
 		}
 		connect()
 
-		// The shell's row count is fixed, so when the keyboard shrinks the screen the bottom rows
-		// (where you type) would be cut off. Slide the terminal up just enough to keep the cursor
-		// line in view; slide it back down when there's room again.
-		const frame = el.parentElement!
+		// Fill the window, now and whenever it changes size. (Phones: the keyboard shrinks the
+		// window, so the shell gets fewer rows and the prompt stays in view above it.)
 		let raf = 0
-		const follow = () => {
+		const onResize = () => {
 			cancelAnimationFrame(raf)
 			raf = requestAnimationFrame(() => {
-				const screen = el.querySelector<HTMLElement>('.xterm-screen')
-				const buf = term.buffer.active
-				if (!screen || !term.rows) return
-				const rowH = screen.clientHeight / term.rows
-				const atBottom = buf.viewportY === buf.baseY
-				const cursorBottom = 6 + (buf.cursorY + 1) * rowH + 4
-				const shift = atBottom ? Math.max(0, cursorBottom - frame.clientHeight) : 0
-				el.style.transform = shift ? `translateY(${-Math.ceil(shift)}px)` : ''
-				// Keep xterm's hidden input inside the visible area so iOS never scrolls to find it.
-				el.style.setProperty('--term-shift', `${Math.ceil(shift)}px`)
-				el.style.setProperty('--term-frame', `${frame.clientHeight}px`)
+				refit()
+				el.style.setProperty('--term-frame', `${el.clientHeight}px`)
 			})
 		}
-		term.onWriteParsed(follow)
-		term.onCursorMove(follow)
-		term.onScroll(follow)
-		term.onRender(follow)
-
-		// On rotate / keyboard, keep the shell's columns and scale the font to fit the width.
-		const fit = () => {
-			const {cols, cellW, font, ready} = size.current
-			if (!ready) return
-			const fitted = Math.max(8, Math.min(20, (font * (el.clientWidth - 12)) / (cols * cellW)))
-			if (Math.abs(fitted - (term.options.fontSize ?? BASE_FONT)) > 0.3) term.options.fontSize = Math.round(fitted * 2) / 2
-			term.scrollToBottom()
-			follow()
-		}
-		const ro = new ResizeObserver(fit)
+		const ro = new ResizeObserver(onResize)
 		ro.observe(el)
-		ro.observe(frame)
 		const rootEl = root.current
-		rootEl?.addEventListener('viewportchange', follow)
+		rootEl?.addEventListener('viewportchange', onResize)
+
+		// -- Touch: scroll like a phone app ---------------------------------------------------
+		// A drag moves the text with your finger and keeps going when you let go (momentum). In
+		// full-screen programs (less, man, vim) there's no history to scroll, so a drag sends the
+		// arrow keys instead, as a mouse wheel would. A tap still opens the keyboard, and a long
+		// press still offers Paste.
+		const viewport = () => el.querySelector<HTMLElement>('.xterm-viewport')
+		let touch: {startY: number; y: number; t: number; v: number; moved: boolean; carry: number} | null = null
+		let fling = 0
+		const stopFling = () => cancelAnimationFrame(fling)
+		// dy > 0: the text moves up (towards newer lines).
+		const scrollBy = (dy: number) => {
+			if (term.buffer.active.type === 'alternate') {
+				if (!touch) return false
+				touch.carry += dy
+				const rowH = cell().h * ((term.options.fontSize ?? BASE_FONT) / BASE_FONT)
+				let out = ''
+				while (Math.abs(touch.carry) >= rowH) {
+					out += applyTerminalModifiers(touch.carry > 0 ? SEQ.down : SEQ.up, {ctrl: false, alt: false}, {appCursor: term.modes.applicationCursorKeysMode, applyAppCursor: true}).data
+					touch.carry -= Math.sign(touch.carry) * rowH
+				}
+				if (out) send(out)
+				return true
+			}
+			const vp = viewport()
+			if (!vp) return false
+			const before = vp.scrollTop
+			vp.scrollTop = before + dy
+			return vp.scrollTop !== before
+		}
+		// Press and hold (without moving) offers Paste; a reading of the clipboard needs a tap of its own.
+		let holdTimer = 0
+		const cancelHold = () => window.clearTimeout(holdTimer)
+		const onTouchStart = (e: TouchEvent) => {
+			stopFling()
+			cancelHold()
+			if (e.touches.length !== 1) return void (touch = null)
+			const y = e.touches[0].clientY
+			const x = e.touches[0].clientX
+			touch = {startY: y, y, t: performance.now(), v: 0, moved: false, carry: 0}
+			holdTimer = window.setTimeout(() => {
+				if (touch && !touch.moved) (haptic(10), setPressPaste({x, y}))
+			}, 500)
+		}
+		const onTouchMove = (e: TouchEvent) => {
+			if (!touch || e.touches.length !== 1) return
+			const y = e.touches[0].clientY
+			if (!touch.moved && Math.abs(y - touch.startY) < 6) return // not a drag yet: maybe a tap or a long press
+			touch.moved = true
+			cancelHold()
+			e.preventDefault() // ours, not the page's (or xterm's own, slower) scrolling
+			e.stopPropagation()
+			const now = performance.now()
+			const dy = touch.y - y
+			const dt = Math.max(1, now - touch.t)
+			touch.v = 0.75 * (dy / dt) + 0.25 * touch.v
+			touch.y = y
+			touch.t = now
+			scrollBy(dy)
+		}
+		const onTouchEnd = (e: TouchEvent) => {
+			cancelHold()
+			const t = touch
+			touch = null
+			if (!t?.moved) return
+			e.stopPropagation()
+			// Let go mid-swipe: keep going and slow down, as a phone does (not in full-screen programs).
+			let v = performance.now() - t.t > 80 ? 0 : t.v
+			if (term.buffer.active.type === 'alternate' || Math.abs(v) < 0.05) return
+			let last = performance.now()
+			const step = (now: number) => {
+				const dt = now - last
+				last = now
+				v *= Math.pow(0.9965, dt)
+				if (Math.abs(v) < 0.02 || !scrollBy(v * dt)) return
+				fling = requestAnimationFrame(step)
+			}
+			fling = requestAnimationFrame(step)
+		}
+		// Until this settles, the phone's stretched typing field ignores the tap that opened the screen.
+		const readyTimer = window.setTimeout(() => root.current?.classList.add('term-ready'), 500)
+		el.addEventListener('touchstart', onTouchStart, {capture: true, passive: true})
+		el.addEventListener('touchmove', onTouchMove, {capture: true, passive: false})
+		el.addEventListener('touchend', onTouchEnd, {capture: true})
+		el.addEventListener('touchcancel', onTouchEnd, {capture: true})
 
 		return () => {
 			disposed = true
 			ro.disconnect()
 			cancelAnimationFrame(raf)
-			rootEl?.removeEventListener('viewportchange', follow)
+			stopFling()
+			window.clearTimeout(readyTimer)
+			window.clearTimeout(sizeTimer)
+			rootEl?.removeEventListener('viewportchange', onResize)
+			cancelHold()
+			el.removeEventListener('touchstart', onTouchStart, {capture: true})
+			el.removeEventListener('touchmove', onTouchMove, {capture: true})
+			el.removeEventListener('touchend', onTouchEnd, {capture: true})
+			el.removeEventListener('touchcancel', onTouchEnd, {capture: true})
+			ta?.removeEventListener('focus', markFocusReport, true)
+			ta?.removeEventListener('blur', markFocusReport, true)
 			ta?.removeEventListener('focus', onFocus)
 			ta?.removeEventListener('blur', onBlur)
 			wsRef.current?.close()
 			el.removeEventListener('contextmenu', onContextMenu)
+			el.removeEventListener('paste', onPaste, true)
+			document.removeEventListener('copy', onClip)
+			document.removeEventListener('cut', onClip)
 			term.dispose()
 		}
-	}, [app, agent?.id, attempt])
+	}, [app, agent?.id, container?.name, container?.mode, attempt])
 
-	const sendSeq = (s: string) => {
+	// A clip pasted as text goes into the terminal used last, not into every open one.
+	const clipTarget = useRef({})
+	useEffect(() => {
+		const me = clipTarget.current
+		markClipTarget(me)
+		// Listening on the document, because the screen's own element can be swapped out.
+		const mark = (e: Event) => {
+			if (e.target instanceof Node && root.current?.contains(e.target)) markClipTarget(me)
+		}
+		document.addEventListener('focusin', mark)
+		document.addEventListener('pointerdown', mark, true)
+		const onClipPaste = (e: Event) => {
+			const text = (e as CustomEvent<{text?: string}>).detail?.text
+			if (text && isClipTarget(me)) termRef.current?.paste(text)
+		}
+		window.addEventListener('omarchy-clip-paste', onClipPaste)
+		return () => {
+			window.removeEventListener('omarchy-clip-paste', onClipPaste)
+			document.removeEventListener('focusin', mark)
+			document.removeEventListener('pointerdown', mark, true)
+			unmarkClipTarget(me)
+		}
+	}, [])
+
+	const sendSeq = (seq: string) => {
 		haptic(5)
 		const ws = wsRef.current
-		if (ws?.readyState === WebSocket.OPEN) ws.send(alt && s.length === 1 ? `\x1b${s}` : s)
-		if (alt) setAlt(false)
+		if (ws?.readyState !== WebSocket.OPEN) return
+		const m = mods.current
+		const res = applyTerminalModifiers(seq, m, {appCursor: termRef.current?.modes.applicationCursorKeysMode, applyAppCursor: true})
+		mods.current = {ctrl: res.ctrl, alt: res.alt}
+		if (res.ctrl !== m.ctrl) setCtrl(res.ctrl)
+		if (res.alt !== m.alt) setAlt(res.alt)
+		ws.send(res.data)
 	}
 	const toggleKeyboard = () => {
 		haptic(8)
@@ -374,6 +651,12 @@ export function TerminalScreen({
 		setPasteText('')
 		setPasteBox(true)
 	}
+	pasteRef.current = () => void paste()
+	useEffect(() => {
+		if (!pressPaste) return
+		const t = window.setTimeout(() => setPressPaste(null), 4000)
+		return () => window.clearTimeout(t)
+	}, [pressPaste])
 	const sendPaste = () => {
 		if (pasteText) {
 			haptic(8)
@@ -389,7 +672,9 @@ export function TerminalScreen({
 		haptic(6)
 		const ok = await confirm({
 			title: 'Start a new session?',
-			body: 'The shell that’s running now ends, along with anything still running in it. (Closing the terminal doesn’t do this: your shell keeps running until you exit it.)',
+			body: agent
+				? 'The shell that’s running now ends, along with anything still running in it. This computer’s connector does not keep the shell after it closes.'
+				: 'The shell that’s running now ends, along with anything still running in it. (Closing the terminal doesn’t do this: your shell keeps running until you exit it.)',
 			confirm: 'New session',
 			icon: 'reset',
 		})
@@ -398,7 +683,7 @@ export function TerminalScreen({
 		setResumed(false)
 		setAttempt((a) => a + 1)
 	}
-	const title = app ? (app.name ?? app.id) : agent ? agent.name : 'Terminal'
+	const title = app ? (app.name ?? app.id) : machineName
 
 	const keys: {label: string; onClick: () => void; on?: boolean}[] = [
 		{label: 'esc', onClick: () => sendSeq(SEQ.esc)},
@@ -418,10 +703,10 @@ export function TerminalScreen({
 		{label: 'end', onClick: () => sendSeq(SEQ.end)},
 	]
 
-	return createPortal(
-		<div ref={root} className={`console terminal${embedded ? ' embedded' : ''}`} role="dialog" aria-modal={!embedded} aria-label={`${title} terminal`}>
+	const screen = (
+		<div ref={root} className={`console terminal${inline ? ' inline' : embedded ? ' embedded' : ''}${overSheet ? ' over-sheet' : ''}`} role={inline ? 'region' : 'dialog'} aria-modal={inline ? undefined : !embedded} aria-label={`${title} terminal, on ${machineName}`}>
 			<header className="console-bar">
-				<button className="round-btn" aria-label="Close terminal" onClick={onClose}>
+				<button className="round-btn" aria-label="Close terminal" onClick={back}>
 					<Icon name="back" size={20} />
 				</button>
 				{app ? (
@@ -435,19 +720,27 @@ export function TerminalScreen({
 					<b>{title}</b>
 					<span>
 						<i className={`dot ${live ? 'live' : state === 'connecting' ? '' : 'down'}`} />
-						{live ? `${app ? 'App shell' : agent ? 'Shell through its connector' : 'Omarchy Server shell'}${resumed ? ' · resumed' : ''}` : state === 'connecting' ? 'Connecting…' : 'Disconnected'}
+						{live ? `On ${machineName}${app ? ' · App shell' : agent ? ' · Shell through its connector' : container ? (container.mode === 'console' ? ' · Console' : ' · Root shell') : ''}${resumed ? ' · resumed' : ''}` : state === 'connecting' ? `On ${machineName} · Connecting…` : `On ${machineName} · Disconnected`}
 					</span>
 				</div>
-				{!agent && (
-					<button className="round-btn" aria-label="New session" title="New session" onClick={newSession} disabled={!live}>
-						<Icon name="reset" size={19} />
-					</button>
-				)}
+				<button className="round-btn" aria-label="New session" title="New session" onClick={newSession} disabled={!live}>
+					<Icon name="reset" size={19} />
+				</button>
 				<button className="round-btn" aria-label="Paste" onClick={paste} disabled={!live}>
 					<Icon name="clipboard" size={19} />
 				</button>
 			</header>
-			<div className="term-screen" onClick={() => live && !kbd && termRef.current?.focus()}>
+			<div
+				className="term-screen"
+				onClick={() => {
+					if (!live || kbd) return
+					if (ignoreOpeningFocus(matchMedia('(pointer: coarse)').matches, performance.now() - openedAt.current)) return
+					const term = termRef.current
+					if (!term) return
+					if (term.textarea) term.textarea.value = ''
+					term.focus()
+				}}
+			>
 				<div ref={host} className="term-host" />
 				{state !== 'connected' && state !== 'connecting' && (
 					<div className="console-overlay">
@@ -460,23 +753,39 @@ export function TerminalScreen({
 					</div>
 				)}
 			</div>
+			{pressPaste && (
+				<>
+					<div className="term-press-scrim" onPointerDown={() => setPressPaste(null)} />
+					<button
+						className="term-press-paste"
+						style={{left: Math.min(Math.max(12, pressPaste.x - 40), window.innerWidth - 92), top: Math.max(12, pressPaste.y - 56)}}
+						onClick={() => (setPressPaste(null), void paste())}
+					>
+						Paste
+					</button>
+				</>
+			)}
 			{pasteBox && (
 				<div className="term-paste" role="dialog" aria-label="Paste into terminal">
 					<div className="term-paste-card">
 						<div className="term-paste-head">
 							<b>Paste</b>
-							<span>Long-press in the box, tap Paste, then Send.</span>
+							<span>{matchMedia('(any-pointer: fine)').matches ? 'Press Ctrl+V (or right-click → Paste) in the box, then Send.' : 'Long-press in the box, tap Paste, then Send.'}</span>
 						</div>
 						<textarea
+							ref={pasteField}
 							autoFocus
 							value={pasteText}
 							onChange={(e) => setPasteText(e.target.value)}
 							onPaste={(e) => {
 								const t = e.clipboardData.getData('text')
-								if (t) {
-									e.preventDefault()
-									setPasteText((v) => v + t)
-								}
+								if (!t) return
+								e.preventDefault()
+								const el = e.currentTarget
+								const start = el.selectionStart ?? el.value.length
+								const end = el.selectionEnd ?? el.value.length
+								pasteCaret.current = Math.min(start, end) + t.length
+								setPasteText(pasteInto(el.value, start, end, t))
 							}}
 							placeholder="Paste here"
 							autoCapitalize="off"
@@ -507,7 +816,7 @@ export function TerminalScreen({
 					))}
 				</div>
 			</div>
-		</div>,
-		portalRoot,
+		</div>
 	)
+	return inline ? screen : createPortal(screen, portalRoot)
 }

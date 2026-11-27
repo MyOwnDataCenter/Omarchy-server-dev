@@ -22,18 +22,19 @@ ExecStart=-/sbin/agetty -o '-p -f -- \\\\u' --noclear --autologin $owner %I \$TE
 EOF
 
 cat >/etc/profile.d/zz-omarchy-server-firstboot.sh <<'EOF'
-# Omarchy Server first-boot setup (removes itself when done).
-if [ "$(tty)" = /dev/tty1 ] && [ -f /var/lib/omarchy-server/firstboot ] && [ "$(cat /var/lib/omarchy-server/firstboot)" = "$USER" ]; then
+# My Own Data Center first-boot setup (removes itself when done).
+if [ -z "${OMARCHY_SERVER_FIRSTBOOT_SKIP:-}" ] && [ "$(tty)" = /dev/tty1 ] && [ -f /var/lib/omarchy-server/firstboot ] && [ "$(cat /var/lib/omarchy-server/firstboot)" = "$USER" ]; then
 	/usr/local/bin/omarchy-server-firstboot
 fi
 EOF
 
 cat >/usr/local/bin/omarchy-server-firstboot <<'EOF'
 #!/usr/bin/env bash
-# First start of a new Omarchy Server: install Omarchy Server, then Omarchy.
+# First start of a new My Own Data Center: install My Own Data Center, then Omarchy.
 set -u
+set -o pipefail
 b='\033[1m'; r='\033[0m'; o='\033[38;5;208m'
-SERVER_INSTALL="${OMARCHY_SERVER_INSTALL_URL:-https://raw.githubusercontent.com/TouchWorkStation/omarchy-server/main/install.sh}"
+SERVER_INSTALL="${OMARCHY_SERVER_INSTALL_URL:-https://raw.githubusercontent.com/MyOwnDataCenter/server/main/install.sh}"
 OMARCHY_INSTALL="${OMARCHY_INSTALL_URL:-https://omarchy.org/install}"
 
 finish_firstboot() {
@@ -42,33 +43,42 @@ finish_firstboot() {
 }
 
 clear
-printf "\n  ${o}${b}Omarchy Server${r} first-time setup\n\n"
-printf "  You'll be asked for your password (for sudo), then to create your Omarchy Server account.\n\n"
+printf "\n  ${o}${b}My Own Data Center${r} first-time setup\n\n"
+printf "  You'll be asked for your password (for sudo), then to create your account.\n\n"
 printf "  Waiting for the network…"
-nm-online -t 120 >/dev/null 2>&1 || true
-printf " ok\n\n"
+if nm-online -t 120 >/dev/null 2>&1; then
+	printf " ok\n\n"
+else
+	printf "\n\n"
+fi
 
 # Firewall rules first, so they're in place when Omarchy turns the firewall on later.
 sudo pacman -S --needed --noconfirm ufw curl git >/dev/null
-sudo ufw allow 7780/tcp comment 'Omarchy Server' >/dev/null
-sudo ufw allow 40000:49999/tcp comment 'Omarchy Server machine forwards' >/dev/null
-sudo ufw allow 40000:49999/udp comment 'Omarchy Server machine forwards' >/dev/null
+sudo ufw allow 7780/tcp comment 'MODC' >/dev/null
+sudo ufw allow 40000:49999/tcp comment 'MODC machine forwards' >/dev/null
+sudo ufw allow 40000:49999/udp comment 'MODC machine forwards' >/dev/null
 
 if ! curl -fsSL "$SERVER_INSTALL" | bash; then
-	printf "\n  ${b}Omarchy Server didn't finish installing.${r} Fix the problem above, then run:\n"
+	printf "\n  ${b}My Own Data Center didn't finish installing.${r} Fix the problem above, then run:\n"
 	printf "    curl -fsSL %s | bash\n\n" "$SERVER_INSTALL"
-	read -rp "  Press Enter for a command line " _
-	exec bash -l
+	if [ -t 0 ]; then
+		read -rp "  Press Enter for a command line " _
+		exec env OMARCHY_SERVER_FIRSTBOOT_SKIP=1 bash -l
+	fi
+	exit 1
 fi
 finish_firstboot
 
-printf "\n  ${o}${b}Omarchy Server is running.${r} Next: Omarchy, the desktop.\n\n"
+printf "\n  ${o}${b}My Own Data Center is running.${r} Next: Omarchy, the desktop.\n\n"
 if curl -fsSL "$OMARCHY_INSTALL" | bash; then
 	exit 0
 fi
-printf "\n  ${b}Omarchy didn't install.${r} Omarchy Server still works in your browser.\n"
+printf "\n  ${b}Omarchy didn't install.${r} My Own Data Center still works in your browser.\n"
 printf "  Install Omarchy later with:  curl -fsSL %s | bash\n\n" "$OMARCHY_INSTALL"
-read -rp "  Press Enter for a command line " _
-exec bash -l
+if [ -t 0 ]; then
+	read -rp "  Press Enter for a command line " _
+	exec bash -l
+fi
+exit 1
 EOF
 chmod 0755 /usr/local/bin/omarchy-server-firstboot

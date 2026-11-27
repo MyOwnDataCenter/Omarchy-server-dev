@@ -5,16 +5,17 @@
 // Tailscale is one because it can't safely run in a container here. Containers run rootless, and a
 // rootless Tailscale can only use its userspace networking, in which every connection to the
 // server's Tailscale address is handed to 127.0.0.1 on the same port (wgengine/netstack: dialIP =
-// 127.0.0.1). Everything Omarchy Server keeps on localhost would then be open to the whole tailnet:
+// 127.0.0.1). Everything My Own Data Center keeps on localhost would then be open to the whole tailnet:
 // omarchyd itself and each app's private port behind the sign-in gateway. Installed on the system,
 // the way Omarchy's own menu does it, Tailscale gets a real network interface, so the tailnet
-// reaches only what the server offers to the network anyway (Omarchy Server and your apps'
+// reaches only what the server offers to the network anyway (My Own Data Center and your apps'
 // ports, behind their sign-in).
 import {execFile, spawn as nodeSpawn} from 'node:child_process'
 import {readFile} from 'node:fs/promises'
 import http from 'node:http'
 
 import {RpcError} from './rpc.mjs'
+import {stoppedMessage} from './exec-error.mjs'
 
 export const TAILSCALE_SOCKET = '/run/tailscale/tailscaled.sock'
 const HELPER_FILE = '/usr/local/libexec/omarchy-server/helper.mjs'
@@ -23,12 +24,12 @@ const HELPER_FILE = '/usr/local/libexec/omarchy-server/helper.mjs'
 export const TAILSCALE_SETUP_COMMAND = 'sudo pacman -S --needed tailscale && sudo systemctl enable --now tailscaled && sudo tailscale set --operator="$(id -un)"'
 
 const execRun = (cmd, args) =>
-	new Promise((resolve, reject) => execFile(cmd, args, {timeout: 30_000, maxBuffer: 4 * 1024 * 1024}, (error, stdout, stderr) => (error ? reject(new Error(String(stderr || error.message).trim())) : resolve(String(stdout)))))
+	new Promise((resolve, reject) => execFile(cmd, args, {timeout: 30_000, maxBuffer: 4 * 1024 * 1024}, (error, stdout, stderr) => (error ? reject(new Error(stoppedMessage(cmd, error, 30_000) ?? String(stderr || error.message).trim())) : resolve(String(stdout)))))
 
 export const SYSTEM_PERMISSIONS = {
 	'system-software': {
 		label: 'Install software on the server itself',
-		detail: 'It isn’t a container: it is installed on your server with administrator rights, as Omarchy’s own menu installs it, and runs as a system service. You become its operator, so Omarchy Server can sign it in and out for you.',
+		detail: 'It isn’t a container: it is installed on your server with administrator rights, as Omarchy’s own menu installs it, and runs as a system service. You become its operator, so My Own Data Center can sign it in and out for you.',
 	},
 }
 
@@ -41,7 +42,7 @@ const TAILSCALE_LISTING = {
 	port: 8240,
 	path: '',
 	description: [
-		'Tailscale puts this server on your own private network (your tailnet), together with your phone, laptop and other devices, wherever they are. Open Omarchy Server and your apps at the server’s Tailscale address from anywhere, without opening any port to the internet. Connections are end-to-end encrypted with WireGuard.',
+		'Tailscale puts this server on your own private network (your tailnet), together with your phone, laptop and other devices, wherever they are. Open My Own Data Center and your apps at the server’s Tailscale address from anywhere, without opening any port to the internet. Connections are end-to-end encrypted with WireGuard.',
 		'Open it and choose Log in to connect it to your Tailscale account. Its page then shows this server’s Tailscale name and address: on your other devices, install Tailscale, sign in to the same account, and go to http://that-address:7780.',
 		'It is installed on the server itself, the same way Omarchy’s menu installs Tailscale (the official package and its service), not in a container. If you already installed Tailscale from Omarchy’s menu, this adds its page here and leaves your setup as it is; uninstalling then leaves Tailscale installed.',
 	].join('\n\n'),
@@ -95,7 +96,7 @@ export function createSystemApps({helper, helperFile = HELPER_FILE, run = execRu
 		if (await canDrive()) return
 		if (!(await helperCan('tailscale-setup'))) throw needsSetup()
 		const r = JSON.parse(await helperSays('tailscale-setup'))
-		// Only what Omarchy Server installed is removed again; a Tailscale you set up yourself stays.
+		// Only what My Own Data Center installed is removed again; a Tailscale you set up yourself stays.
 		if (r.installedPackage) app.installedPackage = true
 	}
 	async function version() {
@@ -103,7 +104,7 @@ export function createSystemApps({helper, helperFile = HELPER_FILE, run = execRu
 	}
 
 	// Its page: `tailscale web` (Tailscale's sign-in page), run as the owner on a private port that
-	// only the app's gateway (behind Omarchy Server's sign-in) forwards to. On a normal Linux system
+	// only the app's gateway (behind My Own Data Center's sign-in) forwards to. On a normal Linux system
 	// this page has no sign-in of its own, so it must never listen anywhere else.
 	function startWeb(app) {
 		stopWeb(app)
@@ -187,8 +188,9 @@ export function createSystemApps({helper, helperFile = HELPER_FILE, run = execRu
 			startWeb(app)
 		},
 		async uninstall(app) {
-			stopWeb(app)
+			// Stop the page only after the package is gone. A failed remove must leave it running.
 			if (app.installedPackage) await helperSays('tailscale-remove')
+			stopWeb(app)
 		},
 		async logs(app) {
 			const service = await run('journalctl', ['-u', 'tailscaled.service', '-n', '300', '--no-pager', '-o', 'short-iso']).catch(() => 'Reading the tailscaled service’s log needs administrator rights here. In a terminal: sudo journalctl -u tailscaled\n')

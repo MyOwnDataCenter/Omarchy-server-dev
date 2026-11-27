@@ -1,27 +1,57 @@
-import {useCallback, useEffect, useState, type CSSProperties} from 'react'
+import {lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type CSSProperties} from 'react'
 import {useQuery, useQueryClient} from '@tanstack/react-query'
 
 import {getBootstrap, query, type Bootstrap, type User, type UserApp} from './api'
+import {plural} from './plural'
+import {bootstrapPollInterval, useServerReachable} from './connection'
 import {AppSheet} from './AppSheet'
 import {AppViewer} from './AppViewer'
 import {VIEW_APP} from './openApp'
 import {OPEN_TERMINAL} from './terminalEvent'
+import {OPEN_FLEET} from './fleet/openMember'
+import {OPEN_STORE, type StoreBinding} from './fleet/openStore'
 import {BootstrapContext, useAction, useApps, useNotifications, useUpdates, useUser} from './data'
 import {Icon, type IconName} from './icons'
+import {APP_TITLE, pageTitle} from './pageTitle'
 import {Apps} from './screens/Apps'
-import {Files} from './screens/Files'
 import {Connect, Login} from './screens/Auth'
 import {Home} from './screens/Home'
-import {Machines} from './screens/Machines'
-import {More} from './screens/More'
-import {Settings} from './screens/Settings'
-import {Store} from './screens/Store'
-import {TerminalScreen} from './Terminal'
 import {Desktop} from './desktop/Desktop'
-import {Backdrop, Sheet, SheetHeader, haptic, useLayout, usePrefs, type Prefs} from './ui'
+import {resetDeskConfig} from './desktop/config'
+import {OPEN_SETTINGS} from './desktop/settingsPage'
+import {safeSession} from './safeStorage'
+import {ScreenErrorBoundary} from './screenBoundary'
+import {inAppBackTarget, markInAppHistory, readInAppHistoryFlag} from './inAppHistory'
+import {ThemeModeButton} from './theme/ThemeModeButton'
+import {Backdrop, Sheet, SheetHeader, haptic, layoutAsked, scrollPhoneToTop, useLayout, usePrefs, type Prefs} from './ui'
 import {WhatsNewOnUpdate} from './WhatsNew'
+import {WelcomeForUser} from './Welcome'
+import {InstallerPrompt} from './InstallerPrompt'
+import {consumeReopenAssistant, reopenOnMount} from './assistant'
+import {closeAssistantView, openAssistantView, resetAssistantTurn, useAssistantTurn} from './assistantTurn'
+import {AssistantLookContext, cleanLook, DEFAULT_LOOK, type AssistantLook} from './character/AssistantCharacter'
+import {StatViewProvider} from './fleet/StatRegion'
+import {AssistantCharacterWidget} from './character/widgets'
 
-type Tab = 'home' | 'apps' | 'files' | 'machines' | 'more' | 'settings' | 'store'
+const Clips = lazy(() => import('./screens/Clips').then((m) => ({default: m.Clips})))
+const Files = lazy(() => import('./screens/Files').then((m) => ({default: m.Files})))
+const Machines = lazy(() => import('./screens/Machines').then((m) => ({default: m.Machines})))
+const Terminals = lazy(() => import('./fleet/Terminals').then((m) => ({default: m.Terminals})))
+const More = lazy(() => import('./screens/More').then((m) => ({default: m.More})))
+const Settings = lazy(() => import('./screens/Settings').then((m) => ({default: m.Settings})))
+const Store = lazy(() => import('./screens/Store').then((m) => ({default: m.Store})))
+const TerminalScreen = lazy(() => import('./Terminal').then((m) => ({default: m.TerminalScreen})))
+const Assistant = lazy(() => import('./screens/Assistant').then((m) => ({default: m.Assistant})))
+
+function ScreenFallback() {
+	return (
+		<main className="screen center">
+			<span className="spinner" role="status" aria-label="Loading" />
+		</main>
+	)
+}
+
+type Tab = 'home' | 'apps' | 'files' | 'machines' | 'terminals' | 'more' | 'settings' | 'store' | 'clips'
 // `tone`: the palette colour each tab's icon takes in the themed looks (the same as on the desktop).
 const TABS: {id: Tab; label: string; icon: IconName; active: IconName; tone: string}[] = [
 	{id: 'home', label: 'Home', icon: 'home', active: 'home-filled', tone: 'var(--accent)'},
@@ -30,25 +60,64 @@ const TABS: {id: Tab; label: string; icon: IconName; active: IconName; tone: str
 	{id: 'machines', label: 'Machines', icon: 'machine', active: 'machine-filled', tone: 'var(--teal)'},
 	{id: 'more', label: 'System', icon: 'activity', active: 'activity-filled', tone: 'var(--peach)'},
 ]
-const tabFromHash = (): Tab => {
+const TERMINALS_TAB: (typeof TABS)[number] = {id: 'terminals', label: 'Terminals', icon: 'terminal', active: 'terminal', tone: 'var(--green)'}
+function dockTabs(owner: boolean) {
+	if (!owner) return TABS
+	const next = [...TABS]
+	const at = next.findIndex((t) => t.id === 'more')
+	next.splice(at < 0 ? next.length : at, 0, TERMINALS_TAB)
+	return next
+}
+const tabFromHash = (allowTerminals: boolean): Tab => {
 	const h = location.hash.replace('#/', '') as Tab
-	return h === 'settings' || h === 'store' || TABS.some((t) => t.id === h) ? h : 'home'
+	if (h === 'terminals') return allowTerminals ? 'terminals' : 'home'
+	return h === 'settings' || h === 'store' || h === 'clips' || TABS.some((t) => t.id === h) ? h : 'home'
 }
 
 export function App() {
 	const qc = useQueryClient()
-	const boot = useQuery({queryKey: ['bootstrap'], queryFn: getBootstrap, retry: 1, refetchOnWindowFocus: false})
+	const boot = useQuery({
+		queryKey: ['bootstrap'],
+		queryFn: getBootstrap,
+		retry: 1,
+		refetchInterval: (q) => bootstrapPollInterval(q.state),
+		refetchOnWindowFocus: (q) => bootstrapPollInterval(q.state) !== false,
+	})
 	const signedIn = !!boot.data?.session && !!boot.data?.server?.reachable
 	const user = useQuery({queryKey: ['user.get'], queryFn: () => query<User>('user.get'), enabled: signedIn, staleTime: 5 * 60_000})
 	const [loginId, setLoginId] = useState<string>()
 	const account = boot.data?.accounts.find((a) => a.userId === (signedIn ? boot.data?.session?.accountId : loginId)) ?? boot.data?.accounts[0]
 	const wallpaper = (signedIn ? user.data?.wallpaper : null) ?? account?.wallpaper ?? null
 	const [prefs, setPrefs] = usePrefs(wallpaper?.brandColorHsl, signedIn)
+	// The assistant's look (character, name, motion), saved with this account's preferences.
+	const look = useMemo(() => cleanLook(prefs.assistantLook ?? DEFAULT_LOOK), [prefs.assistantLook])
+	const lookValue = useMemo(() => ({look, setLook: (next: AssistantLook) => setPrefs({...prefs, assistantLook: next})}), [look, prefs, setPrefs])
 	const refresh = useCallback(() => qc.invalidateQueries({queryKey: ['bootstrap']}), [qc])
+	const retryBootstrap = useCallback(async () => {
+		const res = await boot.refetch()
+		if (res.error) throw res.error
+		return res.data ?? null
+	}, [boot])
 	const layout = useLayout()
+	// The first time anyone signs in on this device: a short welcome setup (then What's New).
+	const [askLayout, setAskLayout] = useState(() => !layoutAsked())
+	// Consumed once per page load. Cleared after the first signed-in Shell or Desktop has seen it,
+	// so a later remount (wallpaper, theme, restart) does not open the assistant again.
+	const reopenWantedRef = useRef<boolean | null>(null)
+	if (reopenWantedRef.current === null) reopenWantedRef.current = consumeReopenAssistant()
+	const [reopenGiven, setReopenGiven] = useState(false)
+	const reopenAssistant = reopenOnMount(reopenWantedRef.current, reopenGiven)
+	const showShell = !!boot.data?.configured && !!boot.data?.server?.reachable && !!boot.data?.session
+
+	useEffect(() => {
+		if (!showShell || !reopenAssistant) return
+		setReopenGiven(true)
+	}, [showShell, reopenAssistant])
 
 	useEffect(() => {
 		const onOut = () => {
+			resetDeskConfig()
+			resetAssistantTurn()
 			qc.removeQueries({predicate: (q) => q.queryKey[0] !== 'bootstrap'})
 			refresh()
 		}
@@ -56,47 +125,55 @@ export function App() {
 		return () => window.removeEventListener('touch:signed-out', onOut)
 	}, [qc, refresh])
 
+	// The installer prompt waits for What's New, so the two don't stack.
+	const [whatsNewDone, setWhatsNewDone] = useState(false)
 	const b = boot.data
 	let content
 	if (boot.isLoading) {
 		content = (
 			<main className="auth center">
-				<span className="spinner" style={{width: 30, height: 30, margin: '0 auto', color: 'var(--accent-text)'}} aria-label="Loading" />
+				<span className="spinner" style={{width: 30, height: 30, margin: '0 auto', color: 'var(--accent-text)'}} role="status" aria-label="Loading" />
 			</main>
 		)
 	} else if (boot.error || !b) {
 		content = (
 			<main className="auth center screen">
-				<h1>Omarchy Server is offline</h1>
-				<p className="lead">The Omarchy Server server isn’t answering. Is it still running?</p>
-				<button className="btn primary block" onClick={refresh}>
+				<h1>My Own Data Center is offline</h1>
+				<p className="lead">The server isn’t answering. Is it still running?</p>
+				<button className="btn primary block" onClick={() => void boot.refetch()}>
 					Try again
 				</button>
 			</main>
 		)
 	} else if (!b.configured) content = <Connect onDone={refresh} />
-	else if (!b.server?.reachable) content = <Connect onDone={refresh} unreachable={b.server} />
+	else if (!b.server?.reachable) content = <Connect onDone={refresh} onRetry={retryBootstrap} unreachable={b.server} />
 	else if (!b.session) content = <Login boot={b} userId={loginId} setUserId={setLoginId} onDone={refresh} />
 	else
 		content = (
 			<BootstrapContext.Provider value={b}>
-				{layout.desktop ? <Desktop boot={b} prefs={prefs} setPrefs={setPrefs} onSignedOut={refresh} /> : <Shell boot={b} prefs={prefs} setPrefs={setPrefs} onSignedOut={refresh} />}
-				<WhatsNewOnUpdate version={b.touch.version} />
+			<AssistantLookContext.Provider value={lookValue}>
+			<StatViewProvider prefs={prefs} setPrefs={setPrefs}>
+				{layout.desktop ? <Desktop boot={b} prefs={prefs} setPrefs={setPrefs} onSignedOut={refresh} reopenAssistant={reopenAssistant} /> : <Shell boot={b} prefs={prefs} setPrefs={setPrefs} onSignedOut={refresh} reopenAssistant={reopenAssistant} />}
+				{askLayout ? <WelcomeForUser prefs={prefs} setPrefs={setPrefs} onDone={() => setAskLayout(false)} /> : <WhatsNewOnUpdate version={b.touch.version} onDone={() => setWhatsNewDone(true)} />}
+				<InstallerPrompt ready={whatsNewDone} />
+			</StatViewProvider>
+			</AssistantLookContext.Provider>
 			</BootstrapContext.Provider>
 		)
 
 	return (
 		<>
-			<Backdrop wallpaper={wallpaper} prefs={prefs} />
+			<Backdrop wallpaper={wallpaper} prefs={prefs} signedIn={!!boot.data?.session} />
 			{content}
 		</>
 	)
 }
 
-function Shell({boot, prefs, setPrefs, onSignedOut}: {boot: Bootstrap; prefs: Prefs; setPrefs: (p: Prefs) => void; onSignedOut: () => void}) {
-	const [tab, setTab] = useState<Tab>(tabFromHash)
+function Shell({boot, prefs, setPrefs, onSignedOut, reopenAssistant}: {boot: Bootstrap; prefs: Prefs; setPrefs: (p: Prefs) => void; onSignedOut: () => void; reopenAssistant?: boolean}) {
+	const [tab, setTab] = useState<Tab>(() => tabFromHash(false))
+	const [storeBound, setStoreBound] = useState<StoreBinding | null>(null)
 	const [appId, setAppId] = useState<string | null>(null)
-	// An app open inside Omarchy Server (full screen, back button returns here).
+	// An app open inside My Own Data Center (full screen, back button returns here).
 	const [viewing, setViewing] = useState<UserApp | null>(null)
 	useEffect(() => {
 		const onView = (e: Event) => (setAppId(null), setViewing((e as CustomEvent<UserApp>).detail))
@@ -105,7 +182,13 @@ function Shell({boot, prefs, setPrefs, onSignedOut}: {boot: Bootstrap; prefs: Pr
 	}, [])
 	const [bellOpen, setBellOpen] = useState(false)
 	const [terminal, setTerminal] = useState<{app?: {id: string; name?: string; icon?: string}; input?: string} | null>(null)
+	const [assistantOpen, setAssistantOpen] = useState(() => !!reopenAssistant)
+	const turn = useAssistantTurn()
+	const keepAssistant = assistantOpen || turn.streaming
 	const user = useUser()
+	// Every terminal socket is owner-only. Hide the tab until that is known.
+	const owner = user.data?.role === 'owner'
+	const tabs = dockTabs(owner)
 	// omarchyd only gives the owner a shell.
 	const openTerminal = user.data?.role === 'member' ? undefined : (app?: {id: string; name?: string; icon?: string}, input?: string) => {
 		haptic(8)
@@ -122,31 +205,94 @@ function Shell({boot, prefs, setPrefs, onSignedOut}: {boot: Bootstrap; prefs: Pr
 	const updates = useUpdates()
 	const notifications = useNotifications()
 
+	// Each phone screen is its own history entry, so each one names itself in the tab and the history list.
 	useEffect(() => {
-		const onHash = () => setTab(tabFromHash())
+		document.title = pageTitle(tab)
+		return () => {
+			document.title = APP_TITLE
+		}
+	}, [tab])
+	useEffect(() => {
+		const onHash = () => setTab(tabFromHash(owner))
 		window.addEventListener('hashchange', onHash)
 		return () => window.removeEventListener('hashchange', onHash)
+	}, [owner])
+	useEffect(() => {
+		if (!user.isSuccess) return
+		const hash = location.hash.replace('#/', '')
+		if (owner) {
+			if (hash === 'terminals') setTab('terminals')
+			return
+		}
+		if (hash === 'terminals' || tab === 'terminals') {
+			history.replaceState(null, '', '#/home')
+			setTab('home')
+		}
+	}, [user.isSuccess, owner, tab])
+	useEffect(() => {
+		const onOpen = (e: Event) => {
+			setStoreBound((e as CustomEvent<StoreBinding>).detail ?? null)
+			setTab('store')
+			markInAppHistory((key, value) => sessionStorage.setItem(key, value))
+			history.pushState(null, '', '#/store')
+			scrollPhoneToTop()
+		}
+		window.addEventListener(OPEN_STORE, onOpen)
+		return () => window.removeEventListener(OPEN_STORE, onOpen)
 	}, [])
+	useEffect(() => {
+		const onOpen = (e: Event) => {
+			safeSession.set('omarchy-server:settings-page', String((e as CustomEvent<string>).detail || 'main'))
+			setTab('settings')
+			markInAppHistory((key, value) => sessionStorage.setItem(key, value))
+			history.pushState(null, '', '#/settings')
+			scrollPhoneToTop()
+		}
+		window.addEventListener(OPEN_SETTINGS, onOpen)
+		return () => window.removeEventListener(OPEN_SETTINGS, onOpen)
+	}, [])
+	useEffect(() => {
+		const onOpen = () => {
+			setTab('machines')
+			markInAppHistory((key, value) => sessionStorage.setItem(key, value))
+			history.pushState(null, '', '#/machines')
+			scrollPhoneToTop()
+		}
+		window.addEventListener(OPEN_FLEET, onOpen)
+		return () => window.removeEventListener(OPEN_FLEET, onOpen)
+	}, [])
+	useEffect(() => {
+		if (tab !== 'store') setStoreBound((cur) => (cur ? null : cur))
+	}, [tab])
 	const go = (t: Tab) => {
 		haptic(5)
-		if (t === tab) window.scrollTo({top: 0, behavior: 'smooth'})
+		if (t === tab) scrollPhoneToTop('smooth')
 		else {
+			markInAppHistory((key, value) => sessionStorage.setItem(key, value))
 			history.pushState(null, '', `#/${t}`)
 			setTab(t)
-			window.scrollTo({top: 0})
+			scrollPhoneToTop()
 		}
+	}
+	// A direct open of #/settings (or store, or clips) has no in-app entry to pop.
+	const backInApp = () => {
+		const flag = readInAppHistoryFlag((key) => sessionStorage.getItem(key))
+		if (inAppBackTarget(flag) === 'back') history.back()
+		else go('home')
 	}
 
 	const app = apps.data?.find((a) => a.id === appId) ?? null
 	const update = updates.data?.find((u) => u.id === appId)
-	const online = !apps.error
+	const conn = useServerReachable()
+	const online = conn.reachable
 	const updateCount = updates.data?.length ?? 0
 	const notes = notifications.data ?? []
-	const index = TABS.findIndex((t) => t.id === tab)
+	const index = tabs.findIndex((t) => t.id === tab)
 
 	return (
 		<>
 			<div className="shell">
+				<div className="shell-col">
 				<header className="topbar">
 					<span className="device">
 						<span className={`dot ${online ? 'live' : 'down'}`} />
@@ -161,9 +307,10 @@ function Shell({boot, prefs, setPrefs, onSignedOut}: {boot: Bootstrap; prefs: Pr
 					>
 						<Icon name="settings" size={20} />
 					</button>
+					<ThemeModeButton prefs={prefs} setPrefs={setPrefs} className="round-btn theme-mode" size={20} />
 					<button
 						className={`round-btn bell${notes.length ? ' lit' : ''}${notes.includes('update-available') ? ' ringing' : ''}`}
-						aria-label={notes.length ? `${notes.length} notifications` : 'Notifications'}
+						aria-label={notes.length ? plural(notes.length, 'notification') : 'Notifications'}
 						onClick={() => {
 							haptic(6)
 							setBellOpen(true)
@@ -176,23 +323,45 @@ function Shell({boot, prefs, setPrefs, onSignedOut}: {boot: Bootstrap; prefs: Pr
 				{!online && (
 					<div className="error" role="alert">
 						<Icon name="alert" size={18} />
-						Lost contact with your server. Retrying…
+						{conn.message}
 					</div>
 				)}
-				<main key={tab} className="screen">
-					{tab === 'home' && <Home onOpenApp={(a) => setAppId(a.id)} go={go} onTerminal={openTerminal} />}
-					{tab === 'apps' && <Apps onOpenApp={(a) => setAppId(a.id)} onTerminal={openTerminal} onStore={() => go('store')} />}
-					{tab === 'files' && <Files />}
-					{tab === 'store' && <Store onOpenInstalled={(a) => setAppId(a.id)} onBack={() => history.back()} onTerminal={openTerminal && ((input) => openTerminal(undefined, input))} />}
-					{tab === 'machines' && <Machines />}
-					{tab === 'more' && <More prefs={prefs} setPrefs={setPrefs} onSignedOut={onSignedOut} onSettings={() => go('settings')} />}
-					{tab === 'settings' && <Settings prefs={prefs} setPrefs={setPrefs} onSignedOut={onSignedOut} onBack={() => history.back()} />}
-				</main>
+				<ScreenErrorBoundary>
+				<Suspense fallback={<ScreenFallback />}>
+					<main key={tab} className="screen">
+						{tab === 'home' && (
+							<Home
+								onOpenApp={(a) => setAppId(a.id)}
+								go={go}
+								onTerminal={openTerminal}
+								onAssistant={() => {
+									haptic(8)
+									setAppId(null)
+									setAssistantOpen(true)
+									openAssistantView()
+								}}
+							/>
+						)}
+						{tab === 'apps' && <Apps onOpenApp={(a) => setAppId(a.id)} onStore={() => go('store')} />}
+						{tab === 'files' && <Files />}
+						{tab === 'store' && <Store bound={storeBound} onOpenInstalled={(a) => setAppId(a.id)} onBack={backInApp} onTerminal={openTerminal && ((input) => openTerminal(undefined, input))} />}
+						{tab === 'machines' && <Machines prefs={prefs} setPrefs={setPrefs} onOpenApp={(a) => setAppId(a.id)} onTerminal={openTerminal} />}
+						{tab === 'terminals' && owner && <Terminals />}
+						{tab === 'more' && <More prefs={prefs} setPrefs={setPrefs} onSignedOut={onSignedOut} onSettings={() => go('settings')} onClips={() => go('clips')} />}
+						{tab === 'clips' && <Clips onBack={backInApp} />}
+						{tab === 'settings' && <Settings prefs={prefs} setPrefs={setPrefs} onSignedOut={onSignedOut} onBack={backInApp} />}
+					</main>
+				</Suspense>
+				</ScreenErrorBoundary>
+				</div>
 			</div>
-			<nav className="dock" aria-label="Main">
+			<nav className="dock" aria-label="Main" data-tabs={tabs.length} style={{'--dock-tabs': tabs.length} as CSSProperties}>
 				<span className="indicator" style={{transform: `translateX(${Math.max(index, 0) * 100}%)`, opacity: index < 0 ? 0 : 1}} aria-hidden="true" />
-				{TABS.map((t) => (
-					<button key={t.id} aria-current={tab === t.id ? 'page' : undefined} onClick={() => go(t.id)} style={{'--tone': t.tone} as CSSProperties}>
+				{tabs.map((t) => (
+					<button key={t.id} aria-current={tab === t.id ? 'page' : undefined} onClick={() => {
+						if (t.id === 'store') setStoreBound(null)
+						go(t.id)
+					}} style={{'--tone': t.tone} as CSSProperties}>
 						<Icon name={tab === t.id ? t.active : t.icon} size={23} stroke={tab === t.id ? 2 : 1.75} />
 						{t.label}
 						{t.id === 'apps' && updateCount > 0 && <span className="count">{updateCount}</span>}
@@ -202,7 +371,44 @@ function Shell({boot, prefs, setPrefs, onSignedOut}: {boot: Bootstrap; prefs: Pr
 			<AppSheet app={app} update={update} onClose={() => setAppId(null)} onTerminal={openTerminal} />
 			{viewing && <AppViewer app={viewing} onClose={() => setViewing(null)} />}
 
-			{terminal && <TerminalScreen app={terminal.app} input={terminal.input} onClose={() => setTerminal(null)} />}
+			{terminal && (
+				<ScreenErrorBoundary>
+				<Suspense fallback={<ScreenFallback />}>
+					<TerminalScreen app={terminal.app} input={terminal.input} onClose={() => setTerminal(null)} />
+				</Suspense>
+				</ScreenErrorBoundary>
+			)}
+			{/* Not over Settings, which has its own preview of the character (and forms it would cover). */}
+			{!assistantOpen && !terminal && !viewing && tab !== 'settings' && (
+				<AssistantCharacterWidget
+					onOpen={() => {
+						setAppId(null)
+						setAssistantOpen(true)
+						openAssistantView()
+					}}
+				/>
+			)}
+			{keepAssistant && (
+				<ScreenErrorBoundary>
+				<Suspense fallback={<ScreenFallback />}>
+					<Assistant
+						active={assistantOpen}
+						onClose={() => {
+							closeAssistantView()
+							setAssistantOpen(false)
+						}}
+						onSettings={() => {
+							safeSession.set('omarchy-server:settings-page', 'assistant')
+							closeAssistantView()
+							setAssistantOpen(false)
+							go('settings')
+						}}
+						prefs={prefs}
+						setPrefs={setPrefs}
+					/>
+				</Suspense>
+				</ScreenErrorBoundary>
+			)}
 			<NotificationsSheet
 				open={bellOpen}
 				notes={notes}
@@ -210,7 +416,7 @@ function Shell({boot, prefs, setPrefs, onSignedOut}: {boot: Bootstrap; prefs: Pr
 				onOpen={(n) => {
 					setBellOpen(false)
 					if (n === 'update-available') {
-						sessionStorage.removeItem('omarchy-server:settings-page')
+						safeSession.remove('omarchy-server:settings-page')
 						go('settings')
 					}
 				}}
@@ -220,7 +426,7 @@ function Shell({boot, prefs, setPrefs, onSignedOut}: {boot: Bootstrap; prefs: Pr
 }
 
 const NOTIFICATION_TEXT: Record<string, string> = {
-	'update-available': 'A new version of Omarchy Server is available',
+	'update-available': 'A new version of My Own Data Center is available',
 	migration: 'Your data migration finished',
 }
 const noteText = (n: string) => NOTIFICATION_TEXT[n] ?? n.replace(/[-_]/g, ' ').replace(/^\w/, (c) => c.toUpperCase())
@@ -229,7 +435,7 @@ function NotificationsSheet({open, notes, onClose, onOpen}: {open: boolean; note
 	const action = useAction()
 	return (
 		<Sheet open={open} onClose={onClose} label="Notifications">
-			<SheetHeader title="Notifications" subtitle={notes.length ? `${notes.length} from Omarchy Server` : undefined} onClose={onClose} />
+			<SheetHeader title="Notifications" subtitle={notes.length ? `${notes.length}` : undefined} onClose={onClose} />
 			{notes.length === 0 ? (
 				<div className="empty" style={{paddingTop: 20}}>
 					<span className="big">

@@ -28,7 +28,7 @@ export function WhatsNewSheet({releases, version, onClose}: {releases: Release[]
 					</span>
 				}
 				title="What’s new"
-				subtitle={`Omarchy Server ${version}`}
+				subtitle={`MODC ${version}`}
 				onClose={onClose}
 			/>
 			<div className="screen whats-new">
@@ -71,17 +71,20 @@ export function WhatsNewSheet({releases, version, onClose}: {releases: Release[]
 }
 
 // Pops up once after Touch updates, with everything since the version this device last saw.
-export function WhatsNewOnUpdate({version}: {version: string}) {
+// onDone: once it's closed, or straight away when there's nothing new (so other prompts wait their turn).
+export function WhatsNewOnUpdate({version, onDone}: {version: string; onDone?: () => void}) {
 	const [releases, setReleases] = useState<Release[] | null>(null)
 	useEffect(() => {
 		const seen = readSeen()
-		if (seen === version) return
+		if (seen === version) return onDone?.()
 		const list = unseen(version, seen)
 		if (list.length) {
 			const t = window.setTimeout(() => setReleases(list), 900)
 			return () => window.clearTimeout(t)
 		}
 		markSeen(version)
+		onDone?.()
+		// eslint-disable-next-line react-hooks/exhaustive-deps
 	}, [version])
 	if (!releases) return null
 	return (
@@ -91,6 +94,7 @@ export function WhatsNewOnUpdate({version}: {version: string}) {
 			onClose={() => {
 				markSeen(version)
 				setReleases(null)
+				onDone?.()
 			}}
 		/>
 	)

@@ -6,13 +6,16 @@
 //   success  {"result":{"data":<value>}}
 //   failure  {"error":{"message":"...","code":-32001,"data":{"code":"UNAUTHORIZED","httpStatus":401}}}
 
+export const UNREACHABLE_MESSAGE = 'My Own Data Center is restarting or not answering. Wait a moment and try again.'
+
 export class BackendError extends Error {
-	constructor(message, {code = 'INTERNAL_SERVER_ERROR', status = 500, path} = {}) {
+	constructor(message, {code = 'INTERNAL_SERVER_ERROR', status = 500, path, detail} = {}) {
 		super(message)
 		this.name = 'BackendError'
 		this.code = code
 		this.status = status
 		this.path = path
+		if (detail) this.detail = detail
 	}
 }
 
@@ -33,35 +36,50 @@ export function createBackendClient({baseUrl, timeoutMs = 20_000, fetchImpl = fe
 			url += `?input=${encodeURIComponent(JSON.stringify(input))}`
 		}
 
+		// Not answering, or dropping the connection part way through its answer (a restart), are the same to the caller.
+		const unreachable = (error) => {
+			const reason = error?.name === 'TimeoutError' ? 'timed out' : (error?.cause?.code ?? error?.message ?? 'failed')
+			return new BackendError(UNREACHABLE_MESSAGE, {
+				code: 'UNREACHABLE',
+				status: 502,
+				path,
+				detail: `Can't reach My Own Data Center at ${base} (${reason})`,
+			})
+		}
 		let response
+		let text
 		try {
 			response = await fetchImpl(url, {...init, signal: AbortSignal.timeout(timeout)})
+			text = await response.text()
 		} catch (error) {
-			const reason = error?.name === 'TimeoutError' ? 'timed out' : (error?.cause?.code ?? error?.message ?? 'failed')
-			throw new BackendError(`Can't reach Omarchy Server at ${base} (${reason})`, {code: 'UNREACHABLE', status: 502, path})
+			throw unreachable(error)
 		}
-
-		const text = await response.text()
 		let body
 		try {
 			body = text ? JSON.parse(text) : {}
 		} catch {
-			throw new BackendError(`Omarchy Server returned an unexpected response for ${path} (HTTP ${response.status})`, {
+			throw new BackendError(UNREACHABLE_MESSAGE, {
 				code: 'BAD_RESPONSE',
 				status: 502,
 				path,
+				detail: `My Own Data Center returned an unexpected response for ${path} (HTTP ${response.status})`,
 			})
 		}
 		if (body?.error) {
 			const data = body.error.data ?? {}
-			throw new BackendError(body.error.message || 'Omarchy Server error', {
+			throw new BackendError(body.error.message || 'My Own Data Center error', {
 				code: data.code ?? 'INTERNAL_SERVER_ERROR',
 				status: data.httpStatus ?? response.status ?? 500,
 				path,
 			})
 		}
 		if (!response.ok) {
-			throw new BackendError(`Omarchy Server returned HTTP ${response.status} for ${path}`, {status: response.status, path})
+			throw new BackendError(UNREACHABLE_MESSAGE, {
+				code: 'BAD_RESPONSE',
+				status: response.status >= 400 ? response.status : 502,
+				path,
+				detail: `My Own Data Center returned HTTP ${response.status} for ${path}`,
+			})
 		}
 		const data = body?.result?.data
 		// Cookies omarchyd set on this response, as `name=value` pairs.

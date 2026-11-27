@@ -1,4 +1,95 @@
-// Talks only to the Omarchy Server server (same origin). Shapes mirror omarchyd.
+// Talks only to the My Own Data Center server (same origin). Shapes mirror omarchyd.
+
+export const DEFAULT_TIMEOUT_MS = 20_000
+export const SLOW_TIMEOUT_MS = 10 * 60_000
+export type RequestOptions = {timeoutMs?: number; signal?: AbortSignal}
+
+// Long blocking server operations keep a generous timeout; normal RPCs and polling fail in 20 s.
+const SLOW_RPC = new Set([
+	'hermes.connect',
+	'hermes.connectRemote',
+	'hermes.disconnect',
+	'unraid.connect',
+	'unraid.scan',
+	'backups.configure',
+	'backups.shares',
+	'backups.restoreApp',
+	'backups.connectExisting',
+	'backups.snapshots',
+	'backups.computerSnapshots',
+	'backups.setComputer',
+	'backups.computerFolders',
+	'backups.gdrive.authFinish',
+	'backups.gdrive.configure',
+	'backups.gdrive.test',
+	'backups.gdrive.connectExisting',
+	'storage.growSystem',
+	'system.replaceCertificate',
+	'system.desktopSignIn',
+	'system.desktopShare',
+	'omarchy.removeTheme',
+	'storage.createPool',
+	'storage.addToPool',
+	'storage.importPool',
+	'storage.forgetPool',
+	'storage.unmount',
+	'storage.mount',
+	'storage.format',
+	'swarm.storage.unmount',
+	'swarm.storage.mount',
+	'swarm.storage.format',
+	'swarm.storage.createPool',
+	'swarm.storage.addToPool',
+	'swarm.storage.importPool',
+	'swarm.storage.forgetPool',
+	'swarm.storage.scrub',
+	'files.copy',
+	'files.transfer',
+	'files.fleetRecents',
+	'swarm.files.recents',
+	'files.unarchive',
+	'files.move',
+	'files.delete',
+	'files.trash',
+	'files.restore',
+	'files.emptyTrash',
+	'appStore.addRepository',
+	'appStore.refresh',
+	'omarchy.installPlugin',
+	'swarm.action',
+	'system.update',
+	'machines.uninstall',
+	'machines.snapshot',
+	'machines.revertSnapshot',
+	'machines.deleteSnapshot',
+	'machines.resizeDisk',
+	'machines.addDisk',
+	'machines.restart',
+	'machines.backup',
+	'machines.restoreBackup',
+	'machines.clone',
+	'machines.installConnector',
+	'wifi.connect',
+	'hardware.raid.addDevice',
+	'hardware.raid.addMirror',
+	'hardware.raid.addAccelerator',
+	'hardware.raid.replaceDevice',
+	'hardware.raid.transitionToFailsafeRaidz',
+	'hardware.raid.scrub',
+	'clips.paste',
+	'clips.addFile',
+	'clips.fleetList',
+	'hyprland.launch',
+	'hyprland.profileRun',
+	'apps.setOidc',
+])
+
+const RESTARTING_MESSAGE = 'My Own Data Center is restarting or not answering. Wait a moment and try again.'
+const FRIENDLY_ERROR: Record<string, string> = {
+	UNREACHABLE: RESTARTING_MESSAGE,
+	BAD_RESPONSE: RESTARTING_MESSAGE,
+	NOT_CONFIGURED: RESTARTING_MESSAGE,
+}
 
 export class ApiError extends Error {
 	code: string
@@ -10,33 +101,110 @@ export class ApiError extends Error {
 	}
 }
 
-async function handle<T>(res: Response): Promise<T> {
-	const body = await res.json().catch(() => null)
-	if (!res.ok || body?.error) {
-		const err = body?.error ?? {}
-		const error = new ApiError(err.message ?? `Request failed (${res.status})`, err.code ?? 'ERROR', res.status)
-		if (res.status === 401 && err.code === 'UNAUTHORIZED') window.dispatchEvent(new Event('touch:signed-out'))
+function makeTimeoutSignal(timeoutMs: number, external?: AbortSignal) {
+	// A ref'd timer, cleared when the request ends. AbortSignal.timeout() does not keep the
+	// event loop alive, so a test (and a quiet tab) never saw the timeout fire.
+	const controller = new AbortController()
+	let expired = false
+	const timer = setTimeout(() => {
+		expired = true
+		controller.abort(typeof DOMException === 'function' ? new DOMException('The operation was aborted due to timeout', 'TimeoutError') : undefined)
+	}, timeoutMs)
+	const onExternalAbort = () => controller.abort()
+	if (external) {
+		if (external.aborted) controller.abort()
+		else external.addEventListener('abort', onExternalAbort, {once: true})
+	}
+	return {
+		signal: controller.signal,
+		cleanup: () => {
+			clearTimeout(timer)
+			external?.removeEventListener('abort', onExternalAbort)
+		},
+		timedOut: () => expired,
+	}
+}
+
+async function handle<T>(res: Response, signal?: AbortSignal): Promise<T> {
+	const body: unknown = await res.json().catch((err) => {
+		if (signal?.aborted) throw err
+		return null
+	})
+	const hasError = body !== null && typeof body === 'object' && !Array.isArray(body) && 'error' in body && Boolean((body as {error?: unknown}).error)
+	if (!res.ok || hasError) {
+		const err = hasError ? (body as {error: {message?: string; code?: string}}).error : {}
+		const code = err.code ?? (!hasError && (res.status === 502 || res.status === 503 || res.status === 504) ? 'UNREACHABLE' : 'ERROR')
+		let message = err.message ?? `Request failed (${res.status})`
+		if (Object.hasOwn(FRIENDLY_ERROR, code)) {
+			if (err.message && err.message !== FRIENDLY_ERROR[code] && typeof console !== 'undefined') {
+				console.warn('[omarchy-server]', code, err.message)
+			}
+			message = FRIENDLY_ERROR[code]
+		}
+		const error = new ApiError(message, code, res.status)
+		// A mistyped password or authenticator code is also 401. Leave the person on the form.
+		const credentialMiss =
+			err.message === 'Incorrect password' ||
+			err.message === 'Invalid password' ||
+			err.message === 'Incorrect 2FA code' ||
+			err.message === 'Enter the 6-digit code from your authenticator app (2FA)' ||
+			err.message === 'That 2FA code isn’t right. Try the current one.' ||
+			err.message === 'That 2FA code was already used. Wait for the next one.'
+		if (res.status === 401 && err.code === 'UNAUTHORIZED' && !credentialMiss && typeof window !== 'undefined') window.dispatchEvent(new Event('touch:signed-out'))
 		throw error
+	}
+	if (!body || typeof body !== 'object' || Array.isArray(body)) {
+		throw new ApiError(`My Own Data Center sent an answer this page can’t read (${res.status})`, 'INVALID_RESPONSE', res.status)
 	}
 	return body as T
 }
 
-const post = <T>(path: string, body?: unknown) =>
-	fetch(path, {
-		method: 'POST',
-		headers: {'content-type': 'application/json', 'x-omarchy-server': '1'},
-		body: JSON.stringify(body ?? {}),
-		credentials: 'same-origin',
-	}).then((r) => handle<T>(r))
+async function request<T>(input: string, init: RequestInit, options?: RequestOptions, defaultTimeout = DEFAULT_TIMEOUT_MS): Promise<T> {
+	if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+		throw new ApiError('You’re offline. Check your connection and try again.', 'OFFLINE', 0)
+	}
+	const {signal, cleanup, timedOut} = makeTimeoutSignal(options?.timeoutMs ?? defaultTimeout, options?.signal)
+	try {
+		const res = await fetch(input, {...init, signal})
+		return await handle<T>(res, signal)
+	} catch (error) {
+		if (error instanceof ApiError) throw error
+		if (timedOut() || (error instanceof Error && error.name === 'TimeoutError')) {
+			throw new ApiError('The server took too long to answer. Check your connection and try again.', 'TIMEOUT', 0)
+		}
+		if (options?.signal?.aborted || (error instanceof Error && error.name === 'AbortError')) {
+			throw new ApiError('The request was interrupted before the server answered.', 'ABORTED', 0)
+		}
+		if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+			throw new ApiError('You’re offline. Check your connection and try again.', 'OFFLINE', 0)
+		}
+		throw new ApiError('Can’t reach My Own Data Center. Check your connection and try again.', 'NETWORK', 0)
+	} finally {
+		cleanup()
+	}
+}
 
-export async function query<T>(path: string, input?: unknown): Promise<T> {
+export const post = <T>(path: string, body?: unknown, options?: RequestOptions, defaultTimeout = DEFAULT_TIMEOUT_MS) =>
+	request<T>(
+		path,
+		{
+			method: 'POST',
+			headers: {'content-type': 'application/json', 'x-omarchy-server': '1'},
+			body: JSON.stringify(body ?? {}),
+			credentials: 'same-origin',
+		},
+		options,
+		defaultTimeout,
+	)
+
+export async function query<T>(path: string, input?: unknown, options?: RequestOptions): Promise<T> {
 	const qs = input === undefined ? '' : `?input=${encodeURIComponent(JSON.stringify(input))}`
-	const body = await fetch(`/api/rpc/${path}${qs}`, {credentials: 'same-origin'}).then((r) => handle<{data: T}>(r))
+	const body = await request<{data: T}>(`/api/rpc/${path}${qs}`, {credentials: 'same-origin'}, options, SLOW_RPC.has(path) ? SLOW_TIMEOUT_MS : DEFAULT_TIMEOUT_MS)
 	return body.data
 }
 
-export async function mutate<T = unknown>(path: string, input?: unknown): Promise<T> {
-	const body = await post<{data: T}>(`/api/rpc/${path}`, {input})
+export async function mutate<T = unknown>(path: string, input?: unknown, options?: RequestOptions): Promise<T> {
+	const body = await post<{data: T}>(`/api/rpc/${path}`, {input}, options, SLOW_RPC.has(path) ? SLOW_TIMEOUT_MS : DEFAULT_TIMEOUT_MS)
 	return body.data
 }
 
@@ -46,22 +214,31 @@ export type Bootstrap = {
 	server: null | {
 		url: string
 		host: string
+		local?: boolean
 		reachable: boolean
 		version?: string
 		name?: string
+		startedAt?: number
+		revision?: string
 		device?: string | null
 		onboarded?: boolean
+		// How a browser tab reaches an app from this page (see server/app.mjs appAccess).
+		appAccess?: 'relay' | 'direct' | 'none'
 		error?: string
 	}
 	accounts: {userId: string; name: string; avatar: string | null; wallpaper: Wallpaper | null}[]
 	session: null | {accountId: string; mode: 'native' | 'legacy'}
 }
 
-export const getBootstrap = () => fetch('/api/bootstrap', {credentials: 'same-origin'}).then((r) => handle<Bootstrap>(r))
+export const getBootstrap = (options?: RequestOptions) => request<Bootstrap>('/api/bootstrap', {credentials: 'same-origin'}, options, DEFAULT_TIMEOUT_MS)
 export const setup = (url: string) => post<{ok: true; url: string; version: string}>('/api/setup', {url})
-export const login = (body: {username: string; password: string; totpToken?: string}) =>
-	post<{ok: true; accountId: string}>('/api/auth/login', body)
-export const logout = () => post('/api/auth/logout')
+export const login = (body: {username: string; password: string; totpToken?: string}, options?: RequestOptions) =>
+	post<{ok: true; accountId: string}>('/api/auth/login', body, options)
+export const logout = () =>
+	post('/api/auth/logout').then((body) => {
+		if (typeof window !== 'undefined') window.dispatchEvent(new Event('touch:signed-out'))
+		return body
+	})
 
 // ---- omarchyd shapes ---------------------------------------------------------
 
@@ -82,7 +259,7 @@ export type AppState =
 	| 'not-installed'
 
 export type UserApp = {
-	/** Apps that hold their own port: where Omarchy Server shows them inside its page. */
+	/** Apps that hold their own port: where My Own Data Center shows them inside its page. */
 	viewPort?: number
 	id: string
 	name?: string
@@ -94,16 +271,24 @@ export type UserApp = {
 	progress?: number
 	requiresHttps?: boolean
 	torOnly?: boolean
-	credentials?: {defaultUsername?: string; defaultPassword?: string; showBeforeOpen?: boolean}
+	/** LAN port of a published job API. The token is credentials.defaultPassword. */
+	apiPort?: number
+	credentials?: {defaultUsername?: string; defaultPassword?: string; showBeforeOpen?: boolean; label?: string}
 	dependencies?: string[]
 	error?: string
 	/** Runs on the server itself (Tailscale), not in a container: no container terminal. */
 	system?: boolean
+	/** Which machine this install is on. Absent or "server" is this server. */
+	computerId?: string
+	computerName?: string
+	/** Installed on another machine. It does not open through this server’s gateway. */
+	remote?: boolean
+	oidc?: {enabled: boolean; mode: 'auto' | 'assisted'}
 }
 
 export type UsageItem = {id: string; used: number; name?: string}
 export type CpuUsage = {threads: number; totalUsed: number; system: number; apps: UsageItem[]; machines: UsageItem[]}
-export type MemoryUsage = {size: number; totalUsed: number; system: number; apps: UsageItem[]; machines: UsageItem[]}
+export type MemoryUsage = {size: number; totalUsed: number; system: number; apps: UsageItem[]; machines: UsageItem[]; swap?: {total: number; used: number}}
 export type DiskUsage = {
 	size: number
 	totalUsed: number
@@ -115,10 +300,52 @@ export type DiskUsage = {
 	/** True until the first measurement of apps, machines and files is done. */
 	measuring?: boolean
 	/** The drive the system is on. notInUse: space the drive has that the filesystem doesn't use yet. */
+	/** Other drives Files shows: the ones mounted in Storage (Files › Drives) and pools in Home. */
+	drives?: {name: string; folder: string; size: number; used: number; available: number}[]
 	drive?: {name: string; size: number; notInUse: number; steps: ('partition' | 'partition-not-last' | 'encryption' | 'filesystem')[]; partition: string | null; partitionNumber: number | null; encrypted: string | null; filesystem: string | null} | null
 }
-export type Temperature = {temperature: number | null; warning: string; reason?: 'virtual' | 'no-sensor'}
+export type ThermalSensor = {id: string; label: string; kind: 'processor' | 'video' | 'case' | 'drive' | 'board' | 'other'; celsius: number; stuck?: boolean; defaultOn?: boolean}
+export type Temperature = {temperature: number | null; warning: string; reason?: 'virtual' | 'no-sensor'; sensors?: ThermalSensor[]}
+export type GpuInfo = {
+	id: string
+	index: number
+	name: string
+	used: number | null
+	memoryUsed: number | null
+	memoryTotal: number | null
+	temperature: number | null
+}
+export type GpuUsage = {gpus: GpuInfo[]}
+export type BatteryStatus = 'charging' | 'discharging' | 'full' | 'not-charging' | 'unknown'
+export type BatteryInfo = {
+	id: string
+	index: number
+	name: string
+	percent: number | null
+	status: BatteryStatus
+	secondsRemaining: number | null
+	power: number | null
+	energyNow: number | null
+	energyFull: number | null
+}
+export type BatteryUsage = {batteries: BatteryInfo[]}
+export type SystemStats = {
+	cpu: CpuUsage
+	memory: MemoryUsage
+	disk: DiskUsage
+	temp: Temperature
+	gpu: GpuUsage
+	battery: BatteryUsage
+	uptime: number
+}
 /** Share of the space you can use that's in use (like df: space kept back for the system isn't counted). */
+/** The server's space across its main drive and the other drives it has mounted. */
+export const diskAll = (d: DiskUsage) => {
+	const extra = d.drives ?? []
+	const used = d.totalUsed + extra.reduce((n, x) => n + x.used, 0)
+	const total = d.totalUsed + d.available + extra.reduce((n, x) => n + x.size, 0)
+	return {used, total, available: d.available + extra.reduce((n, x) => n + x.available, 0)}
+}
 export const diskPct = (d: DiskUsage) => (d.totalUsed + d.available > 0 ? (100 * d.totalUsed) / (d.totalUsed + d.available) : 0)
 
 export type RegistryApp = {
@@ -132,6 +359,9 @@ export type RegistryApp = {
 	developer?: string
 	website?: string
 	gallery?: string[]
+	/** Count of screenshots; set on the compact registry list in place of `gallery` URLs. */
+	shots?: number
+	unsupported?: string
 	dependencies?: string[]
 	/** Every app installed along with it, in install order (what it needs comes first). */
 	needs?: string[]
@@ -141,22 +371,24 @@ export type RegistryApp = {
 	caution?: string
 	releaseNotes?: string
 	installSize?: number
+	oidc?: {supported: boolean; mode: 'auto' | 'assisted'; note?: string}
 }
-export type Registry = {meta: {id: string; name: string}; apps: RegistryApp[]}[]
+export type Registry = {url?: string; meta: {id: string; name: string}; apps: RegistryApp[]}[]
 
-export type PortForward = {id: string; protocol: 'tcp' | 'udp'; hostPort: number; guestPort: number}
+export type PortForward = {id: string; protocol: 'tcp' | 'udp'; hostPort: number; guestPort: number; pending?: boolean}
 
 export type Machine = {
 	id: string
 	vmid?: number
 	name: string
+	hostId?: string
 	osId?: string
 	cores?: number
 	memoryGb?: number
 	memoryMb?: number
 	diskSizeGb?: number
 	ipAddress?: string
-	state: 'installing' | 'stopped' | 'starting' | 'running' | 'stopping' | 'restarting' | 'suspended' | 'hibernated' | 'error'
+	state: 'installing' | 'stopped' | 'starting' | 'running' | 'stopping' | 'restarting' | 'pausing' | 'resuming' | 'suspended' | 'hibernated' | 'error'
 	pending?: boolean
 	protected?: boolean
 	onBoot?: boolean
@@ -181,6 +413,7 @@ export type InstallReview = {
 	/** Folders you choose a place for: inside the app, or a folder of yours (suggested under your home). */
 	folders?: {appId: string; appName: string; id: string; label: string; detail: string; suggest: string | null}[]
 	home?: string
+	oidc?: {supported: boolean; mode: 'auto' | 'assisted'; note?: string; issuerUrl: string; defaultOn: boolean}
 }
 
 export type OsImage = {
@@ -207,6 +440,48 @@ export type ActiveSession = {
 	lastSeenAt: number
 	current: boolean
 	client: {type: 'native'; id?: string; platform?: string; deviceClass?: string; appVersion?: string} | {type: 'browser'; userAgent?: string}
+}
+
+export type AssistantProvider = 'spacexai' | 'openai' | 'anthropic' | 'openai-compatible' | 'chatgpt' | 'hermes'
+// Which endpoint the assistant streams from: /chat/completions or /responses.
+export type AssistantApi = 'chat' | 'responses'
+// How hard a reasoning model thinks; '' leaves the model's default.
+export type AssistantEffort = '' | 'low' | 'medium' | 'high'
+export type AssistantCheck = {ok: boolean; status: string; message: string; at: number}
+export type AssistantModel = {id: string; name?: string}
+// A live check: the stored check plus the models the endpoint serves.
+export type AssistantVerify = AssistantCheck & {modelFound: boolean | null; models: AssistantModel[]}
+export type AssistantKey = {
+	id: string
+	name: string
+	provider: AssistantProvider
+	baseUrl: string
+	model: string
+	api: AssistantApi
+	effort: AssistantEffort
+	check: AssistantCheck | null
+	last4: string
+	ownerUserId: string
+	sharedWith: string[]
+	systemDefault: boolean
+	mine: boolean
+	// Sign in with ChatGPT: the account, and whether the sign-in still has a refresh token.
+	account?: string | null
+	signedIn?: boolean
+}
+
+// Public card. The chat shows these fields only — never rpc input, passwords, apiKey, or credentials.
+export type AssistantAction = {
+	id: string
+	status: 'pending' | 'rejected' | 'running' | 'done' | 'error'
+	kind: 'rpc' | 'mcp'
+	toolName: string
+	title: string
+	detail: string
+	// Present on an install card so Approve can open the store review. Never a grant.
+	appId?: string
+	error?: string
+	picker?: {theme: string | null; selected: string | null}
 }
 
 export type FileEntry = {
@@ -270,3 +545,16 @@ export type UsbDrive = {
 	size: number
 	partitions: {id: string; label?: string; size: number; mountpoints: string[]}[]
 }
+export type UsbBound = {kind: 'machine' | 'app'; id: string; name: string}
+export type UsbDevice = {
+	id: string
+	name: string
+	vendorId: string
+	productId: string
+	serial: string | null
+	path: string | null
+	node: string | null
+	bound: UsbBound | null
+	needsRestart: boolean
+}
+export type UsbList = {devices: UsbDevice[]}
